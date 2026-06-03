@@ -1,0 +1,5 @@
+timestamp_seconds,sensor_time_seconds,measurement,unit,value,raw
+0.029,,unlabeled,,-30.3,-30.3
+0.040,7450.009,distance_cm,cm,459.9,"7450.009,""cm"",459.9"
+0.120,8880.396,velocity_cmps,cmps,6.1,"8880.396,""cmps"",6.1"
+0.131,8880.455,distance_cm,cm,451.4,"8880.455,""cm"",451.4"

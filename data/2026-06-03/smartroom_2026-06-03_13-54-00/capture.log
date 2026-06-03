@@ -1,0 +1,42 @@
+ffmpeg -y -f v4l2 -framerate 30.0 -input_format mjpeg -video_size 640x480 -i /dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0 -t 3.0 -vf drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text=%{localtime\\:%Y-%m-%d %H-%M-%S}:x=12:y=12:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=8 -c:v libx264 -preset ultrafast -pix_fmt yuv420p /home/smartroom/CityOS/data/2026-06-03/smartroom_2026-06-03_13-54-00/camera_main.mp4
+
+ffmpeg version 7.1.3-0+deb13u1+rpt1 Copyright (c) 2000-2025 the FFmpeg developers
+  built with gcc 14 (Debian 14.2.0-19)
+  configuration: --prefix=/usr --extra-version=0+deb13u1+rpt1 --toolchain=hardened --incdir=/usr/include/aarch64-linux-gnu --enable-gpl --disable-stripping --disable-libmfx --disable-mmal --disable-omx --enable-gnutls --enable-libaom --enable-libass --enable-libbs2b --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libharfbuzz --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-openal --enable-opencl --enable-opengl --disable-sndio --disable-libvpl --libdir=/usr/lib/aarch64-linux-gnu --arch=arm64 --enable-neon --enable-v4l2-request --enable-libudev --enable-epoxy --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-vout-drm --enable-chromaprint --enable-frei0r --enable-ladspa --enable-libbluray --enable-libcaca --enable-libdvdnav --enable-libdvdread --enable-libjack --enable-libpulse --enable-librabbitmq --enable-librist --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libx264 --enable-libzmq --enable-libzvbi --enable-lv2 --enable-sand --enable-sdl2 --enable-libplacebo --enable-librav1e --enable-pocketsphinx --enable-librsvg --enable-libjxl --enable-shared
+  libavutil      59. 39.100 / 59. 39.100
+  libavcodec     61. 19.101 / 61. 19.101
+  libavformat    61.  7.100 / 61.  7.100
+  libavdevice    61.  3.100 / 61.  3.100
+  libavfilter    10.  4.100 / 10.  4.100
+  libswscale      8.  3.100 /  8.  3.100
+  libswresample   5.  3.100 /  5.  3.100
+  libpostproc    58.  3.100 / 58.  3.100
+Input #0, video4linux2,v4l2, from '/dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0':
+  Duration: N/A, start: 8883.520522, bitrate: N/A
+  Stream #0:0: Video: mjpeg (Baseline), yuvj422p(pc, bt470bg/unknown/unknown), 640x480 [SAR 1:1 DAR 4:3], 30 fps, 30 tbr, 1000k tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (mjpeg (native) -> h264 (libx264))
+Press [q] to stop, [?] for help
+[swscaler @ 0x7f7401aaa0] deprecated pixel format used, make sure you did set range correctly
+[libx264 @ 0x5587ee23a0] using SAR=1/1
+[libx264 @ 0x5587ee23a0] using cpu capabilities: ARMv8 NEON
+[libx264 @ 0x5587ee23a0] profile Constrained Baseline, level 3.0, 4:2:0, 8-bit
+[libx264 @ 0x5587ee23a0] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=0 ref=1 deblock=0:0:0 analyse=0:0 me=dia subme=0 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=0 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=6 lookahead_threads=1 sliced_threads=0 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=0 keyint=250 keyint_min=25 scenecut=0 intra_refresh=0 rc=crf mbtree=0 crf=23.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 ip_ratio=1.40 aq=0
+Output #0, mp4, to '/home/smartroom/CityOS/data/2026-06-03/smartroom_2026-06-03_13-54-00/camera_main.mp4':
+  Metadata:
+    encoder         : Lavf61.7.100
+  Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p(pc, bt470bg/unknown/unknown, progressive), 640x480 [SAR 1:1 DAR 4:3], q=2-31, 30 fps, 15360 tbn
+      Metadata:
+        encoder         : Lavc61.19.101 libx264
+      Side data:
+        cpb: bitrate max/min/avg: 0/0/0 buffer size: 0 vbv_delay: N/A
+frame=    0 fps=0.0 q=0.0 size=       0KiB time=N/A bitrate=N/A speed=N/A    frame=    7 fps=7.0 q=22.0 size=       0KiB time=00:00:00.46 bitrate=   0.8kbits/s speed=0.467x    frame=   14 fps=9.3 q=22.0 size=       0KiB time=00:00:01.00 bitrate=   0.4kbits/s speed=0.666x    frame=   20 fps= 10 q=21.0 size=     256KiB time=00:00:01.43 bitrate=1463.4kbits/s speed=0.716x    frame=   27 fps= 11 q=22.0 size=     256KiB time=00:00:01.96 bitrate=1066.5kbits/s speed=0.786x    frame=   34 fps= 11 q=21.0 size=     512KiB time=00:00:02.46 bitrate=1700.5kbits/s speed=0.822x    [out#0/mp4 @ 0x5587ee30a0] video:745KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.153432%
+frame=   41 fps= 13 q=-1.0 Lsize=     746KiB time=00:00:03.00 bitrate=2038.3kbits/s speed=0.962x    
+[libx264 @ 0x5587ee23a0] frame I:1     Avg QP:20.00  size: 28789
+[libx264 @ 0x5587ee23a0] frame P:40    Avg QP:21.88  size: 18345
+[libx264 @ 0x5587ee23a0] mb I  I16..4: 100.0%  0.0%  0.0%
+[libx264 @ 0x5587ee23a0] mb P  I16..4: 20.3%  0.0%  0.0%  P16..4: 73.0%  0.0%  0.0%  0.0%  0.0%    skip: 6.7%
+[libx264 @ 0x5587ee23a0] coded y,uvDC,uvAC intra: 29.0% 91.2% 61.9% inter: 42.3% 80.7% 23.9%
+[libx264 @ 0x5587ee23a0] i16 v,h,dc,p: 48% 12% 19% 21%
+[libx264 @ 0x5587ee23a0] i8c dc,h,v,p: 47% 14% 30%  8%
+[libx264 @ 0x5587ee23a0] kb/s:2011.27

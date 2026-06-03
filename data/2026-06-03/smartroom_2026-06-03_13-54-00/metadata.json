@@ -1,0 +1,50 @@
+{
+  "session_id": "smartroom_2026-06-03_13-54-00",
+  "started_at_local": "2026-06-03T13:54:00",
+  "day_folder": "2026-06-03",
+  "duration_seconds": 6.397,
+  "camera_device": "/dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0",
+  "video_file": "camera_main.mp4",
+  "camera_timestamps_file": "camera_main_timestamps.csv",
+  "environment_sensor_file": "env_sensor_01.csv",
+  "custom_i2c_file": "custom_board_i2c.csv",
+  "radar_sensor_file": "radar_sensor_01.csv",
+  "microphone_file": "mic_array.wav",
+  "metadata_format": {
+    "camera_main_timestamps.csv": [
+      "frame_index",
+      "timestamp_seconds"
+    ],
+    "env_sensor_01.csv": [
+      "timestamp_seconds",
+      "temperature_c",
+      "humidity_pct"
+    ],
+    "custom_board_i2c.csv": [
+      "timestamp_seconds",
+      "temperature_c",
+      "humidity_pct",
+      "pressure_hpa",
+      "gas_ohm",
+      "light_lux",
+      "color_temperature_k",
+      "red",
+      "green",
+      "blue",
+      "accel_x_mps2",
+      "accel_y_mps2",
+      "accel_z_mps2",
+      "mag_x_ut",
+      "mag_y_ut",
+      "mag_z_ut"
+    ],
+    "radar_sensor_01.csv": [
+      "timestamp_seconds",
+      "sensor_time_seconds",
+      "measurement",
+      "unit",
+      "value",
+      "raw"
+    ]
+  }
+}
