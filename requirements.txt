@@ -1,0 +1,15 @@
+# Python packages for the smartroom capture and sensor-test scripts.
+# Versions pinned to the Raspberry Pi venv. Install with:
+#   pip install -r requirements.txt
+#
+# Note: camera capture also needs the system tools ffmpeg and v4l2-ctl
+# (apt install ffmpeg v4l-utils), which are not Python packages.
+
+Adafruit-Blinka==9.1.0                    # board, busio, digitalio
+adafruit-circuitpython-mcp3xxx==1.5.2     # MCP3008 ADC (mic)
+adafruit-circuitpython-bme680==3.7.16     # temp / humidity / pressure / gas
+adafruit-circuitpython-tcs34725==3.3.28   # color / light
+adafruit-circuitpython-adxl34x==1.12.20   # accelerometer
+adafruit-circuitpython-mlx90393==2.4.2    # magnetometer
+pyserial==3.5                             # OPS243-A radar serial
+gpiozero==2.0.1                           # GPIO sensor test
