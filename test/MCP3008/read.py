@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Combined sound-level + PIR motion monitor for the MAESTRO 2.1 board.
+Sound-level monitor for the MAESTRO 2.1 board.
 
-Signal paths (both analog -> MCP3008 ADC -> SPI -> Pi):
-  electret mic -> MAX9814 (amp + AGC)        -> MCP3008 MIC_CH
-  ZRE200GE PIR -> NCS36000 (PIR controller)  -> MCP3008 PIR_CH
+Signal path (analog -> MCP3008 ADC -> SPI -> Pi):
+  electret mic -> MAX9814 (amp + AGC) -> MCP3008 MIC_CH
 
 What it does:
   - Mic: auto-calibrates quiet baseline, reports loudness, flags loud events
-  - PIR: auto-calibrates idle level, flags motion when the signal deviates
 
 What it does NOT do:
   - Record audio / FFT. SPI-from-Python is only fast enough for level sensing.
-
-  >>> CONFIRM MIC_CH / PIR_CH / CS_PIN below against your wiring <<<
-  (Channel scan showed mic on P0; PIR is most likely P1 -- verify.)
 
 Install driver (in venv):
   pip install adafruit-circuitpython-mcp3xxx
@@ -35,7 +30,6 @@ from adafruit_mcp3xxx.analog_in import AnalogIn
 # ---------------------------------------------------------------------------
 CS_PIN  = board.D8       # MCP3008 chip-select: CE0 = D8, CE1 = D7
 MIC_CH  = MCP.P0         # confirmed: mic (MAX9814) on P0
-PIR_CH  = MCP.P1         # likely: PIR (ZRE200GE/NCS36000) on P1 -- verify
 VREF    = 3.3            # MCP3008 reference / board supply voltage
 
 # --- mic settings ---
@@ -45,12 +39,6 @@ REPORT_HZ   = 5          # readings per second
 EVENT_FACTOR   = 3.0     # loud event when pp > baseline * this
 EVENT_COOLDOWN = 0.4     # min seconds between loud events
 BASELINE_DECAY = 0.95    # mic baseline smoothing (closer to 1 = slower)
-
-# --- PIR settings ---
-# The NCS36000 output deviates from its idle level on motion. We learn the
-# idle level at startup, then flag motion when |reading - idle| exceeds this.
-PIR_DELTA_V     = 0.30   # volts of deviation from idle that counts as motion
-PIR_HOLD_S      = 1.5    # keep "MOTION" latched this long after last trigger
 # ---------------------------------------------------------------------------
 
 # --- set up MCP3008 ---
@@ -58,7 +46,6 @@ spi = busio.SPI(clock=board.SCK, MISO=board.MISO, MOSI=board.MOSI)
 cs = digitalio.DigitalInOut(CS_PIN)
 mcp = MCP.MCP3008(spi, cs, ref_voltage=VREF)
 mic = AnalogIn(mcp, MIC_CH)
-pir = AnalogIn(mcp, PIR_CH)
 
 
 def sample_pp():
@@ -89,28 +76,13 @@ def calibrate_mic(seconds=2.0):
     return base
 
 
-def calibrate_pir(seconds=2.0):
-    """Learn the PIR idle voltage. Stay still / out of view during this."""
-    print(f"Calibrating PIR idle for {seconds:.0f}s... hold still.")
-    samples = []
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        samples.append(pir.voltage)
-        time.sleep(0.01)
-    idle = sum(samples) / len(samples) if samples else 0.0
-    print(f"  PIR idle = {idle:.3f} V")
-    return idle
-
-
-print("Smart-room monitor: mic + PIR")
-print(f"  MIC ch {MIC_CH}   PIR ch {PIR_CH}   CS {CS_PIN}")
+print("Smart-room monitor: mic")
+print(f"  MIC ch {MIC_CH}   CS {CS_PIN}")
 mic_baseline = calibrate_mic()
-pir_idle = calibrate_pir()
 print()
 
 interval = 1.0 / REPORT_HZ
 last_event = 0.0
-last_motion = 0.0
 
 print("Monitoring (Ctrl-C to stop)")
 print("-" * 72)
@@ -119,7 +91,6 @@ try:
     while True:
         now = time.monotonic()
 
-        # ---- mic ----
         pp = sample_pp()
         if pp < mic_baseline:
             mic_baseline = BASELINE_DECAY * mic_baseline + (1 - BASELINE_DECAY) * pp
@@ -134,16 +105,8 @@ try:
             last_event = now
             loud = " LOUD"
 
-        # ---- PIR ----
-        pir_v = pir.voltage
-        if abs(pir_v - pir_idle) > PIR_DELTA_V:
-            last_motion = now
-        motion = (now - last_motion) < PIR_HOLD_S
-        motion_str = "MOTION" if motion else "------"
-
         print(f"[{time.strftime('%H:%M:%S')}]  "
-              f"MIC pp {pp:4.2f}V |{bar}|{loud:<5}   "
-              f"PIR {pir_v:4.2f}V {motion_str}")
+              f"MIC pp {pp:4.2f}V |{bar}|{loud:<5}")
         time.sleep(interval)
 except KeyboardInterrupt:
     print("\nStopped.")
