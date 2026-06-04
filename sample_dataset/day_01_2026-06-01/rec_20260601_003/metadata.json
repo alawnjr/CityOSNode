@@ -1,0 +1,52 @@
+{
+  "recording_id": "rec_20260601_003",
+  "scenario_id": "person_walkthrough_v1",
+  "space": "smart_room_1",
+  "start_time": "2026-06-01T14:42:00-04:00",
+  "end_time": "2026-06-01T14:42:30-04:00",
+  "duration_seconds": 30.0,
+  "operator": "alan_jiang",
+  "schema_version": "0.1",
+  "privacy_level": "local_context",
+  "streams": {
+    "camera_main": {
+      "modality": "video",
+      "path": "streams/camera_main.mp4",
+      "codec": "h264",
+      "resolution": [1920, 1080],
+      "fps": 30,
+      "sync_offset_ms": 0,
+      "frame_count": 885,
+      "timestamps_path": "streams/camera_main_timestamps.csv"
+    },
+    "env_sensor_01": {
+      "modality": "environmental",
+      "path": "streams/env_sensor_01.csv",
+      "sample_rate_hz": 1,
+      "fields": ["temperature_c", "light_lux", "humidity_pct", "pressure_hpa"],
+      "sync_offset_ms": 0
+    },
+    "motion_sensor_01": {
+      "modality": "motion",
+      "path": "streams/motion_sensor_01.csv",
+      "sample_rate_hz": 10,
+      "fields": ["motion_detected", "motion_value"],
+      "sync_offset_ms": 0
+    },
+    "mic_array": {
+      "modality": "audio",
+      "path": "streams/mic_array.wav",
+      "sample_rate_hz": 48000,
+      "channels": 4,
+      "sync_offset_ms": 12
+    }
+  },
+  "scripted_events": [
+    {"t_seconds": 0.0, "event": "recording_start"},
+    {"t_seconds": 30.0, "event": "recording_end"}
+  ],
+  "calibration": {
+    "sync_method": "clap_at_t0",
+    "clock_source": "ntp_pool"
+  }
+}
