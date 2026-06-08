@@ -112,7 +112,7 @@ Standalone per-device scripts, run individually on the Pi:
 
 - `data/`, `*.mp4`, `*.wav`, and `PRIVATE.md` are gitignored — recordings are not
   version-controlled.
-- Keep raw sensor values raw. Calibration constants belong in a sidecar
-  (`calibration.json`) referenced from `metadata.json`, not baked into the CSVs.
+- Keep raw sensor values raw — capture writes uncorrected readings; any
+  post-processing happens downstream, not baked into the CSVs.
 - New device-driving scripts hardcode the device path/port (matching `capture.py`)
   rather than adding flags.
