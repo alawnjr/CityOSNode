@@ -65,8 +65,8 @@ The PIR motion sensor was removed; `test/GPIO/` scripts are legacy wiring-discov
 
 ## capture.py — the main pipeline
 
-Records all sensors concurrently for `DURATION_SECONDS` (hardcoded 30, no CLI
-flags by design) into a recording folder mirroring `sample_dataset/`:
+Records all sensors concurrently for `DURATION_SECONDS` (default 30, set with
+`--duration`/`-d`) into a recording folder mirroring `sample_dataset/`:
 
 ```
 data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_NNN/
@@ -86,17 +86,33 @@ and a `stop_event` ends them when the camera finishes. Every sensor's init is
 wrapped in try/except so missing hardware prints `<sensor>: unavailable` and the
 rest of the capture still proceeds. Folder/recording numbers auto-increment.
 
-## Two generations of capture (important context)
+When `SMARTROOM_PREVIEW` is set in the environment, the camera ffmpeg gains a
+second `mpjpeg` output on `pipe:1` (a live MJPEG feed) — the web UI uses this to
+show the camera while recording. Without it, behaviour is unchanged.
 
-- `run_smartroom_capture.py` lives **only on the Pi** (not in this repo) — the
-  original full pipeline with CLI flags. It wrote the **flat** layout
-  `data/<day>/smartroom_<timestamp>/` (note `env_sensor_01.csv`,
-  `radar_sensor_01.csv` names). The existing recordings under `data/` came from it.
-- `capture.py` (this repo) is the simpler reimplementation using the **nested**
-  `sample_dataset` layout above. New recordings use this layout.
+## smartroom_video_page.py — web UI
 
-`sample_dataset/` is the canonical reference for the `metadata.json` schema — match
-its `streams{}` structure when changing capture output.
+A stdlib `http.server` (`ThreadingHTTPServer`) serving `http://smartroom.local:8000`,
+run on the Pi by the `smartroom-video-page.service` systemd unit (system
+`python3`, working dir `~/CityOS`). It lives in this repo and is synced via GitHub
+like everything else — **after editing, push and `git pull` on the Pi, then
+`sudo systemctl restart smartroom-video-page.service`**. Routes:
+- `/` — live MJPEG view (`/stream.mjpg`), a Record panel, and a list of recordings.
+- `POST /record` (duration) → runs `run_smartroom_capture.sh`; `POST /record/cancel`
+  kills the recording's process group; `/record/status` returns countdown/elapsed JSON.
+- `/dataset/<rec>` zips a whole recording folder; `/video/`, `/download/` serve single files.
+
+The camera is **single-access**, so the page releases its own preview ffmpeg
+before a recording starts and instead relays the recorder's `SMARTROOM_PREVIEW`
+feed, then resumes its own camera capture when the recording ends.
+
+## `sample_dataset/` is the schema reference
+
+`run_smartroom_capture.py` is a thin wrapper that calls `capture.py` (kept for the
+`.sh`/desktop launchers). `sample_dataset/` is the canonical reference for the
+`metadata.json` schema — match its `streams{}` structure when changing capture
+output. (Older flat recordings under `data/`, `env_sensor_01.csv` etc., came from a
+previous generation of the pipeline.)
 
 ## test/ directory
 

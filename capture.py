@@ -274,21 +274,28 @@ def main():
     start_time = datetime.now().astimezone()
 
     threads = [
-        threading.Thread(target=log_i2c, args=(streams / "custom_board_i2c.csv", stop_event, start)),
-        threading.Thread(target=log_mcp3008_mic, args=(streams / "mcp3008_mic.csv", stop_event, start)),
-        threading.Thread(target=log_radar, args=(streams / "radar_ops243.csv", stop_event, start)),
+        threading.Thread(target=log_i2c, args=(streams / "custom_board_i2c.csv", stop_event, start), daemon=True),
+        threading.Thread(target=log_mcp3008_mic, args=(streams / "mcp3008_mic.csv", stop_event, start), daemon=True),
+        threading.Thread(target=log_radar, args=(streams / "radar_ops243.csv", stop_event, start), daemon=True),
     ]
     for thread in threads:
         thread.start()
     audio_proc = start_audio(streams / "mic_array.wav")
 
-    record_camera(streams / "camera_main.mp4")  # blocks for DURATION_SECONDS
-
-    if audio_proc:
-        audio_proc.wait()
-    stop_event.set()
-    for thread in threads:
-        thread.join()
+    # The camera drives the recording length; whatever happens, stop the sensor
+    # threads and audio cleanly so this process always exits (a camera failure
+    # must not leave it hanging).
+    try:
+        record_camera(streams / "camera_main.mp4")  # blocks for DURATION_SECONDS
+    finally:
+        stop_event.set()
+        if audio_proc:
+            try:
+                audio_proc.wait(timeout=10)
+            except Exception:
+                audio_proc.terminate()
+        for thread in threads:
+            thread.join(timeout=5)
 
     end_time = datetime.now().astimezone()
     frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", CAMERA_FPS)
