@@ -100,6 +100,10 @@ def resolve_dataset_path(encoded_name):
     return None
 
 
+def day_token(day_dir):
+    return "data/" + day_dir.relative_to(DATA_DIR).as_posix()
+
+
 def day_folders():
     """All day_* folders that contain at least one recording, newest first."""
     if not DATA_DIR.exists():
