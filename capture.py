@@ -15,9 +15,11 @@ same layout as sample_dataset/:
             mcp3008_mic.csv              (mic level via MCP3008 ADC)
             radar_ops243.csv             (OPS243-A radar, raw serial lines)
 
-Run on the Pi:  python capture.py
+Run on the Pi:  python capture.py            # 30s (default)
+                python capture.py -d 60      # 60s
 """
 
+import argparse
 import csv
 import json
 import subprocess
@@ -26,7 +28,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DURATION_SECONDS = 30
+DEFAULT_DURATION = 30
+DURATION_SECONDS = DEFAULT_DURATION  # overridden by --duration in main()
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 CAMERA = "/dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0"
@@ -241,6 +244,12 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
 
 
 def main():
+    global DURATION_SECONDS
+    parser = argparse.ArgumentParser(description="Capture raw data from all smartroom sensors.")
+    parser.add_argument("-d", "--duration", type=int, default=DEFAULT_DURATION,
+                        help=f"Recording length in seconds (default: {DEFAULT_DURATION}).")
+    DURATION_SECONDS = parser.parse_args().duration
+
     rec_dir = make_recording_dir()
     streams = rec_dir / "streams"
     print(f"Recording {DURATION_SECONDS}s -> {rec_dir}")
