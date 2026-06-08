@@ -22,7 +22,9 @@ Run on the Pi:  python capture.py            # 30s (default)
 import argparse
 import csv
 import json
+import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -83,7 +85,7 @@ def log_i2c(path, stop_event, start):
         adxl = adafruit_adxl34x.ADXL345(i2c, address=0x53)
         mlx = adafruit_mlx90393.MLX90393(i2c, address=0x0C)
     except Exception as error:
-        print(f"i2c: unavailable ({error})")
+        print(f"i2c: unavailable ({error})", file=sys.stderr)
         return
 
     with path.open("w", newline="") as handle:
@@ -120,7 +122,7 @@ def log_mcp3008_mic(path, stop_event, start):
         mcp = MCP.MCP3008(spi, cs, ref_voltage=3.3)
         mic = AnalogIn(mcp, MCP.P0)
     except Exception as error:
-        print(f"mcp3008: unavailable ({error})")
+        print(f"mcp3008: unavailable ({error})", file=sys.stderr)
         return
 
     with path.open("w", newline="") as handle:
@@ -139,7 +141,7 @@ def log_radar(path, stop_event, start):
         port = serial.Serial(RADAR_PORT, RADAR_BAUD, timeout=0.5)
         port.write(b"OD")  # OPS243-A: enable data output
     except Exception as error:
-        print(f"radar: unavailable ({error})")
+        print(f"radar: unavailable ({error})", file=sys.stderr)
         return
 
     with path.open("w", newline="") as handle, port:
@@ -165,7 +167,7 @@ def start_audio(path):
             str(path),
         ])
     except Exception as error:
-        print(f"audio: unavailable ({error})")
+        print(f"audio: unavailable ({error})", file=sys.stderr)
         return None
 
 
@@ -176,15 +178,28 @@ def record_camera(path):
         "x=12:y=12:fontsize=22:fontcolor=white:"
         "box=1:boxcolor=black@0.55:boxborderw=8"
     )
-    subprocess.run([
+    command = [
         "ffmpeg", "-y",
         "-f", "v4l2", "-framerate", str(CAMERA_FPS),
         "-input_format", "mjpeg", "-video_size", f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}",
         "-i", CAMERA, "-t", str(DURATION_SECONDS),
-        "-vf", timestamp_filter,
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        str(path),
-    ], check=True)
+    ]
+    if os.environ.get("SMARTROOM_PREVIEW"):
+        # Write the recording to file (with overlay) AND emit a live MJPEG feed
+        # on stdout so the web page can show the camera while recording.
+        command += [
+            "-map", "0:v:0", "-vf", timestamp_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            str(path),
+            "-map", "0:v:0", "-c:v", "copy", "-f", "mpjpeg", "pipe:1",
+        ]
+    else:
+        command += [
+            "-vf", timestamp_filter,
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            str(path),
+        ]
+    subprocess.run(command, check=True)
 
 
 def write_camera_timestamps(path, fps):
@@ -252,7 +267,7 @@ def main():
 
     rec_dir = make_recording_dir()
     streams = rec_dir / "streams"
-    print(f"Recording {DURATION_SECONDS}s -> {rec_dir}")
+    print(f"Recording {DURATION_SECONDS}s -> {rec_dir}", file=sys.stderr)
 
     stop_event = threading.Event()
     start = time.monotonic()
@@ -278,7 +293,7 @@ def main():
     end_time = datetime.now().astimezone()
     frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", CAMERA_FPS)
     write_metadata(rec_dir, start_time, end_time, frame_count)
-    print(f"Done -> {rec_dir}")
+    print(f"Done -> {rec_dir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
