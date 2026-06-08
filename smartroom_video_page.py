@@ -100,6 +100,26 @@ def resolve_dataset_path(encoded_name):
     return None
 
 
+def day_folders():
+    """All day_* folders that contain at least one recording, newest first."""
+    if not DATA_DIR.exists():
+        return []
+    days = [d for d in DATA_DIR.glob("day_*") if d.is_dir() and any(d.glob("rec_*"))]
+    return sorted(days, key=lambda d: d.name, reverse=True)
+
+
+def resolve_day_path(encoded_name):
+    token = urllib.parse.unquote(encoded_name)
+    if not token.startswith("data/"):
+        return None
+    candidate = (DATA_DIR / token.removeprefix("data/")).resolve()
+    root = DATA_DIR.resolve()
+    # must be a direct child of data/ named day_*
+    if candidate.is_dir() and candidate.parent == root and candidate.name.startswith("day_"):
+        return candidate
+    return None
+
+
 def local_ip():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -382,6 +402,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/dataset/"):
             self.serve_dataset(parsed.path.removeprefix("/dataset/"))
             return
+        if parsed.path.startswith("/day/"):
+            self.serve_day(parsed.path.removeprefix("/day/"))
+            return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
     def do_POST(self):
@@ -488,6 +511,18 @@ class Handler(BaseHTTPRequestHandler):
             <p>Record a video with Smartroom Recorder, then refresh this page.</p>
           </article>
         """
+
+        day_links = []
+        for d in day_folders():
+            count = len(list(d.glob("rec_*")))
+            dq = urllib.parse.quote(day_token(d), safe="")
+            plural = "s" if count != 1 else ""
+            day_links.append(
+                f'<a href="/day/{dq}">{html.escape(d.name)} '
+                f'<span>({count} recording{plural}, .zip)</span></a>'
+            )
+        days_html = "".join(day_links)
+
         body = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -663,6 +698,23 @@ class Handler(BaseHTTPRequestHandler):
       margin: 36px 0 4px;
       font-size: 22px;
     }}
+    .day-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .day-list a {{
+      display: inline-block;
+      color: #fff;
+      background: var(--accent);
+      text-decoration: none;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-weight: 700;
+      width: fit-content;
+    }}
+    .day-list a span {{ font-weight: 400; opacity: 0.85; }}
     main {{
       margin: 16px auto 48px;
       display: grid;
@@ -756,6 +808,11 @@ class Handler(BaseHTTPRequestHandler):
     <div class="live-stage" id="rec-preview-stage" style="display:none; margin-top:14px;">
       <img id="rec-preview" alt="Recording preview">
     </div>
+  </section>
+
+  <section class="wrap days">
+    <h2 class="section-head">Full days</h2>
+    <div class="day-list">{days_html}</div>
   </section>
 
   <h2 class="section-head wrap">Recordings</h2>
@@ -907,20 +964,30 @@ class Handler(BaseHTTPRequestHandler):
         if rec_dir is None:
             self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
             return
+        self.serve_zip(rec_dir)
 
-        files = sorted(p for p in rec_dir.rglob("*") if p.is_file())
+    def serve_day(self, encoded_name):
+        day_dir = resolve_day_path(encoded_name)
+        if day_dir is None:
+            self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
+            return
+        self.serve_zip(day_dir)
+
+    def serve_zip(self, target_dir):
+        """Stream a zip of target_dir, nested under its own name (e.g. day_*/...)."""
+        files = sorted(p for p in target_dir.rglob("*") if p.is_file())
         tmp = tempfile.NamedTemporaryFile(prefix="smartroom_", suffix=".zip", delete=False)
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as archive:
                 for file_path in files:
-                    arcname = Path(rec_dir.name) / file_path.relative_to(rec_dir)
+                    arcname = file_path.relative_to(target_dir.parent)
                     archive.write(file_path, arcname.as_posix())
             tmp.close()
             size = os.path.getsize(tmp.name)
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition", f'attachment; filename="{rec_dir.name}.zip"')
+            self.send_header("Content-Disposition", f'attachment; filename="{target_dir.name}.zip"')
             self.end_headers()
             with open(tmp.name, "rb") as src:
                 self.copy_file(src)
