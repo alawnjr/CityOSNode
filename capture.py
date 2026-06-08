@@ -10,6 +10,7 @@ same layout as sample_dataset/:
         streams/
             camera_main.mp4              (USB camera, h264)
             camera_main_timestamps.csv   (frame_index, timestamp_seconds)
+            mic_array.wav                (camera mic, 48 kHz stereo)
             custom_board_i2c.csv         (BME680 / TCS34725 / ADXL345 / MLX90393)
             mcp3008_mic.csv              (mic level via MCP3008 ADC)
             radar_ops243.csv             (OPS243-A radar, raw serial lines)
@@ -31,6 +32,9 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 CAMERA = "/dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0"
 CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 640, 480, 30
 TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+MIC_DEVICE = "plughw:CARD=Camera,DEV=0"  # camera's built-in mic (by card name)
+AUDIO_RATE, AUDIO_CHANNELS = 48000, 2
 
 RADAR_PORT, RADAR_BAUD = "/dev/ttyACM0", 19200
 
@@ -145,6 +149,23 @@ def log_radar(path, stop_event, start):
                 handle.flush()
 
 
+def start_audio(path):
+    """Record the camera mic to a wav for DURATION_SECONDS (non-blocking)."""
+    try:
+        return subprocess.Popen([
+            "arecord", "-q",
+            "-D", MIC_DEVICE,
+            "-f", "S16_LE",
+            "-r", str(AUDIO_RATE),
+            "-c", str(AUDIO_CHANNELS),
+            "-d", str(DURATION_SECONDS),
+            str(path),
+        ])
+    except Exception as error:
+        print(f"audio: unavailable ({error})")
+        return None
+
+
 def record_camera(path):
     timestamp_filter = (
         f"drawtext=fontfile={TIMESTAMP_FONT}:"
@@ -197,6 +218,12 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
                 "sample_rate_hz": 1,
                 "fields": I2C_FIELDS,
             },
+            "mic_array": {
+                "modality": "audio",
+                "path": "streams/mic_array.wav",
+                "sample_rate_hz": AUDIO_RATE,
+                "channels": AUDIO_CHANNELS,
+            },
             "mcp3008_mic": {
                 "modality": "audio_level",
                 "path": "streams/mcp3008_mic.csv",
@@ -229,9 +256,12 @@ def main():
     ]
     for thread in threads:
         thread.start()
+    audio_proc = start_audio(streams / "mic_array.wav")
 
     record_camera(streams / "camera_main.mp4")  # blocks for DURATION_SECONDS
 
+    if audio_proc:
+        audio_proc.wait()
     stop_event.set()
     for thread in threads:
         thread.join()
