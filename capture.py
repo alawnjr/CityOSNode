@@ -184,14 +184,16 @@ def record_camera(path):
         "-input_format", "mjpeg", "-video_size", f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}",
         "-i", CAMERA, "-t", str(DURATION_SECONDS),
     ]
-    if os.environ.get("SMARTROOM_PREVIEW"):
-        # Write the recording to file (with overlay) AND emit a live MJPEG feed
-        # on stdout so the web page can show the camera while recording.
+    preview_path = os.environ.get("SMARTROOM_PREVIEW")
+    if preview_path:
+        # Record to file (with overlay) AND write the latest frame (~5 fps) to a
+        # single jpg so the web page can show the camera while recording. A file
+        # write can't block, so this never stalls the recording.
         command += [
             "-map", "0:v:0", "-vf", timestamp_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             str(path),
-            "-map", "0:v:0", "-c:v", "copy", "-f", "mpjpeg", "pipe:1",
+            "-map", "0:v:0", "-r", "5", "-update", "1", "-y", preview_path,
         ]
     else:
         command += [

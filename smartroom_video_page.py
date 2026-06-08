@@ -19,6 +19,7 @@ PORT = int(os.environ.get("SMARTROOM_VIDEO_PORT", "8000"))
 RECORDINGS_DIR = Path.home() / "Videos" / "Smartroom Recordings"
 DATA_DIR = Path.home() / "CityOS" / "data"
 RECORD_SCRIPT = Path.home() / "CityOS" / "run_smartroom_capture.sh"
+PREVIEW_PATH = "/dev/shm/smartroom_preview.jpg"  # recorder writes the latest frame here
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".h264", ".ts"}
 
 CAMERA_DEVICE = os.environ.get("SMARTROOM_CAMERA", "/dev/video0")
@@ -151,27 +152,6 @@ class CameraStream:
         with self.cond:
             self.recording = False
 
-    def start_external_feed(self):
-        """Broadcast frames pushed in from the recorder instead of our own ffmpeg."""
-        with self.cond:
-            self.recording = True
-            self.running = True
-            self.frame = None
-            self.frame_id += 1
-            self.cond.notify_all()
-
-    def push_external_frame(self, frame):
-        with self.cond:
-            self.frame = frame
-            self.frame_id += 1
-            self.cond.notify_all()
-
-    def stop_external_feed(self):
-        with self.cond:
-            self.recording = False
-            self.running = False
-            self.cond.notify_all()
-
     def _start_locked(self):
         self.frame = None
         cmd = [
@@ -295,57 +275,33 @@ class Recorder:
                 return False, "A recording is already in progress."
             if not RECORD_SCRIPT.exists():
                 return False, "Recorder script not found on the Pi."
-        # Free the camera from the live stream, then broadcast the recorder's feed.
+        # Free the camera from the live stream so the recorder can open it. The
+        # recorder writes preview frames to PREVIEW_PATH, which we serve directly.
         CAMERA.shutdown_for_recording()
-        CAMERA.start_external_feed()
+        try:
+            os.unlink(PREVIEW_PATH)
+        except OSError:
+            pass
         time.sleep(0.8)  # let the device free up before the recorder opens it
         env = dict(os.environ)
-        env["SMARTROOM_PREVIEW"] = "1"  # tell capture.py to emit the live feed on stdout
+        env["SMARTROOM_PREVIEW"] = PREVIEW_PATH  # capture.py writes the live frame here
         try:
             process = subprocess.Popen(
                 ["/bin/sh", str(RECORD_SCRIPT), str(duration)],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,  # own process group so cancel can kill children
                 env=env,
-                bufsize=0,
             )
         except Exception as exc:
-            CAMERA.stop_external_feed()
+            CAMERA.resume_after_recording()
             return False, f"Could not start recorder: {exc}"
         with self.lock:
             self.process = process
             self.start_monotonic = time.monotonic()
             self.duration = duration
-        threading.Thread(target=self._relay_preview, args=(process.stdout,), daemon=True).start()
         threading.Thread(target=self._watch, args=(process,), daemon=True).start()
         return True, "Recording started."
-
-    def _relay_preview(self, stdout):
-        """Read the recorder's MJPEG stdout feed and broadcast it to viewers."""
-        try:
-            while True:
-                content_length = None
-                while True:
-                    line = stdout.readline()
-                    if not line:
-                        return
-                    stripped = line.strip()
-                    if stripped.lower().startswith(b"content-length:"):
-                        content_length = int(stripped.split(b":", 1)[1])
-                    elif stripped == b"" and content_length is not None:
-                        break
-                body = bytearray()
-                remaining = content_length
-                while remaining > 0:
-                    chunk = stdout.read(remaining)
-                    if not chunk:
-                        return
-                    body += chunk
-                    remaining -= len(chunk)
-                CAMERA.push_external_frame(bytes(body))
-        except Exception:
-            pass
 
     def cancel(self):
         with self.lock:
@@ -363,7 +319,11 @@ class Recorder:
 
     def _watch(self, process):
         process.wait()
-        CAMERA.stop_external_feed()
+        CAMERA.resume_after_recording()
+        try:
+            os.unlink(PREVIEW_PATH)
+        except OSError:
+            pass
 
     def status(self):
         with self.lock:
@@ -409,6 +369,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/record/status":
             self.send_bytes(json.dumps(RECORDER.status()).encode("utf-8"),
                             "application/json; charset=utf-8")
+            return
+        if parsed.path == "/preview.jpg":
+            self.serve_preview()
             return
         if parsed.path.startswith("/video/"):
             self.serve_video(parsed.path.removeprefix("/video/"), download=False)
@@ -790,6 +753,9 @@ class Handler(BaseHTTPRequestHandler):
       <span id="rec-text">Recording&hellip;</span>
       <button type="button" id="rec-cancel">Cancel</button>
     </div>
+    <div class="live-stage" id="rec-preview-stage" style="display:none; margin-top:14px;">
+      <img id="rec-preview" alt="Recording preview">
+    </div>
   </section>
 
   <h2 class="section-head wrap">Recordings</h2>
@@ -840,7 +806,10 @@ class Handler(BaseHTTPRequestHandler):
       var secs = document.getElementById('rec-seconds');
       var box = document.getElementById('rec-status');
       var text = document.getElementById('rec-text');
-      var tick = null, poll = null, startMs = 0, duration = 0, cancelling = false;
+      var liveSection = document.querySelector('.wrap.live');
+      var previewStage = document.getElementById('rec-preview-stage');
+      var previewImg = document.getElementById('rec-preview');
+      var tick = null, poll = null, refresh = null, startMs = 0, duration = 0, cancelling = false;
 
       function fmt(s) {{
         s = Math.max(0, Math.round(s));
@@ -857,6 +826,7 @@ class Handler(BaseHTTPRequestHandler):
       function finish(message) {{
         if (tick) {{ clearInterval(tick); tick = null; }}
         if (poll) {{ clearInterval(poll); poll = null; }}
+        if (refresh) {{ clearInterval(refresh); refresh = null; }}
         text.textContent = message;
         cancelBtn.style.display = 'none';
         btn.disabled = false;
@@ -893,8 +863,13 @@ class Handler(BaseHTTPRequestHandler):
           render();
           tick = setInterval(render, 250);
           poll = setInterval(checkStatus, 1500);
-          // reconnect the live view to show the recorder's feed
-          if (window.__liveRestart) {{ window.__liveRestart(); }}
+          // the live MJPEG view can't run while recording (camera is busy), so
+          // hide it and show the recorder's preview frame, refreshed a few times/sec
+          if (liveSection) {{ liveSection.style.display = 'none'; }}
+          previewStage.style.display = '';
+          refresh = setInterval(function () {{
+            previewImg.src = '/preview.jpg?t=' + Date.now();
+          }}, 300);
         }}).catch(function () {{ finish('Could not start recording.'); }});
       }});
 
@@ -909,6 +884,23 @@ class Handler(BaseHTTPRequestHandler):
 </body>
 </html>"""
         self.send_bytes(body.encode("utf-8"))
+
+    def serve_preview(self):
+        """Serve the latest recording preview frame written by the recorder."""
+        try:
+            data = Path(PREVIEW_PATH).read_bytes()
+        except OSError:
+            self.send_bytes(b"", "image/jpeg", 404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
 
     def serve_dataset(self, encoded_name):
         rec_dir = resolve_dataset_path(encoded_name)
