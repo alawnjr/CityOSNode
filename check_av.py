@@ -23,6 +23,7 @@ Device paths/format match capture.py. Run on the Pi:
 """
 
 import array
+import collections
 import math
 import subprocess
 import sys
@@ -169,23 +170,29 @@ def _analyze_wav(path):
         return "FAIL"
 
     mean = sum(mono) / n
-    peak = max(abs(mn := min(mono)), abs(mx := max(mono)))
+    mn, mx = min(mono), max(mono)
+    peak = max(abs(mn), abs(mx))
     ac_rms = math.sqrt(sum((s - mean) ** 2 for s in mono) / n)
 
-    # A healthy AC mic swings BOTH sides of its DC bias. The dead camera mic
-    # sits pinned at its rest value (~3145) and only ever dips downward, so it
-    # almost never rises above its own mean.
-    above = sum(1 for s in mono if s > mean)
+    # A healthy AC mic swings BOTH sides of its DC rest level. The dead camera
+    # mic sits pinned at its rest value (~3145) and only ever dips downward --
+    # it never rises above that rest level. The rest level is the *mode* (most
+    # common sample), NOT the arithmetic mean: the downward dips drag the mean
+    # below the pinned value, which would make the pinned samples look like
+    # they're "above the mean". So measure excursions above the mode instead.
+    rest = collections.Counter(mono).most_common(1)[0][0]
+    above = sum(1 for s in mono if s > rest)
+    below = sum(1 for s in mono if s < rest)
     frac_above = above / n
 
-    print(f"    samples={n}  dc_mean={mean:.0f}  min={mn}  max={mx}")
+    print(f"    samples={n}  rest(mode)={rest}  dc_mean={mean:.0f}  min={mn}  max={mx}")
     print(f"    ac_rms={ac_rms:.1f} ({_dbfs(ac_rms):.1f} dBFS)  "
           f"peak={peak} ({_dbfs(peak):.1f} dBFS)")
-    print(f"    samples above DC mean: {frac_above*100:.1f}%")
+    print(f"    above rest: {frac_above*100:.1f}%   below rest: {below/n*100:.1f}%")
 
     if frac_above < 0.02:
-        print("    FAIL: signal is one-sided / pinned at a DC value -- "
-              "mic is not producing real audio (likely dead)")
+        print("    FAIL: signal never rises above its DC rest level -- "
+              "pinned/one-sided, mic is not producing real audio (likely dead)")
         return "FAIL"
     if ac_rms < FULL_SCALE * 10 ** (-50 / 20):  # below ~-50 dBFS
         print("    WARN: audio present but very quiet -- silent room, or low "
