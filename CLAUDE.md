@@ -15,22 +15,26 @@ The sensors are physically wired to a **Raspberry Pi 5** (`smartroom.local`, use
 CircuitPython libraries (`board`, `busio`, `adafruit_*`) only function there
 against real GPIO/SPI/I²C — they will not import or run on a normal dev machine.
 
-### Sync workflow — GitHub only, never edit code on the Pi
+### Sync workflow — push through git, never edit code on the Pi
 
 **Do NOT edit code on the Pi directly, and do NOT `scp`/copy files onto it.** All
-code changes flow through GitHub so the two checkouts never diverge:
+code changes flow through git so the two checkouts never diverge:
 
-1. On the dev machine: make changes, commit, and push to GitHub.
-2. On the Pi: `git pull`, then run.
+1. On the dev machine: make changes, commit, and push to **both** remotes.
+2. On the Pi: `git pull origin master`, then run.
 
-GitHub is `github.com:alawnjr/CityOSNode.git`. The remote names are **swapped**
-between the machines:
+Both machines have the **same two remotes** (names are NOT swapped):
+- `origin`   → `github.com:alawnjr/CityOSNode.git` (the Pi pulls from this one)
+- `personal` → `gitlab.orbit-lab.org:alawnjr/smartroom.git`
+
+Always push to **both** so GitHub and the GitLab mirror stay in sync:
 
 ```bash
-# Dev machine (this repo): GitHub is the "personal" remote
+# Dev machine (this repo): push the same commit to both remotes
+git push origin master
 git push personal master
 
-# Pi (~/CityOS): GitHub is the "origin" remote
+# Pi (~/CityOS): pulls from origin (GitHub)
 ssh smartroom@smartroom.local 'cd ~/CityOS && git pull origin master'
 ```
 
