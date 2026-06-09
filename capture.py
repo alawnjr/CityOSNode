@@ -12,7 +12,8 @@ same layout as sample_dataset/:
             camera_main_timestamps.csv   (frame_index, timestamp_seconds)
             mic_array.wav                (camera mic, 48 kHz stereo)
             custom_board_i2c.csv         (BME680 / TCS34725 / ADXL345 / MLX90393)
-            mcp3008_mic.csv              (mic level via MCP3008 ADC)
+            mcp3008_mic.csv              (mic level via MCP3008 ADC, ~20 Hz)
+            mcp3008_audio.wav            (MAX9814 mic waveform via MCP3008, ~28 kHz)
             radar_ops243.csv             (OPS243-A radar, raw serial lines)
 
 Run on the Pi:  python capture.py            # 30s (default)
@@ -20,6 +21,7 @@ Run on the Pi:  python capture.py            # 30s (default)
 """
 
 import argparse
+import array
 import csv
 import json
 import os
@@ -27,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +43,16 @@ TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 MIC_DEVICE = "plughw:CARD=Camera,DEV=0"  # camera's built-in mic (by card name)
 AUDIO_RATE, AUDIO_CHANNELS = 48000, 2
+
+# MCP3008 ADC mic (MAX9814 on channel P0, SPI0 CE0 = board.D8). One thread owns
+# the bus and reads it flat-out, producing both the ~20 Hz level CSV and a
+# real audio waveform. The camera mic is dead, so this is the node's only
+# usable audio track.
+ADC_REF_VOLTAGE = 3.3
+MCP3008_SPI_HZ = 1_350_000        # MCP3008 rated max clock at ~3.3V -> ~28 kHz sampling
+MCP3008_LEVEL_HZ = 20             # mcp3008_mic.csv level cadence (unchanged)
+MCP3008_AUDIO_GAIN = 32           # 10-bit (±512) -> 16-bit PCM, with headroom
+MCP3008_AUDIO_RATE_NOMINAL = 28000  # metadata fallback if the measured rate is unknown
 
 RADAR_PORT, RADAR_BAUD = "/dev/ttyACM0", 19200
 
@@ -110,29 +123,65 @@ def log_i2c(path, stop_event, start):
             time.sleep(1.0)
 
 
-def log_mcp3008_mic(path, stop_event, start):
+def log_mcp3008(audio_path, level_path, stop_event, start, result):
+    """Read the MAX9814 mic on the MCP3008 (SPI channel P0) as fast as the bus
+    allows and produce both ADC outputs from the one stream of samples:
+
+      - level_path  raw voltage at ~MCP3008_LEVEL_HZ (loudness/activity, as before)
+      - audio_path  the full waveform as a real wav (the only working audio mic)
+
+    A single thread owns the chip select so the two outputs never contend for
+    the SPI bus. The high-rate samples are buffered and written to the wav once
+    recording stops (the measured rate is reported back via `result`)."""
     try:
-        import board
-        import busio
-        import digitalio
-        import adafruit_mcp3xxx.mcp3008 as MCP
-        from adafruit_mcp3xxx.analog_in import AnalogIn
-        spi = busio.SPI(clock=board.SCK, MISO=board.MISO, MOSI=board.MOSI)
-        cs = digitalio.DigitalInOut(board.D8)
-        mcp = MCP.MCP3008(spi, cs, ref_voltage=3.3)
-        mic = AnalogIn(mcp, MCP.P0)
+        import spidev
+        spi = spidev.SpiDev()
+        spi.open(0, 0)                       # SPI0, CE0 (board.D8) -- matches wiring
+        spi.max_speed_hz = MCP3008_SPI_HZ
     except Exception as error:
         print(f"mcp3008: unavailable ({error})", file=sys.stderr)
         return
 
-    with path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["timestamp_seconds", "voltage"])
-        while not stop_event.is_set():
-            t = time.monotonic() - start
-            writer.writerow([f"{t:.3f}", f"{mic.voltage:.4f}"])
-            handle.flush()
-            time.sleep(0.05)
+    def read_raw():
+        # MCP3008 single-ended channel 0 -> 10-bit reading.
+        reply = spi.xfer2([1, 8 << 4, 0])
+        return ((reply[1] & 3) << 8) | reply[2]
+
+    raw = array.array("H")
+    next_level = 0.0
+    try:
+        with open(level_path, "w", newline="") as level_file:
+            writer = csv.writer(level_file)
+            writer.writerow(["timestamp_seconds", "voltage"])
+            while not stop_event.is_set():
+                value = read_raw()
+                raw.append(value)
+                t = time.monotonic() - start
+                if t >= next_level:
+                    writer.writerow([f"{t:.3f}", f"{value / 1023 * ADC_REF_VOLTAGE:.4f}"])
+                    level_file.flush()
+                    next_level += 1.0 / MCP3008_LEVEL_HZ
+    finally:
+        elapsed = time.monotonic() - start
+        spi.close()
+
+    if not raw:
+        return
+    rate = int(round(len(raw) / elapsed)) or MCP3008_AUDIO_RATE_NOMINAL
+    # AC-couple (remove the mic's DC bias) and scale the 10-bit reading up to
+    # 16-bit PCM so the wav is listenable. The raw, uncorrected readings are
+    # still preserved in the level CSV; only this audio artifact is centered.
+    mean = sum(raw) / len(raw)
+    pcm = array.array("h", (
+        max(-32768, min(32767, int((value - mean) * MCP3008_AUDIO_GAIN)))
+        for value in raw
+    ))
+    with wave.open(str(audio_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm.tobytes())
+    result["audio_rate"] = rate
 
 
 def log_radar(path, stop_event, start):
@@ -216,7 +265,7 @@ def write_camera_timestamps(path, fps):
     return frame_count
 
 
-def write_metadata(rec_dir, start_time, end_time, frame_count):
+def write_metadata(rec_dir, start_time, end_time, frame_count, mcp3008_audio_rate=None):
     metadata = {
         "recording_id": rec_dir.name,
         "space": "smart_room_1",
@@ -249,8 +298,18 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
             "mcp3008_mic": {
                 "modality": "audio_level",
                 "path": "streams/mcp3008_mic.csv",
-                "sample_rate_hz": 20,
+                "sample_rate_hz": MCP3008_LEVEL_HZ,
                 "fields": ["voltage"],
+            },
+            "mcp3008_audio": {
+                "modality": "audio",
+                "path": "streams/mcp3008_audio.wav",
+                "sample_rate_hz": mcp3008_audio_rate or MCP3008_AUDIO_RATE_NOMINAL,
+                "channels": 1,
+                "note": (
+                    "MAX9814 mic via MCP3008 ADC, raw spidev; AC-coupled and "
+                    "scaled to 16-bit. Software-timed, so the rate is approximate."
+                ),
             },
             "radar_ops243": {
                 "modality": "motion",
@@ -277,9 +336,10 @@ def main():
     start = time.monotonic()
     start_time = datetime.now().astimezone()
 
+    mcp_result = {}
     threads = [
         threading.Thread(target=log_i2c, args=(streams / "custom_board_i2c.csv", stop_event, start), daemon=True),
-        threading.Thread(target=log_mcp3008_mic, args=(streams / "mcp3008_mic.csv", stop_event, start), daemon=True),
+        threading.Thread(target=log_mcp3008, args=(streams / "mcp3008_audio.wav", streams / "mcp3008_mic.csv", stop_event, start, mcp_result), daemon=True),
         threading.Thread(target=log_radar, args=(streams / "radar_ops243.csv", stop_event, start), daemon=True),
     ]
     for thread in threads:
@@ -299,11 +359,13 @@ def main():
             except Exception:
                 audio_proc.terminate()
         for thread in threads:
-            thread.join(timeout=5)
+            # Generous timeout: the mcp3008 thread encodes its buffered audio to
+            # the wav after stop, which takes a moment on long recordings.
+            thread.join(timeout=30)
 
     end_time = datetime.now().astimezone()
     frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", CAMERA_FPS)
-    write_metadata(rec_dir, start_time, end_time, frame_count)
+    write_metadata(rec_dir, start_time, end_time, frame_count, mcp_result.get("audio_rate"))
     print(f"Done -> {rec_dir}", file=sys.stderr)
 
 

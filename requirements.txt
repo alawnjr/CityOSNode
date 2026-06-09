@@ -6,7 +6,8 @@
 # (apt install ffmpeg v4l-utils), which are not Python packages.
 
 Adafruit-Blinka==9.1.0                    # board, busio, digitalio
-adafruit-circuitpython-mcp3xxx==1.5.2     # MCP3008 ADC (mic)
+adafruit-circuitpython-mcp3xxx==1.5.2     # MCP3008 ADC (mic) -- i2c sensors / level
+spidev==3.8                               # raw SPI for high-rate MCP3008 audio
 adafruit-circuitpython-bme680==3.7.16     # temp / humidity / pressure / gas
 adafruit-circuitpython-tcs34725==3.3.28   # color / light
 adafruit-circuitpython-adxl34x==1.12.20   # accelerometer
