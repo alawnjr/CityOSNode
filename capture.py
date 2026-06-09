@@ -53,6 +53,13 @@ MCP3008_SPI_HZ = 1_350_000        # MCP3008 rated max clock at ~3.3V -> ~28 kHz 
 MCP3008_LEVEL_HZ = 20             # mcp3008_mic.csv level cadence (unchanged)
 MCP3008_AUDIO_GAIN = 32           # 10-bit (±512) -> 16-bit PCM, with headroom
 MCP3008_AUDIO_RATE_NOMINAL = 28000  # metadata fallback if the measured rate is unknown
+# The mic is software-timed (no hardware clock), so sample spacing jitters and
+# the bulk of the noise energy sits above the voice band. The audio wav is
+# resampled onto a uniform grid (jitter correction) using the per-sample
+# timestamps, then band-passed to the voice range before encoding. Needs numpy;
+# without it we fall back to the plain AC-coupled encode.
+MCP3008_AUDIO_HP_HZ = 80          # high-pass: drop DC/rumble
+MCP3008_AUDIO_LP_HZ = 5000        # low-pass: drop out-of-band hiss/aliasing
 
 RADAR_PORT, RADAR_BAUD = "/dev/ttyACM0", 19200
 
@@ -148,6 +155,7 @@ def log_mcp3008(audio_path, level_path, stop_event, start, result):
         return ((reply[1] & 3) << 8) | reply[2]
 
     raw = array.array("H")
+    times = array.array("d")             # per-sample timestamps, for jitter correction
     next_level = 0.0
     try:
         with open(level_path, "w", newline="") as level_file:
@@ -155,33 +163,68 @@ def log_mcp3008(audio_path, level_path, stop_event, start, result):
             writer.writerow(["timestamp_seconds", "voltage"])
             while not stop_event.is_set():
                 value = read_raw()
-                raw.append(value)
                 t = time.monotonic() - start
+                raw.append(value)
+                times.append(t)
                 if t >= next_level:
                     writer.writerow([f"{t:.3f}", f"{value / 1023 * ADC_REF_VOLTAGE:.4f}"])
                     level_file.flush()
                     next_level += 1.0 / MCP3008_LEVEL_HZ
     finally:
-        elapsed = time.monotonic() - start
         spi.close()
 
-    if not raw:
-        return
-    rate = int(round(len(raw) / elapsed)) or MCP3008_AUDIO_RATE_NOMINAL
-    # AC-couple (remove the mic's DC bias) and scale the 10-bit reading up to
-    # 16-bit PCM so the wav is listenable. The raw, uncorrected readings are
-    # still preserved in the level CSV; only this audio artifact is centered.
-    mean = sum(raw) / len(raw)
-    pcm = array.array("h", (
-        max(-32768, min(32767, int((value - mean) * MCP3008_AUDIO_GAIN)))
-        for value in raw
-    ))
+    rate = _encode_adc_audio(raw, times, audio_path)
+    if rate:
+        result["audio_rate"] = rate
+
+
+def _encode_adc_audio(raw, times, audio_path):
+    """Encode the buffered MCP3008 samples to a 16-bit wav and return its rate.
+
+    The samples are software-timed, so before encoding we resample them onto a
+    uniform grid using the captured timestamps (this undoes the ~20% timing
+    jitter) and band-pass to the voice range to drop out-of-band hiss. This
+    needs numpy; without it we fall back to a plain AC-coupled encode at the
+    average rate. Raw, uncorrected readings remain in the level CSV -- only this
+    listenable audio artifact is filtered."""
+    n = len(raw)
+    if n < 2:
+        return None
+    duration = times[-1] - times[0]
+    if duration <= 0:
+        return None
+    rate = int(round(n / duration)) or MCP3008_AUDIO_RATE_NOMINAL
+
+    try:
+        import numpy as np
+        signal = np.asarray(raw, dtype=np.float64)
+        signal -= signal.mean()                      # AC-couple
+        stamps = np.asarray(times, dtype=np.float64) - times[0]
+        # 1) jitter correction: resample the unevenly-spaced samples onto a
+        #    uniform time grid so playback timing is regular.
+        uniform = np.linspace(0.0, duration, n)
+        signal = np.interp(uniform, stamps, signal)
+        # 2) voice band-pass via an FFT mask.
+        spectrum = np.fft.rfft(signal)
+        freqs = np.fft.rfftfreq(n, d=duration / n)
+        spectrum[(freqs < MCP3008_AUDIO_HP_HZ) | (freqs > MCP3008_AUDIO_LP_HZ)] = 0.0
+        signal = np.fft.irfft(spectrum, n=n)
+        pcm = np.clip(signal * MCP3008_AUDIO_GAIN, -32768, 32767).astype("<i2").tobytes()
+    except Exception as error:
+        # numpy missing (or any failure): plain AC-coupled encode, no filtering.
+        print(f"mcp3008: writing unfiltered audio ({error})", file=sys.stderr)
+        mean = sum(raw) / n
+        pcm = array.array("h", (
+            max(-32768, min(32767, int((value - mean) * MCP3008_AUDIO_GAIN)))
+            for value in raw
+        )).tobytes()
+
     with wave.open(str(audio_path), "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
         wav.setframerate(rate)
-        wav.writeframes(pcm.tobytes())
-    result["audio_rate"] = rate
+        wav.writeframes(pcm)
+    return rate
 
 
 def log_radar(path, stop_event, start):
@@ -307,8 +350,10 @@ def write_metadata(rec_dir, start_time, end_time, frame_count, mcp3008_audio_rat
                 "sample_rate_hz": mcp3008_audio_rate or MCP3008_AUDIO_RATE_NOMINAL,
                 "channels": 1,
                 "note": (
-                    "MAX9814 mic via MCP3008 ADC, raw spidev; AC-coupled and "
-                    "scaled to 16-bit. Software-timed, so the rate is approximate."
+                    "MAX9814 mic via MCP3008 ADC, raw spidev; AC-coupled, "
+                    "jitter-corrected (resampled from per-sample timestamps) and "
+                    f"band-passed {MCP3008_AUDIO_HP_HZ}-{MCP3008_AUDIO_LP_HZ} Hz. "
+                    "Software-timed, so the rate is approximate."
                 ),
             },
             "radar_ops243": {
