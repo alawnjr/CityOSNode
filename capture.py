@@ -10,7 +10,7 @@ same layout as sample_dataset/:
         streams/
             camera_main.mp4              (USB camera, h264)
             camera_main_timestamps.csv   (frame_index, timestamp_seconds)
-            mic_array.wav                (camera mic, 48 kHz stereo)
+            mic_array.wav                (C920 camera mic, 48 kHz stereo)
             custom_board_i2c.csv         (BME680 / TCS34725 / ADXL345 / MLX90393)
             mcp3008_mic.csv              (mic level via MCP3008 ADC, ~20 Hz)
             mcp3008_audio.wav            (MAX9814 mic waveform via MCP3008, ~28 kHz)
@@ -43,13 +43,13 @@ CAMERA = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_6E6D65AF-video-index0"
 CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 1280, 720, 30
 TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-MIC_DEVICE = "plughw:CARD=Camera,DEV=0"  # camera's built-in mic (by card name)
+MIC_DEVICE = "plughw:CARD=C920,DEV=0"  # C920's built-in mic, by card name (a real, working mic)
 AUDIO_RATE, AUDIO_CHANNELS = 48000, 2
 
 # MCP3008 ADC mic (MAX9814 on channel P0, SPI0 CE0 = board.D8). One thread owns
 # the bus and reads it flat-out, producing both the ~20 Hz level CSV and a
-# real audio waveform. The camera mic is dead, so this is the node's only
-# usable audio track.
+# real audio waveform. This is now a second working mic alongside the C920's
+# (mic_array.wav); the old lihappe8 camera mic was dead.
 ADC_REF_VOLTAGE = 3.3
 MCP3008_SPI_HZ = 1_350_000        # MCP3008 rated max clock at ~3.3V -> ~28 kHz sampling
 MCP3008_LEVEL_HZ = 20             # mcp3008_mic.csv level cadence (unchanged)
@@ -137,7 +137,7 @@ def log_mcp3008(audio_path, level_path, stop_event, start, result):
     allows and produce both ADC outputs from the one stream of samples:
 
       - level_path  raw voltage at ~MCP3008_LEVEL_HZ (loudness/activity, as before)
-      - audio_path  the full waveform as a real wav (the only working audio mic)
+      - audio_path  the full waveform as a real wav (a working audio mic)
 
     A single thread owns the chip select so the two outputs never contend for
     the SPI bus. The high-rate samples are buffered and written to the wav once
