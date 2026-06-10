@@ -231,6 +231,7 @@ def log_radar(path, stop_event, start):
     try:
         import serial
         port = serial.Serial(RADAR_PORT, RADAR_BAUD, timeout=0.5)
+        port.write(b"O/")  # report range smallest-distance-first (nearest object), not strongest
         port.write(b"OD")  # OPS243-A: enable data output
     except Exception as error:
         print(f"radar: unavailable ({error})", file=sys.stderr)

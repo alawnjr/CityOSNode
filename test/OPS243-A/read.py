@@ -3,6 +3,7 @@ import serial
 ser = serial.Serial('/dev/ttyACM0', 19200, timeout=1)
 
 ser.write(b'UC')
+ser.write(b'O/')  # report range smallest-distance-first (nearest object), not strongest
 
 while True:
     ser.write(b'OD')
