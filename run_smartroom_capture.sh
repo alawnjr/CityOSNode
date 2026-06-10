@@ -10,4 +10,7 @@ if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
   PYTHON="$SCRIPT_DIR/.venv/bin/python"
 fi
 
-exec "$PYTHON" "$SCRIPT_DIR/run_smartroom_capture.py" --duration "${1:-30}"
+# Run the capture, then split the raw radar log into typed speed/distance
+# columns (parse_radar.py parses the recording capture.py just wrote).
+"$PYTHON" "$SCRIPT_DIR/run_smartroom_capture.py" --duration "${1:-30}"
+"$PYTHON" "$SCRIPT_DIR/parse_radar.py"
