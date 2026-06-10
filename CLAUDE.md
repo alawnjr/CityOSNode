@@ -59,7 +59,7 @@ capture also needs the system tools `ffmpeg` and `v4l-utils` (apt).
 
 | Sensor | Access | Notes |
 |---|---|---|
-| USB camera (lihappe8) | ffmpeg `-f v4l2`, device `/dev/v4l/by-id/usb-lihappe8_...index0`, MJPG 640×480@30 | also has a built-in mic |
+| USB camera (Logitech C920) | ffmpeg `-f v4l2`, device `/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_...index0`, MJPG 1280×720@30 | wide 16:9 FOV; use a 16:9 mode (4:3 modes are center-cropped/narrower). Has a working built-in stereo mic. Replaced the lihappe8 (still wired, on video0) |
 | Camera mic | `arecord -D plughw:CARD=Camera,DEV=0`, 48 kHz stereo | addressed by card **name** so it survives card-number reordering. **DEAD** — the mic element only emits a constant DC value (~3145) and never responds to sound, so `mic_array.wav` is always silent. Config is correct; the hardware is faulty. Run `check_av.py` to confirm |
 | OPS243-C radar | pyserial `/dev/ttyACM0` @ **19200**, send `OD` to enable output | factory-calibrated; speed+distance FMCW. Dirs/comments say "OPS243-A" but the hardware is a **-C** |
 | MCP3008 ADC (SPI, CE0=`board.D8`) | raw `spidev` (bus 0, dev 0) @ 1.35 MHz, mic (MAX9814) on channel P0 | the node's **only working mic**. Read flat-out (~28 kHz) → `mcp3008_audio.wav` (real audio); also decimated to ~20 Hz → `mcp3008_mic.csv` (level). MAX9814 has hardware AGC (compresses dynamics); 10-bit + software-timed, so voice-grade not studio-clean |

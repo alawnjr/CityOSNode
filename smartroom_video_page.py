@@ -22,8 +22,13 @@ RECORD_SCRIPT = Path.home() / "CityOS" / "run_smartroom_capture.sh"
 PREVIEW_PATH = "/dev/shm/smartroom_preview.jpg"  # recorder writes the latest frame here
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".h264", ".ts"}
 
-CAMERA_DEVICE = os.environ.get("SMARTROOM_CAMERA", "/dev/video0")
-CAMERA_SIZE = os.environ.get("SMARTROOM_CAMERA_SIZE", "640x480")
+# Logitech C920, addressed by stable by-id path (matches capture.py) so it
+# survives /dev/videoN renumbering. Override with the SMARTROOM_CAMERA* env vars.
+CAMERA_DEVICE = os.environ.get(
+    "SMARTROOM_CAMERA",
+    "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_6E6D65AF-video-index0",
+)
+CAMERA_SIZE = os.environ.get("SMARTROOM_CAMERA_SIZE", "1280x720")
 STREAM_BOUNDARY = "frame"
 IDLE_TIMEOUT = 5.0  # release the camera this many seconds after the last viewer leaves
 FIRST_FRAME_TIMEOUT = 4.0

@@ -37,8 +37,10 @@ DEFAULT_DURATION = 30
 DURATION_SECONDS = DEFAULT_DURATION  # overridden by --duration in main()
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
-CAMERA = "/dev/v4l/by-id/usb-lihappe8_Corp._USB_2.0_Camera-video-index0"
-CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 640, 480, 30
+# Logitech C920 (wide 16:9 FOV); addressed by stable by-id path. The 16:9 MJPG
+# modes use the full sensor width — the 4:3 640x480 mode is center-cropped/narrower.
+CAMERA = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_6E6D65AF-video-index0"
+CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS = 1280, 720, 30
 TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 MIC_DEVICE = "plughw:CARD=Camera,DEV=0"  # camera's built-in mic (by card name)
