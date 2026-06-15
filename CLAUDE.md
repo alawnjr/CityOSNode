@@ -4,27 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A multimodal sensor-capture system for a "smart room" research node. It records
-synchronized camera, audio, and environmental/motion data into structured
-recording folders for downstream analysis (e.g. occupancy detection).
+A multi-camera capture system for a "smart room" research node — cameras placed
+in different parts of a room, recording into structured folders for downstream
+analysis (e.g. occupancy detection). **Video-only for now**: audio and the custom
+I²C/PCB sensors were removed from the capture pipeline (their `test/` scripts are
+kept — see below).
 
-## Critical: code runs on the Raspberry Pi, not the dev machine
+## Critical: code runs on the Raspberry Pis, not the dev machine
 
-The sensors are physically wired to a **Raspberry Pi 5** (`smartroom.local`, user
-`smartroom` — credentials in `PRIVATE.md`, gitignored). The Adafruit Blinka /
-CircuitPython libraries (`board`, `busio`, `adafruit_*`) only function there
-against real GPIO/SPI/I²C — they will not import or run on a normal dev machine.
+There are **two camera nodes**, each a Pi running the same checkout of this repo:
 
-### Sync workflow — push through git, never edit code on the Pi
+| Host | Board | Camera |
+|---|---|---|
+| `smartroom1.local` | Raspberry Pi 3 | generic ("random Chinese") USB camera |
+| `smartroom2.local` | Raspberry Pi 4 | Logitech (C920-class) USB camera |
 
-**Do NOT edit code on the Pi directly, and do NOT `scp`/copy files onto it.** All
-code changes flow through git so the two checkouts never diverge:
+User is `smartroom` on both; credentials in `PRIVATE.md` (gitignored). The cameras
+are accessed via `ffmpeg -f v4l2`, so capture itself needs no special libraries —
+but the cameras differ per node, so the device/format are **auto-detected and
+env-overridable** (see `capture.py` below) rather than hardcoded.
+
+### Sync workflow — push through git, never edit code on the Pis
+
+**Do NOT edit code on a Pi directly, and do NOT `scp`/copy files onto it.** All
+code changes flow through git so the checkouts never diverge:
 
 1. On the dev machine: make changes, commit, and push to **both** remotes.
-2. On the Pi: `git pull origin master`, then run.
+2. On **each** Pi: `git pull origin master`, then run.
 
-Both machines have the **same two remotes** (names are NOT swapped):
-- `origin`   → `github.com:alawnjr/CityOSNode.git` (the Pi pulls from this one)
+Both Pis (and this repo) have the **same two remotes** (names are NOT swapped):
+- `origin`   → `github.com:alawnjr/CityOSNode.git` (the Pis pull from this one)
 - `personal` → `gitlab.orbit-lab.org:alawnjr/smartroom.git`
 
 Always push to **both** so GitHub and the GitLab mirror stay in sync:
@@ -34,74 +43,81 @@ Always push to **both** so GitHub and the GitLab mirror stay in sync:
 git push origin master
 git push personal master
 
-# Pi (~/CityOS): pulls from origin (GitHub)
-ssh smartroom@smartroom.local 'cd ~/CityOS && git pull origin master'
+# Each Pi (~/CityOS): pulls from origin (GitHub)
+ssh smartroom@smartroom1.local 'cd ~/CityOS && git pull origin master'
+ssh smartroom@smartroom2.local 'cd ~/CityOS && git pull origin master'
 ```
 
-On the Pi you may freely **read and run** code (and run read-only git commands),
-but never modify tracked files there — editing happens only on the dev machine and
+On a Pi you may freely **read and run** code (and run read-only git commands), but
+never modify tracked files there — editing happens only on the dev machine and
 arrives via `git pull`. SSH key auth is already configured (no password needed).
+If `.local` mDNS resolution is flaky, SSH by IP instead.
 
-Run sensor code with the venv Python (`~/CityOS/.venv/bin/python`), never system
+Run capture with the venv Python (`~/CityOS/.venv/bin/python`), never system
 python:
 
 ```bash
-ssh smartroom@smartroom.local '~/CityOS/.venv/bin/python ~/CityOS/capture.py'
+ssh smartroom@smartroom2.local '~/CityOS/.venv/bin/python ~/CityOS/capture.py'
 ```
 
 There is **no build/lint/test suite** — these are standalone hardware scripts
-verified by running them against the live sensors.
+verified by running them against the live cameras.
 
-Install dependencies (on the Pi): `pip install -r requirements.txt`. Camera
-capture also needs the system tools `ffmpeg` and `v4l-utils` (apt).
+Install dependencies (on each Pi): `pip install -r requirements.txt`. Camera
+capture also needs the system tools `ffmpeg` and `v4l-utils` (apt). Fresh nodes
+can be bootstrapped with `setup_pi.sh`.
 
-## Hardware and how each sensor is accessed
+## Hardware and how the camera is accessed
 
-| Sensor | Access | Notes |
+| Node | Camera | Access |
 |---|---|---|
-| USB camera (Logitech C920) | ffmpeg `-f v4l2`, device `/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_...index0`, MJPG 1280×720@30 | wide 16:9 FOV; use a 16:9 mode (4:3 modes are center-cropped/narrower). Has a working built-in stereo mic. Replaced the lihappe8 (still wired, on video0) |
-| Camera mic (C920) | `arecord -D plughw:CARD=C920,DEV=0`, 48 kHz stereo | the C920's built-in mic — a **real, working** mic → `mic_array.wav`. Addressed by card **name** so it survives card-number reordering. Replaced the lihappe8 camera mic, which was **DEAD** (emitted a constant DC ~3145, never responded to sound). Run `check_av.py` to confirm |
-| MCP3008 ADC (SPI, CE0=`board.D8`) | raw `spidev` (bus 0, dev 0) @ 1.35 MHz, mic (MAX9814) on channel P0 | a **second working mic** (alongside the C920). Read flat-out (~28 kHz) → `mcp3008_audio.wav` (real audio); also decimated to ~20 Hz → `mcp3008_mic.csv` (level). MAX9814 has hardware AGC (compresses dynamics); 10-bit + software-timed, so voice-grade not studio-clean |
-| MAESTRO 2.1 I²C board | `board.I2C()` + `adafruit_*` | BME680 `0x76`, TCS34725 `0x29`, ADXL345 `0x53`, MLX90393 `0x0C` |
+| `smartroom1` (Pi 3) | generic USB camera | ffmpeg `-f v4l2`, MJPG; device auto-detected |
+| `smartroom2` (Pi 4) | Logitech (C920-class) USB camera | ffmpeg `-f v4l2`, MJPG 1280×720@30; wide 16:9 FOV (4:3 modes are center-cropped/narrower) |
 
-The PIR motion sensor was removed; `test/GPIO/` scripts are legacy wiring-discovery tools.
+The camera device is **auto-detected** at runtime (first `/dev/v4l/by-id/*-video-index0`
+symlink), so the one shared codebase works on both nodes despite the different
+cameras. Override per node with env vars: `SMARTROOM_CAMERA` (device),
+`SMARTROOM_CAMERA_SIZE` (e.g. `1280x720`), `SMARTROOM_CAMERA_FPS`. Set
+`SMARTROOM_CAMERA_SIZE` on a node whose camera doesn't support the 1280×720 default.
+
+**Audio and the I²C/PCB sensors were removed from the capture pipeline** (video
+only for now). Their drivers/wiring still exist on the boards and the per-device
+`test/` scripts are retained, so re-adding any of them later is straightforward.
 
 ## capture.py — the main pipeline
 
-Records all sensors concurrently for `DURATION_SECONDS` (default 30, set with
-`--duration`/`-d`) into a recording folder mirroring `sample_dataset/`:
+Records video for `DURATION_SECONDS` (default 30, set with `--duration`/`-d`) into
+a recording folder mirroring `sample_dataset/`:
 
 ```
 data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_NNN/
-  metadata.json          # recording_id, streams{}, calibration block
+  metadata.json          # recording_id, node (hostname), streams{}
   streams/
     camera_main.mp4 + camera_main_timestamps.csv
-    mic_array.wav          # C920 camera mic, 48 kHz stereo — a real, working mic
-    mcp3008_audio.wav      # MAX9814 mic waveform via MCP3008, ~28 kHz (the real audio)
-    mcp3008_mic.csv        # same mic decimated to ~20 Hz level/voltage
-    custom_board_i2c.csv   # all 4 i2c chips, one row/sec
 ```
 
-Concurrency model: the camera runs via a blocking `ffmpeg` call for the full
-duration; `arecord` runs as a parallel subprocess; the i2c/mcp3008 loggers
-each run in a thread writing CSV against a **shared `time.monotonic()` clock**
-(`start`), and a `stop_event` ends them when the camera finishes. The mcp3008
-thread owns the SPI bus alone, samples flat-out, and on stop encodes its buffered
-samples to `mcp3008_audio.wav` (so its `join` timeout is generous). Every sensor's
-init is wrapped in try/except so missing hardware prints `<sensor>: unavailable`
-and the rest of the capture still proceeds. Folder/recording numbers auto-increment.
+It's a single blocking `ffmpeg -f v4l2` call for the full duration, then it writes
+the per-frame timestamps and `metadata.json`. `metadata.json` records `node`
+(`socket.gethostname()`) so recordings from `smartroom1` vs `smartroom2` are
+distinguishable when merged. Folder/recording numbers auto-increment.
 
 When `SMARTROOM_PREVIEW` is set in the environment, the camera ffmpeg gains a
-second `mpjpeg` output on `pipe:1` (a live MJPEG feed) — the web UI uses this to
-show the camera while recording. Without it, behaviour is unchanged.
+second output writing the latest frame to a jpg — the web UI uses this to show the
+camera while recording. Without it, behaviour is unchanged.
+
+Cross-node sync: there's no shared clock between the two Pis, so align recordings
+using the **clap at t=0** marker in `test/scenarios.md` (keep the Pis' clocks close
+with NTP).
 
 ## smartroom_video_page.py — web UI
 
-A stdlib `http.server` (`ThreadingHTTPServer`) serving `http://smartroom.local:8000`,
-run on the Pi by the `smartroom-video-page.service` systemd unit (system
-`python3`, working dir `~/CityOS`). It lives in this repo and is synced via GitHub
-like everything else — **after editing, push and `git pull` on the Pi, then
-`sudo systemctl restart smartroom-video-page.service`**. Routes:
+A stdlib `http.server` (`ThreadingHTTPServer`) serving `http://<node>.local:8000`
+(runs independently on each node — `smartroom1`/`smartroom2`), via the
+`smartroom-video-page.service` systemd unit (system `python3`, working dir
+`~/CityOS`). It auto-detects the node's camera the same way `capture.py` does. It
+lives in this repo and is synced via GitHub like everything else — **after editing,
+push and `git pull` on each Pi, then `sudo systemctl restart
+smartroom-video-page.service`** there. Routes:
 - `/` — live MJPEG view (`/stream.mjpg`), a Record panel, and a list of recordings.
 - `POST /record` (duration) → runs `run_smartroom_capture.sh`; `POST /record/cancel`
   kills the recording's process group; `/record/status` returns countdown/elapsed JSON.
@@ -121,13 +137,15 @@ previous generation of the pipeline.)
 
 ## test/ directory
 
-Standalone per-device scripts, run individually on the Pi:
+Standalone per-device scripts, run individually on a Pi. **These are retained for
+all sensors — including audio (MCP3008) and the I²C/PCB chips — even though those
+are no longer in the capture pipeline**, so any of them can be re-added later.
 - `test/<device>/read.py` — live continuous monitor for that sensor (Ctrl-C to stop).
 - `test/<device>/*_scanner.py` — one-off wiring/channel discovery tools.
 - `test/camera/record_camera.py` — grab a single camera snapshot.
 - `test/scenarios.md` — **human acting scripts** to perform in front of the node
   for realistic occupancy data; each opens with a clap at t=0 (`clap_at_t0`) as the
-  cross-stream sync marker.
+  cross-stream / cross-node sync marker.
 
 ## Conventions
 
@@ -135,5 +153,6 @@ Standalone per-device scripts, run individually on the Pi:
   version-controlled.
 - Keep raw sensor values raw — capture writes uncorrected readings; any
   post-processing happens downstream, not baked into the CSVs.
-- New device-driving scripts hardcode the device path/port (matching `capture.py`)
-  rather than adding flags.
+- The camera device/format are auto-detected with `SMARTROOM_CAMERA*` env
+  overrides (the one shared codebase runs on both differently-cameraed nodes).
+  Other one-off `test/` scripts may still hardcode their device path.
