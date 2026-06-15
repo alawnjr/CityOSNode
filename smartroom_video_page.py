@@ -37,8 +37,35 @@ def _detect_camera():
     return "/dev/video0"
 
 
+def _detect_camera_size(device, cap_width=1280):
+    """Largest MJPG mode <= cap_width (matches capture.py), SMARTROOM_CAMERA_SIZE overrides."""
+    override = os.environ.get("SMARTROOM_CAMERA_SIZE")
+    if override:
+        return override
+    try:
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--list-formats-ext"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        sizes, in_mjpg = [], False
+        for line in out.splitlines():
+            s = line.strip()
+            if "]:" in s and "'" in s:
+                in_mjpg = "MJPG" in s
+            elif in_mjpg and s.startswith("Size: Discrete"):
+                w, h = (int(v) for v in s.split()[-1].split("x"))
+                sizes.append((w, h))
+        usable = [(w, h) for w, h in sizes if w <= cap_width]
+        if usable:
+            w, h = max(usable, key=lambda wh: wh[0] * wh[1])
+            return f"{w}x{h}"
+    except Exception:
+        pass
+    return "1280x720"
+
+
 CAMERA_DEVICE = _detect_camera()
-CAMERA_SIZE = os.environ.get("SMARTROOM_CAMERA_SIZE", "1280x720")
+CAMERA_SIZE = _detect_camera_size(CAMERA_DEVICE)
 STREAM_BOUNDARY = "frame"
 IDLE_TIMEOUT = 5.0  # release the camera this many seconds after the last viewer leaves
 FIRST_FRAME_TIMEOUT = 4.0

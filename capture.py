@@ -17,7 +17,7 @@ has a different camera, so the device/format are env-configurable and otherwise
 auto-detected:
 
     SMARTROOM_CAMERA       v4l2 device (default: first USB camera by-id, else /dev/video0)
-    SMARTROOM_CAMERA_SIZE  WxH (default: 1280x720)
+    SMARTROOM_CAMERA_SIZE  WxH (default: largest MJPG mode <=1280 wide, e.g. C920->1280x720, lihappe8->640x480)
     SMARTROOM_CAMERA_FPS   frames/sec (default: 30)
 
 Run on the Pi:  python capture.py            # 30s (default)
@@ -60,9 +60,42 @@ def detect_camera():
     return "/dev/video0"
 
 
+def detect_camera_size(device, cap_width=1280):
+    """Pick the capture resolution.
+
+    SMARTROOM_CAMERA_SIZE (WxH) wins if set. Otherwise query the device's MJPG
+    modes and pick the largest with width <= cap_width — so a wide-FOV camera
+    records at 1280x720 while a cheaper 640x480-only camera records at 640x480,
+    off the one shared codebase. The cap keeps software H.264 encode load sane on
+    a Pi 3/4 (no 1080p). Falls back to 1280x720 if detection fails.
+    """
+    override = os.environ.get("SMARTROOM_CAMERA_SIZE")
+    if override:
+        w, h = (int(v) for v in override.lower().split("x"))
+        return w, h
+    try:
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--list-formats-ext"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        sizes, in_mjpg = [], False
+        for line in out.splitlines():
+            s = line.strip()
+            if "]:" in s and "'" in s:                  # format header, e.g. [2]: 'MJPG' ...
+                in_mjpg = "MJPG" in s
+            elif in_mjpg and s.startswith("Size: Discrete"):
+                w, h = (int(v) for v in s.split()[-1].split("x"))
+                sizes.append((w, h))
+        usable = [(w, h) for w, h in sizes if w <= cap_width]
+        if usable:
+            return max(usable, key=lambda wh: wh[0] * wh[1])
+    except Exception as error:  # noqa: BLE001
+        print(f"camera: size auto-detect failed ({error}); using 1280x720", file=sys.stderr)
+    return 1280, 720
+
+
 CAMERA = detect_camera()
-_size = os.environ.get("SMARTROOM_CAMERA_SIZE", "1280x720")
-CAMERA_WIDTH, CAMERA_HEIGHT = (int(v) for v in _size.lower().split("x"))
+CAMERA_WIDTH, CAMERA_HEIGHT = detect_camera_size(CAMERA)
 CAMERA_FPS = int(os.environ.get("SMARTROOM_CAMERA_FPS", "30"))
 
 
