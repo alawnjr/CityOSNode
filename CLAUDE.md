@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A multimodal sensor-capture system for a "smart room" research node. It records
-synchronized camera, audio, radar, and environmental/motion data into structured
+synchronized camera, audio, and environmental/motion data into structured
 recording folders for downstream analysis (e.g. occupancy detection).
 
 ## Critical: code runs on the Raspberry Pi, not the dev machine
@@ -61,7 +61,6 @@ capture also needs the system tools `ffmpeg` and `v4l-utils` (apt).
 |---|---|---|
 | USB camera (Logitech C920) | ffmpeg `-f v4l2`, device `/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_...index0`, MJPG 1280×720@30 | wide 16:9 FOV; use a 16:9 mode (4:3 modes are center-cropped/narrower). Has a working built-in stereo mic. Replaced the lihappe8 (still wired, on video0) |
 | Camera mic (C920) | `arecord -D plughw:CARD=C920,DEV=0`, 48 kHz stereo | the C920's built-in mic — a **real, working** mic → `mic_array.wav`. Addressed by card **name** so it survives card-number reordering. Replaced the lihappe8 camera mic, which was **DEAD** (emitted a constant DC ~3145, never responded to sound). Run `check_av.py` to confirm |
-| OPS243-C radar | pyserial `/dev/ttyACM0` @ **19200**, send `OD` to enable output | factory-calibrated; speed+distance FMCW. Dirs/comments say "OPS243-A" but the hardware is a **-C** |
 | MCP3008 ADC (SPI, CE0=`board.D8`) | raw `spidev` (bus 0, dev 0) @ 1.35 MHz, mic (MAX9814) on channel P0 | a **second working mic** (alongside the C920). Read flat-out (~28 kHz) → `mcp3008_audio.wav` (real audio); also decimated to ~20 Hz → `mcp3008_mic.csv` (level). MAX9814 has hardware AGC (compresses dynamics); 10-bit + software-timed, so voice-grade not studio-clean |
 | MAESTRO 2.1 I²C board | `board.I2C()` + `adafruit_*` | BME680 `0x76`, TCS34725 `0x29`, ADXL345 `0x53`, MLX90393 `0x0C` |
 
@@ -81,11 +80,10 @@ data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_NNN/
     mcp3008_audio.wav      # MAX9814 mic waveform via MCP3008, ~28 kHz (the real audio)
     mcp3008_mic.csv        # same mic decimated to ~20 Hz level/voltage
     custom_board_i2c.csv   # all 4 i2c chips, one row/sec
-    radar_ops243.csv       # raw serial lines
 ```
 
 Concurrency model: the camera runs via a blocking `ffmpeg` call for the full
-duration; `arecord` runs as a parallel subprocess; the i2c/mcp3008/radar loggers
+duration; `arecord` runs as a parallel subprocess; the i2c/mcp3008 loggers
 each run in a thread writing CSV against a **shared `time.monotonic()` clock**
 (`start`), and a `stop_event` ends them when the camera finishes. The mcp3008
 thread owns the SPI bus alone, samples flat-out, and on stop encodes its buffered

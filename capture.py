@@ -14,7 +14,6 @@ same layout as sample_dataset/:
             custom_board_i2c.csv         (BME680 / TCS34725 / ADXL345 / MLX90393)
             mcp3008_mic.csv              (mic level via MCP3008 ADC, ~20 Hz)
             mcp3008_audio.wav            (MAX9814 mic waveform via MCP3008, ~28 kHz)
-            radar_ops243.csv             (OPS243-A radar, raw serial lines)
 
 Run on the Pi:  python capture.py            # 30s (default)
                 python capture.py -d 60      # 60s
@@ -62,8 +61,6 @@ MCP3008_AUDIO_RATE_NOMINAL = 28000  # metadata fallback if the measured rate is 
 # without it we fall back to the plain AC-coupled encode.
 MCP3008_AUDIO_HP_HZ = 80          # high-pass: drop DC/rumble
 MCP3008_AUDIO_LP_HZ = 5000        # low-pass: drop out-of-band hiss/aliasing
-
-RADAR_PORT, RADAR_BAUD = "/dev/ttyACM0", 19200
 
 I2C_FIELDS = [
     "temperature_c", "humidity_pct", "pressure_hpa", "gas_ohm",
@@ -229,26 +226,6 @@ def _encode_adc_audio(raw, times, audio_path):
     return rate
 
 
-def log_radar(path, stop_event, start):
-    try:
-        import serial
-        port = serial.Serial(RADAR_PORT, RADAR_BAUD, timeout=0.5)
-        port.write(b"O/")  # report range smallest-distance-first (nearest object), not strongest
-        port.write(b"OD")  # OPS243-A: enable data output
-    except Exception as error:
-        print(f"radar: unavailable ({error})", file=sys.stderr)
-        return
-
-    with path.open("w", newline="") as handle, port:
-        writer = csv.writer(handle)
-        writer.writerow(["timestamp_seconds", "raw"])
-        while not stop_event.is_set():
-            line = port.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                writer.writerow([f"{time.monotonic() - start:.3f}", line])
-                handle.flush()
-
-
 def start_audio(path):
     """Record the camera mic to a wav for DURATION_SECONDS (non-blocking)."""
     try:
@@ -359,11 +336,6 @@ def write_metadata(rec_dir, start_time, end_time, frame_count, mcp3008_audio_rat
                     "Software-timed, so the rate is approximate."
                 ),
             },
-            "radar_ops243": {
-                "modality": "motion",
-                "path": "streams/radar_ops243.csv",
-                "fields": ["raw"],
-            },
         },
     }
     (rec_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -388,7 +360,6 @@ def main():
     threads = [
         threading.Thread(target=log_i2c, args=(streams / "custom_board_i2c.csv", stop_event, start), daemon=True),
         threading.Thread(target=log_mcp3008, args=(streams / "mcp3008_audio.wav", streams / "mcp3008_mic.csv", stop_event, start, mcp_result), daemon=True),
-        threading.Thread(target=log_radar, args=(streams / "radar_ops243.csv", stop_event, start), daemon=True),
     ]
     for thread in threads:
         thread.start()

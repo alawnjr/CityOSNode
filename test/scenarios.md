@@ -17,12 +17,8 @@ you can record in `metadata.json`.
 | Sensor | Stream | What it picks up during occupancy |
 |---|---|---|
 | Camera | `camera_main.mp4` | presence, movement, posture |
-| OPS243-A radar | `radar_ops243.csv` | motion **toward/away** from the node (radial speed) |
 | MCP3008 mic | `mcp3008_mic.csv` | speech, footsteps, ambient noise |
 | BME680 / TCS / ADXL / MLX | `custom_board_i2c.csv` | slow context: temp/humidity, room light, ambient — mostly steady when no one touches the board |
-
-> Radar responds to **radial** motion — walking *toward/away* from the node
-> registers strongly; walking *across* it barely shows. Aim movement at the node.
 
 ---
 

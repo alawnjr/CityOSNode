@@ -13,5 +13,4 @@ adafruit-circuitpython-bme680==3.7.16     # temp / humidity / pressure / gas
 adafruit-circuitpython-tcs34725==3.3.28   # color / light
 adafruit-circuitpython-adxl34x==1.12.20   # accelerometer
 adafruit-circuitpython-mlx90393==2.4.2    # magnetometer
-pyserial==3.5                             # OPS243-A radar serial
 gpiozero==2.0.1                           # GPIO sensor test
