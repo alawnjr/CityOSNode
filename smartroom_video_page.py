@@ -439,6 +439,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/preview.jpg":
             self.serve_preview()
             return
+        if parsed.path == "/recordings":
+            self.serve_recordings()
+            return
         if parsed.path.startswith("/video/"):
             self.serve_video(parsed.path.removeprefix("/video/"), download=False)
             return
@@ -1004,6 +1007,27 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except OSError:
             pass
+
+    def serve_recordings(self):
+        """JSON listing of every recorded video, newest first, with a download
+        path — used by the laptop control panel's "Save All" button."""
+        videos = []
+        for path in video_files():
+            try:
+                size = path.stat().st_size
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            token = video_token(path)
+            videos.append({
+                "token": token,
+                "label": video_label(path),
+                "size": size,
+                "mtime": round(mtime, 3),
+                "download": "/download/" + urllib.parse.quote(token),
+            })
+        self.send_bytes(json.dumps({"videos": videos}).encode("utf-8"),
+                        "application/json; charset=utf-8")
 
     def serve_dataset(self, encoded_name):
         rec_dir = resolve_dataset_path(encoded_name)
