@@ -37,8 +37,11 @@ def _detect_camera():
     return "/dev/video0"
 
 
-def _detect_camera_size(device, cap_width=1280):
-    """Largest MJPG mode <= cap_width (matches capture.py), SMARTROOM_CAMERA_SIZE overrides."""
+def _detect_camera_size(device, cap_width=640):
+    """Largest MJPG mode <= cap_width for the LIVE PREVIEW. Capped at 640 wide so
+    the copy-passthrough MJPEG stream stays light enough to render smoothly in a
+    browser over wifi (a full 1280x720 feed is ~3.5 MB/s). Recording is separate
+    (capture.py) and still uses full resolution. SMARTROOM_CAMERA_SIZE overrides."""
     override = os.environ.get("SMARTROOM_CAMERA_SIZE")
     if override:
         return override
@@ -61,7 +64,7 @@ def _detect_camera_size(device, cap_width=1280):
             return f"{w}x{h}"
     except Exception:
         pass
-    return "1280x720"
+    return "640x480"
 
 
 CAMERA_DEVICE = _detect_camera()
