@@ -4,56 +4,41 @@
 set -euo pipefail
 
 # ---- config -----------------------------------------------------------------
-REPO_SSH="git@github.com:alawnjr/CityOSNode.git"   # origin (Pi pulls from here)
+# The nodes only PULL, and the repo is public, so use HTTPS origin — no SSH key
+# needed and `git pull` works keyless. (Editing/pushing happens on the dev
+# machine, never on a Pi.)
 REPO_HTTPS="https://github.com/alawnjr/CityOSNode.git"
-PERSONAL_SSH="git@gitlab.orbit-lab.org:alawnjr/smartroom.git"
 CLONE_DIR="$HOME/CityOS"
 SVC="smartroom-video-page.service"
 
 echo "==> user=$USER  home=$HOME  clone=$CLONE_DIR"
 
 # ---- 1. system packages -----------------------------------------------------
-echo "==> Installing system packages (needs sudo)"
+echo "==> Installing system packages (sudo — passwordless on these nodes)"
 sudo apt-get update
 sudo apt-get install -y git python3-venv python3-pip ffmpeg v4l-utils
 
-# ---- 2. SSH key for git (so the Pi can pull/push) ---------------------------
-if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
-  echo "==> Generating SSH key"
-  ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519"
-fi
-echo
-echo "    >>> Add this public key to GitHub (and GitLab) deploy keys, then press Enter:"
-echo "    ----------------------------------------------------------------------"
-cat "$HOME/.ssh/id_ed25519.pub"
-echo "    ----------------------------------------------------------------------"
-read -r _ </dev/tty
-
-# ---- 3. clone (or update) the repo -----------------------------------------
+# ---- 2. clone (or update) the repo -----------------------------------------
 if [ -d "$CLONE_DIR/.git" ]; then
-  echo "==> Repo exists, pulling"
+  echo "==> Repo exists, setting HTTPS origin and pulling"
+  git -C "$CLONE_DIR" remote set-url origin "$REPO_HTTPS"
   git -C "$CLONE_DIR" pull origin master
 else
-  echo "==> Cloning repo"
-  # try SSH first (so push works); fall back to HTTPS read-only clone
-  git clone "$REPO_SSH" "$CLONE_DIR" || git clone "$REPO_HTTPS" "$CLONE_DIR"
+  echo "==> Cloning repo (HTTPS)"
+  git clone "$REPO_HTTPS" "$CLONE_DIR"
 fi
-
-# ---- 4. git remotes (origin=GitHub, personal=GitLab; push to both) ----------
-git -C "$CLONE_DIR" remote set-url origin "$REPO_SSH" 2>/dev/null \
-  || git -C "$CLONE_DIR" remote add origin "$REPO_SSH"
-git -C "$CLONE_DIR" remote get-url personal >/dev/null 2>&1 \
-  || git -C "$CLONE_DIR" remote add personal "$PERSONAL_SSH"
 echo "==> remotes:"; git -C "$CLONE_DIR" remote -v
 
-# ---- 5. python venv + deps --------------------------------------------------
-echo "==> Creating venv + installing requirements"
+# ---- 3. python venv + deps --------------------------------------------------
+# Video capture (capture.py) and the web page are stdlib-only and run on system
+# python3 — the venv is only for the test/ sensor scripts (adafruit/spidev/numpy).
+echo "==> Creating venv + installing requirements (for test/ scripts)"
 python3 -m venv "$CLONE_DIR/.venv"
 "$CLONE_DIR/.venv/bin/pip" install --upgrade pip
 "$CLONE_DIR/.venv/bin/pip" install -r "$CLONE_DIR/requirements.txt"
 
-# ---- 6. web-page systemd unit ----------------------------------------------
-echo "==> Installing $SVC (needs sudo)"
+# ---- 4. web-page systemd unit ----------------------------------------------
+echo "==> Installing $SVC (sudo)"
 sudo tee "/etc/systemd/system/$SVC" >/dev/null <<UNIT
 [Unit]
 Description=Smartroom local video page
@@ -74,7 +59,7 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now "$SVC"
 
-# ---- 7. disable wifi power-save (the likely cause of the earlier drops) -----
+# ---- 5. disable wifi power-save (the likely cause of the earlier drops) -----
 echo "==> Disabling wifi power save (persistent)"
 sudo tee /etc/systemd/system/wifi-powersave-off.service >/dev/null <<'UNIT'
 [Unit]
@@ -89,17 +74,15 @@ WantedBy=multi-user.target
 UNIT
 sudo systemctl enable --now wifi-powersave-off.service || true
 
-# ---- 8. reminders -----------------------------------------------------------
+# ---- 6. done ----------------------------------------------------------------
 cat <<EOF
 
-==> DONE. Manual steps left:
-  1. Recreate PRIVATE.md in $CLONE_DIR (Pi credentials — gitignored, not in repo).
-  2. Confirm SSH key was authorized on GitHub & GitLab (push test below).
-  3. Re-clone smartroom-autolabeling separately if you use it.
+==> DONE on $(hostname). No SSH key / sudo password needed (public repo, pull-only,
+    passwordless sudo). Optional: recreate PRIVATE.md (credential notes only).
 
 Quick checks:
-  v4l2-ctl --list-devices                 # camera shows up?
-  $CLONE_DIR/.venv/bin/python $CLONE_DIR/check_av.py   # camera + mics
-  systemctl status $SVC                    # web page running
-  curl -sI http://localhost:8000 | head -1 # web page responding
+  v4l2-ctl --list-devices                                  # camera shows up?
+  python3 $CLONE_DIR/capture.py -d 3                        # records a 3s clip
+  systemctl status $SVC                                     # web page running
+  curl -sI http://localhost:8000 | head -1                 # web page responding
 EOF
