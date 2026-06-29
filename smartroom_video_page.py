@@ -109,7 +109,10 @@ def resolve_video_path(encoded_name):
 
     roots = [DATA_DIR.resolve(), RECORDINGS_DIR.resolve()]
     for path in candidates:
-        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+        # Videos by extension, plus each recording's metadata.json (so the laptop's
+        # "Save All" can beam it and reproduce the real_dataset layout: metadata.json
+        # at the rec root alongside streams/).
+        if path.is_file() and (path.suffix.lower() in VIDEO_EXTENSIONS or path.name == "metadata.json"):
             if any(root == path or root in path.parents for root in roots):
                 return path
     return None
@@ -1015,6 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
         """JSON listing of every recorded video, newest first, with a download
         path — used by the laptop control panel's "Save All" button."""
         videos = []
+        seen_meta = set()
         for path in video_files():
             try:
                 size = path.stat().st_size
@@ -1029,6 +1033,27 @@ class Handler(BaseHTTPRequestHandler):
                 "mtime": round(mtime, 3),
                 "download": "/download/" + urllib.parse.quote(token),
             })
+            # Also list this recording's metadata.json so Save All beams it too and
+            # the laptop ends up with the real_dataset layout (metadata.json at the
+            # rec root, next to streams/). One per rec — dedup across its videos.
+            rec = recording_dir(path)
+            if rec is not None:
+                meta = rec / "metadata.json"
+                mkey = meta.resolve()
+                if meta.is_file() and mkey not in seen_meta:
+                    seen_meta.add(mkey)
+                    try:
+                        msize, mmtime = meta.stat().st_size, meta.stat().st_mtime
+                    except OSError:
+                        continue
+                    mtoken = video_token(meta)
+                    videos.append({
+                        "token": mtoken,
+                        "label": video_label(meta),
+                        "size": msize,
+                        "mtime": round(mmtime, 3),
+                        "download": "/download/" + urllib.parse.quote(mtoken),
+                    })
         self.send_bytes(json.dumps({"videos": videos}).encode("utf-8"),
                         "application/json; charset=utf-8")
 
