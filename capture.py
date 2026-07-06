@@ -152,14 +152,56 @@ def record_camera(path):
     subprocess.run(command, check=True)
 
 
-def write_camera_timestamps(path, fps):
-    frame_count = DURATION_SECONDS * fps
+def probe_frame_times(mp4_path):
+    """Per-frame presentation times (seconds from the recording's start), ascending.
+
+    Read from the *finished* mp4 with ffprobe, so we get one entry per frame the
+    camera actually delivered — the USB cameras run variable-rate and deliver far
+    fewer frames than the nominal fps, so this is the only accurate source. Returns
+    [] on any failure (missing ffprobe, unreadable file) so the caller can fall
+    back to the nominal grid.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "frame=best_effort_timestamp_time",
+             "-of", "csv=p=0", str(mp4_path)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    times = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line == "N/A":
+            continue
+        try:
+            times.append(float(line))
+        except ValueError:
+            continue
+    times.sort()  # ffprobe emits decode order; sort to presentation order
+    if times and times[0] != 0:  # some containers start PTS != 0 — rebase to t=0
+        base = times[0]
+        times = [t - base for t in times]
+    return times
+
+
+def write_camera_timestamps(path, mp4_path, fps):
+    """Write one row (frame_index, timestamp_seconds) per ACTUAL encoded frame.
+
+    Real per-frame timestamps come from the recorded mp4 (see probe_frame_times);
+    only if that yields nothing do we fall back to the old synthetic i/fps grid.
+    Returns the real frame count so metadata.json matches the video.
+    """
+    times = probe_frame_times(mp4_path)
+    if not times:
+        times = [i / fps for i in range(DURATION_SECONDS * fps)]
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["frame_index", "timestamp_seconds"])
-        for i in range(frame_count):
-            writer.writerow([i, f"{i / fps:.6f}"])
-    return frame_count
+        for i, t in enumerate(times):
+            writer.writerow([i, f"{t:.6f}"])
+    return len(times)
 
 
 def write_metadata(rec_dir, start_time, end_time, frame_count):
@@ -198,11 +240,12 @@ def main():
     streams = rec_dir / "streams"
     print(f"Recording {DURATION_SECONDS}s from {CAMERA} -> {rec_dir}", file=sys.stderr)
 
+    mp4_path = streams / "camera_main.mp4"
     start_time = datetime.now().astimezone()
-    record_camera(streams / "camera_main.mp4")  # blocks for DURATION_SECONDS
+    record_camera(mp4_path)  # blocks for DURATION_SECONDS
     end_time = datetime.now().astimezone()
 
-    frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", CAMERA_FPS)
+    frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", mp4_path, CAMERA_FPS)
     write_metadata(rec_dir, start_time, end_time, frame_count)
     print(f"Done -> {rec_dir}", file=sys.stderr)
 
