@@ -42,6 +42,32 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
+def load_node_env():
+    """Apply per-node overrides from <repo>/node.env (KEY=VALUE lines, # comments).
+
+    node.env is gitignored — it's machine-local config, like calibration/ — so a
+    node can pin e.g. SMARTROOM_CAMERA_SIZE=800x600 (a camera that only sustains
+    30fps below full resolution) without diverging the shared code. The real
+    environment always wins over the file.
+    """
+    path = Path(__file__).resolve().parent / "node.env"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_node_env()  # before the module-level auto-detection below reads the env
+
+
 def detect_camera():
     """Pick the camera v4l2 device.
 

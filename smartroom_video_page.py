@@ -15,6 +15,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+# Per-node overrides from ~/CityOS/node.env (gitignored, machine-local), same
+# loader as capture.py — so e.g. SMARTROOM_CAMERA_SIZE pins apply to both the
+# page and the recordings it launches. Real environment wins over the file.
+def _load_node_env():
+    try:
+        lines = (Path.home() / "CityOS" / "node.env").read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_node_env()
+
 PORT = int(os.environ.get("SMARTROOM_VIDEO_PORT", "8000"))
 RECORDINGS_DIR = Path.home() / "Videos" / "Smartroom Recordings"
 DATA_DIR = Path.home() / "CityOS" / "data"
