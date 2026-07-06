@@ -48,8 +48,12 @@ def open_camera(device: str, width: int, height: int):
     """VideoCapture on the v4l2 device at the recording resolution (MJPG).
     Friendly retry loop for 'device busy' — the live preview releases the camera
     a few seconds after its last viewer disconnects."""
+    # OpenCV 5's V4L2 backend can't open by device *name* (the by-id symlink) —
+    # resolve to the real /dev/videoN and open by integer index instead.
+    real = Path(device).resolve()
+    index = int(str(real).removeprefix("/dev/video")) if str(real).startswith("/dev/video") else device
     for attempt in range(6):
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
