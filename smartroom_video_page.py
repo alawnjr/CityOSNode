@@ -109,10 +109,13 @@ def resolve_video_path(encoded_name):
 
     roots = [DATA_DIR.resolve(), RECORDINGS_DIR.resolve()]
     for path in candidates:
-        # Videos by extension, plus each recording's metadata.json (so the laptop's
-        # "Save All" can beam it and reproduce the real_dataset layout: metadata.json
-        # at the rec root alongside streams/).
-        if path.is_file() and (path.suffix.lower() in VIDEO_EXTENSIONS or path.name == "metadata.json"):
+        # Videos by extension, plus each recording's metadata.json and per-frame
+        # *_timestamps.csv (so the laptop's "Save All" can beam them and reproduce
+        # the real_dataset layout: metadata.json at the rec root, timestamps csv
+        # next to its video in streams/).
+        if path.is_file() and (path.suffix.lower() in VIDEO_EXTENSIONS
+                               or path.name == "metadata.json"
+                               or path.name.endswith("_timestamps.csv")):
             if any(root == path or root in path.parents for root in roots):
                 return path
     return None
@@ -1033,6 +1036,25 @@ class Handler(BaseHTTPRequestHandler):
                 "mtime": round(mtime, 3),
                 "download": "/download/" + urllib.parse.quote(token),
             })
+            # Also list the per-frame timestamps CSV(s) sitting next to the video
+            # in streams/, so Save All beams real frame timing to the laptop too.
+            for extra in sorted(path.parent.glob("*_timestamps.csv")):
+                ekey = extra.resolve()
+                if ekey in seen_meta:
+                    continue
+                seen_meta.add(ekey)
+                try:
+                    esize, emtime = extra.stat().st_size, extra.stat().st_mtime
+                except OSError:
+                    continue
+                etoken = video_token(extra)
+                videos.append({
+                    "token": etoken,
+                    "label": video_label(extra),
+                    "size": esize,
+                    "mtime": round(emtime, 3),
+                    "download": "/download/" + urllib.parse.quote(etoken),
+                })
             # Also list this recording's metadata.json so Save All beams it too and
             # the laptop ends up with the real_dataset layout (metadata.json at the
             # rec root, next to streams/). One per rec — dedup across its videos.
