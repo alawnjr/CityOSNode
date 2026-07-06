@@ -97,6 +97,65 @@ def detect_camera_size(device, cap_width=1280):
 CAMERA = detect_camera()
 CAMERA_WIDTH, CAMERA_HEIGHT = detect_camera_size(CAMERA)
 CAMERA_FPS = int(os.environ.get("SMARTROOM_CAMERA_FPS", "30"))
+CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration"
+
+
+def camera_id(device=None):
+    """Stable per-physical-camera identity: the /dev/v4l/by-id/ symlink stem
+    without the -video-indexN suffix (e.g. usb-046d_0809_8633D7D7). Calibration
+    files are keyed by this, so a swapped camera never inherits stale intrinsics.
+    None for devices with no by-id identity (bare /dev/videoN)."""
+    device = device or CAMERA
+    name = Path(device).name
+    if "-video-index" in name:
+        return name.split("-video-index")[0]
+    by_id = Path("/dev/v4l/by-id")
+    if by_id.is_dir():
+        try:
+            target = Path(device).resolve()
+            for link in by_id.iterdir():
+                if "-video-index0" in link.name and link.resolve() == target:
+                    return link.name.split("-video-index")[0]
+        except OSError:
+            pass
+    return None
+
+
+def load_calibration():
+    """This camera's intrinsics from calibration/<camera_id>.json (written by
+    calibrate_camera.py), ready to embed in metadata.json. If the calibration
+    was done at a different resolution than we record at, fx/fy/cx/cy are scaled
+    proportionally (distortion coefficients are resolution-invariant) and the
+    original size is noted under 'scaled_from'. None when uncalibrated."""
+    cam = camera_id()
+    if cam is None:
+        return None
+    path = CALIBRATION_DIR / f"{cam}.json"
+    try:
+        cal = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    blob = {
+        "camera_id": cal.get("camera_id", cam),
+        "camera_matrix": cal["camera_matrix"],
+        "dist_coeffs": cal["dist_coeffs"],
+        "image_size": cal["image_size"],
+        "rms": cal.get("rms"),
+        "calibrated_at": cal.get("calibrated_at"),
+        "file": path.name,
+    }
+    cal_w, cal_h = cal["image_size"]
+    if (cal_w, cal_h) != (CAMERA_WIDTH, CAMERA_HEIGHT) and cal_w and cal_h:
+        sx, sy = CAMERA_WIDTH / cal_w, CAMERA_HEIGHT / cal_h
+        m = [row[:] for row in cal["camera_matrix"]]
+        m[0][0] *= sx  # fx
+        m[0][2] *= sx  # cx
+        m[1][1] *= sy  # fy
+        m[1][2] *= sy  # cy
+        blob["camera_matrix"] = m
+        blob["image_size"] = [CAMERA_WIDTH, CAMERA_HEIGHT]
+        blob["scaled_from"] = [cal_w, cal_h]
+    return blob
 
 
 def make_recording_dir():
@@ -226,6 +285,11 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
             },
         },
     }
+    # Intrinsics from calibrate_camera.py, when this camera has been calibrated.
+    # Videos stay raw — downstream analysis uses these to undistort as needed.
+    calibration = load_calibration()
+    if calibration is not None:
+        metadata["streams"]["camera_main"]["calibration"] = calibration
     (rec_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
