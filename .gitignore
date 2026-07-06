@@ -2,3 +2,6 @@ PRIVATE.md
 *mp4
 *.wav
 data/
+*.pdf
+__pycache__/
+.claude/
