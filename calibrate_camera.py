@@ -2,14 +2,18 @@
 """
 Intrinsic camera calibration for a smartroom node, using a printed checkerboard.
 
-Run ON the Pi (headless — no display needed) with the venv python:
+Run ON the Pi (headless — no display needed) with the venv python. Two modes:
 
+    # from photos snapped on the web page (recommended — you can see framing):
+    ~/CityOS/.venv/bin/python ~/CityOS/calibrate_camera.py --photos
+
+    # live capture (camera must be free — close the live-view browser tab):
     ~/CityOS/.venv/bin/python ~/CityOS/calibrate_camera.py
 
-Close the node's live-view browser tab first (the camera is single-access; the
-web page releases it a few seconds after the last viewer leaves). Then hold a
-printed checkerboard in front of the camera and move it slowly around the frame
-— center, all four corners, near/far, tilted — while the script collects views.
+Photos mode reads data/photos/*.jpg (the Snap photo button's files — snap the
+board at 10+ positions: center, corners, near, far, tilted) and never opens the
+camera. Live mode holds a printed checkerboard in front of the camera and moves
+it slowly around the frame while the script collects views.
 Progress is printed; each accepted view also saves a corner-overlay JPG under
 calibration/debug/<camera-id>/ so detection quality can be checked afterwards.
 
@@ -79,14 +83,71 @@ def _atomic_write_json(path: Path, data: dict):
     os.replace(tmp, path)
 
 
+def board_model(pattern):
+    # One canonical board model in board coordinates (Z=0 plane); square size is
+    # applied by the caller (calibrateCamera only needs a consistent scale).
+    cols, rows = pattern
+    board = np.zeros((cols * rows, 3), np.float32)
+    board[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    return board
+
+
+def detect_corners(gray, pattern):
+    """Checkerboard corners in one grayscale image, or None. Detects on a
+    half-scale copy (fast enough for the Pi 3), then refines the corner
+    positions at full resolution for calibration accuracy."""
+    small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    found, corners = cv2.findChessboardCorners(
+        small, pattern,
+        flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        | cv2.CALIB_CB_FAST_CHECK)
+    if not found:
+        return None
+    corners = corners * 2.0  # back to full-res coordinates
+    return cv2.cornerSubPix(
+        gray, corners.astype(np.float32), (11, 11), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+
+
+def collect_from_photos(paths, pattern, debug_dir: Path):
+    """Detect the board in pre-snapped photos (the web page's Snap photo files).
+    Returns (objpoints, imgpoints, image_size, sample_bgr) — sample is the last
+    detected photo, for the before/after comparison."""
+    board = board_model(pattern)
+    objpoints, imgpoints = [], []
+    image_size, sample = None, None
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    for p in paths:
+        frame = cv2.imread(str(p))
+        if frame is None:
+            print(f"  {p.name}: unreadable — skipped", file=sys.stderr)
+            continue
+        size = (frame.shape[1], frame.shape[0])
+        if image_size is None:
+            image_size = size
+        elif size != image_size:
+            print(f"  {p.name}: {size[0]}x{size[1]} differs from {image_size[0]}x{image_size[1]} — skipped "
+                  "(all photos must share one resolution)", file=sys.stderr)
+            continue
+        corners = detect_corners(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), pattern)
+        if corners is None:
+            print(f"  {p.name}: no board found — skipped", file=sys.stderr)
+            continue
+        objpoints.append(board)
+        imgpoints.append(corners)
+        sample = frame
+        overlay = frame.copy()
+        cv2.drawChessboardCorners(overlay, pattern, corners, True)
+        cv2.imwrite(str(debug_dir / f"view_{len(imgpoints):02d}.jpg"), overlay)
+        print(f"  {p.name}: board detected ({len(imgpoints)} good so far)", file=sys.stderr)
+    return objpoints, imgpoints, image_size, sample
+
+
 def collect_views(cap, pattern, n_views, min_move_px, debug_dir: Path):
     """Grab frames until n_views diverse checkerboard detections are accepted.
     Returns (object_points_list, image_points_list, image_size)."""
     cols, rows = pattern
-    # One canonical board model in board coordinates (Z=0 plane); square size is
-    # applied by the caller (calibrateCamera only needs a consistent scale).
-    board = np.zeros((cols * rows, 3), np.float32)
-    board[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    board = board_model(pattern)
 
     objpoints, imgpoints, centroids = [], [], []
     image_size = None
@@ -104,24 +165,13 @@ def collect_views(cap, pattern, n_views, min_move_px, debug_dir: Path):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         image_size = (gray.shape[1], gray.shape[0])
 
-        # Detect on a half-scale copy (fast enough for the Pi 3), then refine the
-        # corner positions at full resolution for calibration accuracy.
-        small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        found, corners = cv2.findChessboardCorners(
-            small, (cols, rows),
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-            | cv2.CALIB_CB_FAST_CHECK)
+        corners = detect_corners(gray, (cols, rows))
         now = time.monotonic()
-        if not found:
+        if corners is None:
             if now - last_status > 3:
                 print(f"  … board not visible ({len(imgpoints)}/{n_views})", file=sys.stderr)
                 last_status = now
             continue
-
-        corners = corners * 2.0  # back to full-res coordinates
-        corners = cv2.cornerSubPix(
-            gray, corners.astype(np.float32), (11, 11), (-1, -1),
-            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
 
         # Only accept views meaningfully different from the ones we have, so the
         # calibration sees diverse board poses instead of 15 copies of one pose.
@@ -152,6 +202,10 @@ def main():
     ap.add_argument("--min-move", type=float, default=40.0,
                     help="min corner-centroid movement (px) between accepted views (default 40)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output dir (default calibration/)")
+    ap.add_argument("--photos", nargs="?", type=Path, const=capture.DATA_DIR / "photos",
+                    metavar="DIR",
+                    help="calibrate from the web page's snapped photos instead of live capture "
+                         "(default dir: data/photos/); the camera is not opened at all")
     args = ap.parse_args()
 
     device = capture.CAMERA
@@ -162,21 +216,39 @@ def main():
               "to a physical camera. Plug the camera into USB (not a CSI/virtual device).",
               file=sys.stderr)
         return 1
-    print(f"camera: {cam_id} ({device}) at {width}x{height}", file=sys.stderr)
 
-    cap = open_camera(device, width, height)
-    if cap is None:
-        return 1
-    try:
-        objpoints, imgpoints, image_size = collect_views(
-            cap, (args.cols, args.rows), args.frames, args.min_move,
-            args.out / "debug" / cam_id)
-        # One extra still for the before/after comparison written below.
-        ok, sample = cap.read()
-        if not ok:
-            sample = None
-    finally:
-        cap.release()
+    if args.photos is not None:
+        photos = sorted(args.photos.glob("*.jpg"))
+        if not photos:
+            print(f"ERROR: no .jpg photos in {args.photos} — snap some with the web page first.",
+                  file=sys.stderr)
+            return 1
+        print(f"camera: {cam_id} — calibrating from {len(photos)} photo(s) in {args.photos}",
+              file=sys.stderr)
+        objpoints, imgpoints, image_size, sample = collect_from_photos(
+            photos, (args.cols, args.rows), args.out / "debug" / cam_id)
+        if len(imgpoints) < 5:
+            print(f"ERROR: only {len(imgpoints)} photo(s) with a detectable board — need at "
+                  "least 5 (10+ diverse views recommended). Snap more and rerun.", file=sys.stderr)
+            return 1
+        if len(imgpoints) < 10:
+            print(f"warning: only {len(imgpoints)} usable views — calibration will work but "
+                  "10+ diverse views give better results.", file=sys.stderr)
+    else:
+        print(f"camera: {cam_id} ({device}) at {width}x{height}", file=sys.stderr)
+        cap = open_camera(device, width, height)
+        if cap is None:
+            return 1
+        try:
+            objpoints, imgpoints, image_size = collect_views(
+                cap, (args.cols, args.rows), args.frames, args.min_move,
+                args.out / "debug" / cam_id)
+            # One extra still for the before/after comparison written below.
+            ok, sample = cap.read()
+            if not ok:
+                sample = None
+        finally:
+            cap.release()
 
     # Scale the board model to real millimetres so tvecs (unused here, but stored
     # rms is unaffected) are metric; intrinsics don't depend on the scale.
