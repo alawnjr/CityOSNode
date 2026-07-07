@@ -464,13 +464,20 @@ def snap_photo():
         dest = PHOTOS_DIR / name
         CAMERA.shutdown_for_recording()
         try:
-            proc = subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error",
-                 "-f", "v4l2", "-input_format", "mjpeg",
-                 "-video_size", photo_capture_size(), "-i", CAMERA_DEVICE,
-                 "-frames:v", "6", "-update", "1", str(dest)],
-                capture_output=True, text=True, timeout=20,
-            )
+            # The preview's ffmpeg can take a moment to actually release the
+            # device (and a viewer reconnect can race a new one in) — retry
+            # briefly on "busy" instead of failing the snap.
+            for attempt in range(5):
+                proc = subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error",
+                     "-f", "v4l2", "-input_format", "mjpeg",
+                     "-video_size", photo_capture_size(), "-i", CAMERA_DEVICE,
+                     "-frames:v", "6", "-update", "1", str(dest)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                if proc.returncode == 0 or "busy" not in (proc.stderr or "").lower():
+                    break
+                time.sleep(1)
         finally:
             CAMERA.resume_after_recording()
         if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
