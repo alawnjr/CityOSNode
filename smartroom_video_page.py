@@ -439,6 +439,72 @@ RECORDER = Recorder()
 PHOTO_LOCK = threading.Lock()
 
 
+class CalibrateJob:
+    """Runs calibrate_camera.py --photos (venv python) in the background and
+    keeps its outcome for the page to poll. Photos mode never opens the camera,
+    so the live view / recordings are unaffected while it runs."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.ok = None       # None until a run has finished
+        self.message = ""
+
+    def start(self):
+        with self.lock:
+            if self.running:
+                return False, "Calibration already running."
+            self.running = True
+            self.ok, self.message = None, "Running…"
+        threading.Thread(target=self._run, daemon=True).start()
+        return True, "Calibration started."
+
+    def _run(self):
+        home = Path.home() / "CityOS"
+        python = home / ".venv" / "bin" / "python"
+        if not python.exists():
+            python = Path("/usr/bin/python3")
+        try:
+            proc = subprocess.run(
+                [str(python), str(home / "calibrate_camera.py"), "--photos"],
+                capture_output=True, text=True, timeout=600, cwd=str(home),
+            )
+            # The script's summary (RMS, fx/fy, saved path) is on stderr.
+            lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
+            tail = " | ".join(lines[-3:]) if lines else "no output"
+            with self.lock:
+                self.ok = proc.returncode == 0
+                self.message = tail
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.ok, self.message = False, str(e)
+        finally:
+            with self.lock:
+                self.running = False
+
+    def status(self):
+        with self.lock:
+            return {"running": self.running, "ok": self.ok, "message": self.message}
+
+
+CALIBRATOR = CalibrateJob()
+
+
+def calibration_summary():
+    """One-line description of this node's saved calibrations, for the page."""
+    calib_dir = Path.home() / "CityOS" / "calibration"
+    entries = []
+    for p in sorted(calib_dir.glob("*.json")):
+        try:
+            d = json.loads(p.read_text())
+            when = (d.get("calibrated_at") or "")[:10]
+            entries.append(f"{p.stem} — RMS {d.get('rms')} px, "
+                           f"{d.get('image_size', ['?', '?'])[0]}x{d.get('image_size', ['?', '?'])[1]}, {when}")
+        except (OSError, ValueError):
+            continue
+    return entries
+
+
 def photo_capture_size():
     """Full capture resolution for stills (not the 640-capped preview size):
     SMARTROOM_CAMERA_SIZE override wins (node.env / env), else the largest MJPG
@@ -516,6 +582,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/stream.mjpg":
             self.serve_stream()
             return
+        if parsed.path == "/calibrate/status":
+            self.send_bytes(json.dumps(CALIBRATOR.status()).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/record/status":
             self.send_bytes(json.dumps(RECORDER.status()).encode("utf-8"),
                             "application/json; charset=utf-8")
@@ -557,6 +627,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/photo":
             ok, message, name = snap_photo()
             payload = json.dumps({"ok": ok, "message": message, "name": name})
+            self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
+                            200 if ok else 409)
+            return
+        if parsed.path == "/calibrate":
+            ok, message = CALIBRATOR.start()
+            payload = json.dumps({"ok": ok, "message": message})
             self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
                             200 if ok else 409)
             return
@@ -705,6 +781,10 @@ class Handler(BaseHTTPRequestHandler):
                   </div>
                 </div>''')
         photos_html = "".join(photo_items) or '<span class="photo-none">No photos yet.</span>'
+        cal_entries = calibration_summary()
+        calibration_html = ("Calibrated: " + "; ".join(html.escape(e) for e in cal_entries)
+                            if cal_entries else
+                            "Not calibrated yet — snap the checkerboard at 10+ positions, then Calibrate.")
 
         body = f"""<!doctype html>
 <html lang="en">
@@ -997,8 +1077,10 @@ class Handler(BaseHTTPRequestHandler):
     <h2>Photos</h2>
     <div class="record-controls">
       <button type="button" id="photo-btn">&#128247; Snap photo</button>
+      <button type="button" id="cal-btn" title="Checkerboard calibration from the photos below (snap the board at 10+ positions first)">&#128208; Calibrate from photos</button>
       <span id="photo-msg"></span>
     </div>
+    <div id="cal-info" style="font-size:0.85em;opacity:0.85;margin:6px 0;">{calibration_html}</div>
     <div class="day-list" id="photo-list">{photos_html}</div>
   </section>
 
@@ -1065,6 +1147,26 @@ class Handler(BaseHTTPRequestHandler):
           pmsg.textContent = 'Request failed.';
           pbtn.disabled = false;
         }});
+      }});
+
+      var calBtn = document.getElementById('cal-btn');
+      var calInfo = document.getElementById('cal-info');
+      var calPoll = null;
+      function calCheck() {{
+        fetch('/calibrate/status').then(function (r) {{ return r.json(); }}).then(function (s) {{
+          if (s.running) {{ calInfo.textContent = 'Calibrating… ' + (s.message || ''); return; }}
+          if (calPoll) {{ clearInterval(calPoll); calPoll = null; }}
+          calBtn.disabled = false;
+          calInfo.textContent = (s.ok ? '✅ ' : (s.ok === false ? '❌ ' : '')) + (s.message || '');
+        }}).catch(function () {{}});
+      }}
+      calBtn.addEventListener('click', function () {{
+        calBtn.disabled = true;
+        calInfo.textContent = 'Starting calibration…';
+        fetch('/calibrate', {{ method: 'POST' }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
+          if (!j.ok) {{ calInfo.textContent = j.message || 'Could not start.'; calBtn.disabled = false; return; }}
+          calPoll = setInterval(calCheck, 2000);
+        }}).catch(function () {{ calInfo.textContent = 'Request failed.'; calBtn.disabled = false; }});
       }});
 
       document.getElementById('photo-list').addEventListener('click', function (e) {{
