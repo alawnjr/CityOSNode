@@ -560,6 +560,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
                             200 if ok else 409)
             return
+        if parsed.path == "/photo/delete":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            params = urllib.parse.parse_qs(raw.decode("utf-8", "ignore"))
+            name = (params.get("name") or [""])[0]
+            path = (PHOTOS_DIR / name).resolve()
+            # Same traversal guard as serve_photo: flat dir, .jpg only.
+            if (not name or "/" in name or not path.name.endswith(".jpg")
+                    or path.parent != PHOTOS_DIR.resolve() or not path.is_file()):
+                self.send_bytes(b'{"ok": false, "message": "no such photo"}',
+                                "application/json; charset=utf-8", 404)
+                return
+            try:
+                path.unlink()
+                self.send_bytes(b'{"ok": true}', "application/json; charset=utf-8")
+            except OSError as e:
+                payload = json.dumps({"ok": False, "message": str(e)})
+                self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8", 500)
+            return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
     def start_recording(self):
@@ -665,16 +684,26 @@ class Handler(BaseHTTPRequestHandler):
             )
         days_html = "".join(day_links)
 
-        # Full-resolution stills from the Snap photo button, newest first.
+        # Full-resolution stills from the Snap photo button, newest first: a
+        # thumbnail card each, with view (new tab) and delete.
         photo_items = []
         if PHOTOS_DIR.is_dir():
             for p in sorted(PHOTOS_DIR.glob("*.jpg"), key=lambda q: q.stat().st_mtime, reverse=True):
                 pq = urllib.parse.quote(p.name, safe="")
+                safe = html.escape(p.name)
                 kb = p.stat().st_size // 1024
-                photo_items.append(
-                    f'<a class="photo-item" href="/photo/{pq}" target="_blank">'
-                    f'{html.escape(p.name)} <span>({kb} KB)</span></a>'
-                )
+                photo_items.append(f'''
+                <div class="photo-card" style="display:inline-block;width:220px;margin:6px;vertical-align:top;">
+                  <a href="/photo/{pq}" target="_blank" title="Open full size">
+                    <img src="/photo/{pq}" alt="{safe}" loading="lazy"
+                         style="width:100%;border-radius:8px;display:block;">
+                  </a>
+                  <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:4px;font-size:0.8em;">
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{safe} ({kb} KB)</span>
+                    <button type="button" class="photo-del" data-name="{safe}"
+                            style="flex-shrink:0;cursor:pointer;">Delete</button>
+                  </div>
+                </div>''')
         photos_html = "".join(photo_items) or '<span class="photo-none">No photos yet.</span>'
 
         body = f"""<!doctype html>
@@ -1036,6 +1065,22 @@ class Handler(BaseHTTPRequestHandler):
           pmsg.textContent = 'Request failed.';
           pbtn.disabled = false;
         }});
+      }});
+
+      document.getElementById('photo-list').addEventListener('click', function (e) {{
+        var del = e.target.closest('.photo-del');
+        if (!del) return;
+        var name = del.getAttribute('data-name');
+        if (!confirm('Delete ' + name + '?')) return;
+        del.disabled = true;
+        fetch('/photo/delete', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+          body: 'name=' + encodeURIComponent(name)
+        }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
+          if (j.ok) {{ del.closest('.photo-card').remove(); }}
+          else {{ alert(j.message || 'Delete failed.'); del.disabled = false; }}
+        }}).catch(function () {{ alert('Request failed.'); del.disabled = false; }});
       }});
     }})();
   </script>
