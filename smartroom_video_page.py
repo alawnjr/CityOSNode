@@ -40,6 +40,7 @@ RECORDINGS_DIR = Path.home() / "Videos" / "Smartroom Recordings"
 DATA_DIR = Path.home() / "CityOS" / "data"
 RECORD_SCRIPT = Path.home() / "CityOS" / "run_smartroom_capture.sh"
 PREVIEW_PATH = "/dev/shm/smartroom_preview.jpg"  # recorder writes the latest frame here
+PHOTOS_DIR = DATA_DIR / "photos"  # full-resolution stills from the Snap photo button
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".h264", ".ts"}
 
 # Each node has a different camera, so auto-detect the first USB camera via its
@@ -435,6 +436,53 @@ class Recorder:
 
 RECORDER = Recorder()
 
+PHOTO_LOCK = threading.Lock()
+
+
+def photo_capture_size():
+    """Full capture resolution for stills (not the 640-capped preview size):
+    SMARTROOM_CAMERA_SIZE override wins (node.env / env), else the largest MJPG
+    mode <= 1280 wide — the same rule capture.py records with."""
+    override = os.environ.get("SMARTROOM_CAMERA_SIZE")
+    if override:
+        return override
+    return _detect_camera_size(CAMERA_DEVICE, cap_width=1280)
+
+
+def snap_photo():
+    """Grab one full-resolution still to data/photos/. Briefly borrows the camera
+    from the live preview (same release/resume dance the recorder uses); reads a
+    handful of frames and keeps the last so auto-exposure has settled.
+    Returns (ok, message, filename|None)."""
+    if RECORDER.status()["running"]:
+        return False, "Recording in progress — try after it finishes.", None
+    if not PHOTO_LOCK.acquire(blocking=False):
+        return False, "Another photo is being taken.", None
+    try:
+        PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+        name = time.strftime("photo_%Y%m%d_%H%M%S.jpg")
+        dest = PHOTOS_DIR / name
+        CAMERA.shutdown_for_recording()
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error",
+                 "-f", "v4l2", "-input_format", "mjpeg",
+                 "-video_size", photo_capture_size(), "-i", CAMERA_DEVICE,
+                 "-frames:v", "6", "-update", "1", str(dest)],
+                capture_output=True, text=True, timeout=20,
+            )
+        finally:
+            CAMERA.resume_after_recording()
+        if proc.returncode != 0 or not dest.exists() or dest.stat().st_size == 0:
+            dest.unlink(missing_ok=True)
+            err = (proc.stderr or "").strip().splitlines()
+            return False, err[-1] if err else "ffmpeg failed", None
+        return True, f"Saved {name}", name
+    except subprocess.TimeoutExpired:
+        return False, "Camera timed out.", None
+    finally:
+        PHOTO_LOCK.release()
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "SmartroomVideoPage/1.1"
@@ -471,6 +519,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/recordings":
             self.serve_recordings()
             return
+        if parsed.path.startswith("/photo/"):
+            self.serve_photo(parsed.path.removeprefix("/photo/"))
+            return
         if parsed.path.startswith("/video/"):
             self.serve_video(parsed.path.removeprefix("/video/"), download=False)
             return
@@ -493,6 +544,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/record/cancel":
             ok, message = RECORDER.cancel()
             payload = json.dumps({"ok": ok, "message": message})
+            self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
+                            200 if ok else 409)
+            return
+        if parsed.path == "/photo":
+            ok, message, name = snap_photo()
+            payload = json.dumps({"ok": ok, "message": message, "name": name})
             self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
                             200 if ok else 409)
             return
@@ -600,6 +657,18 @@ class Handler(BaseHTTPRequestHandler):
                 f'<span>({count} recording{plural}, .zip)</span></a>'
             )
         days_html = "".join(day_links)
+
+        # Full-resolution stills from the Snap photo button, newest first.
+        photo_items = []
+        if PHOTOS_DIR.is_dir():
+            for p in sorted(PHOTOS_DIR.glob("*.jpg"), key=lambda q: q.stat().st_mtime, reverse=True):
+                pq = urllib.parse.quote(p.name, safe="")
+                kb = p.stat().st_size // 1024
+                photo_items.append(
+                    f'<a class="photo-item" href="/photo/{pq}" target="_blank">'
+                    f'{html.escape(p.name)} <span>({kb} KB)</span></a>'
+                )
+        photos_html = "".join(photo_items) or '<span class="photo-none">No photos yet.</span>'
 
         body = f"""<!doctype html>
 <html lang="en">
@@ -888,6 +957,15 @@ class Handler(BaseHTTPRequestHandler):
     </div>
   </section>
 
+  <section class="wrap record">
+    <h2>Photos</h2>
+    <div class="record-controls">
+      <button type="button" id="photo-btn">&#128247; Snap photo</button>
+      <span id="photo-msg"></span>
+    </div>
+    <div class="day-list" id="photo-list">{photos_html}</div>
+  </section>
+
   <section class="wrap days">
     <h2 class="section-head">Full days</h2>
     <div class="day-list">{days_html}</div>
@@ -931,6 +1009,27 @@ class Handler(BaseHTTPRequestHandler):
       retry.addEventListener('click', start);
       window.__liveRestart = start;
       start();
+    }})();
+  </script>
+
+  <script>
+    (function () {{
+      var pbtn = document.getElementById('photo-btn');
+      var pmsg = document.getElementById('photo-msg');
+      pbtn.addEventListener('click', function () {{
+        pbtn.disabled = true;
+        pmsg.textContent = 'Snapping…';
+        fetch('/photo', {{ method: 'POST' }}).then(function (r) {{
+          return r.json();
+        }}).then(function (j) {{
+          pmsg.textContent = j.message || (j.ok ? 'Saved.' : 'Failed.');
+          if (j.ok) {{ setTimeout(function () {{ location.reload(); }}, 900); }}
+          else {{ pbtn.disabled = false; }}
+        }}).catch(function () {{
+          pmsg.textContent = 'Request failed.';
+          pbtn.disabled = false;
+        }});
+      }});
     }})();
   </script>
 
@@ -1193,6 +1292,16 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     break
                 remaining -= len(chunk)
+
+    def serve_photo(self, encoded_name):
+        # Photos live flat in PHOTOS_DIR; the name check rejects any traversal.
+        name = urllib.parse.unquote(encoded_name)
+        path = (PHOTOS_DIR / name).resolve()
+        if (not name or "/" in name or not path.name.endswith(".jpg")
+                or path.parent != PHOTOS_DIR.resolve() or not path.is_file()):
+            self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
+            return
+        self.send_bytes(path.read_bytes(), "image/jpeg")
 
     def copy_file(self, src):
         while True:
