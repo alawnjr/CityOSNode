@@ -171,6 +171,10 @@ def main():
         objpoints, imgpoints, image_size = collect_views(
             cap, (args.cols, args.rows), args.frames, args.min_move,
             args.out / "debug" / cam_id)
+        # One extra still for the before/after comparison written below.
+        ok, sample = cap.read()
+        if not ok:
+            sample = None
     finally:
         cap.release()
 
@@ -195,6 +199,22 @@ def main():
         "frames_used": len(imgpoints),
         "calibrated_at": dt.datetime.now().astimezone().isoformat(),
     })
+
+    # Before/after comparison: the SAME single frame, raw vs undistorted with the
+    # just-computed intrinsics. The correction is most visible at the frame edges
+    # (straight lines that bow in `before` come out straight in `after`).
+    if sample is not None:
+        debug_dir = args.out / "debug" / cam_id
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        after = cv2.undistort(sample, mtx, dist)
+        cv2.imwrite(str(debug_dir / "before.jpg"), sample)
+        cv2.imwrite(str(debug_dir / "after.jpg"), after)
+        side = np.hstack([sample, after])
+        for text, x in (("before", 12), ("after", sample.shape[1] + 12)):
+            cv2.putText(side, text, (x, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
+            cv2.putText(side, text, (x, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        cv2.imwrite(str(debug_dir / "compare.jpg"), side)
+        print(f"before/after -> {debug_dir}/before.jpg, after.jpg, compare.jpg", file=sys.stderr)
 
     fx, fy = mtx[0, 0], mtx[1, 1]
     cx, cy = mtx[0, 2], mtx[1, 2]
