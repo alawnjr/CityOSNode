@@ -16,8 +16,8 @@ There are **two camera nodes**, each a Pi running the same checkout of this repo
 
 | Host | Board | Camera |
 |---|---|---|
-| `smartroom1.local` | Raspberry Pi 3 | generic ("random Chinese") USB camera |
-| `smartroom2.local` | Raspberry Pi 4 | Logitech (C920-class) USB camera |
+| `smartroom1.local` | Raspberry Pi 3 | Logitech Webcam Pro 9000 — pinned to 800×600 via `node.env` (see below) |
+| `smartroom2.local` | Raspberry Pi 4 | Logitech (C920-class) USB camera — 1280×720@30 |
 
 User is `smartroom` on both; credentials in `PRIVATE.md` (gitignored). The cameras
 are accessed via `ffmpeg -f v4l2`, so capture itself needs no special libraries —
@@ -71,14 +71,22 @@ can be bootstrapped with `setup_pi.sh`.
 
 | Node | Camera | Access |
 |---|---|---|
-| `smartroom1` (Pi 3) | generic USB camera | ffmpeg `-f v4l2`, MJPG; device auto-detected |
+| `smartroom1` (Pi 3) | Logitech Webcam Pro 9000 | ffmpeg `-f v4l2`, MJPG; **pinned to 800×600** — the only mode where it sustains ~27–30fps (its full 1280×800 only delivers ~21fps) |
 | `smartroom2` (Pi 4) | Logitech (C920-class) USB camera | ffmpeg `-f v4l2`, MJPG 1280×720@30; wide 16:9 FOV (4:3 modes are center-cropped/narrower) |
 
 The camera device is **auto-detected** at runtime (first `/dev/v4l/by-id/*-video-index0`
 symlink), so the one shared codebase works on both nodes despite the different
 cameras. Override per node with env vars: `SMARTROOM_CAMERA` (device),
-`SMARTROOM_CAMERA_SIZE` (e.g. `1280x720`), `SMARTROOM_CAMERA_FPS`. Set
-`SMARTROOM_CAMERA_SIZE` on a node whose camera doesn't support the 1280×720 default.
+`SMARTROOM_CAMERA_SIZE` (e.g. `1280x720`), `SMARTROOM_CAMERA_FPS`.
+
+**Per-node overrides live in `node.env`** (gitignored, at the repo root on the
+Pi) — `KEY=VALUE` lines loaded at startup by both `capture.py` and the web page;
+the real environment wins over the file. This is how smartroom1 pins
+`SMARTROOM_CAMERA_SIZE=800x600` without diverging the shared code. Recordings
+are expected to be ~30fps — the laptop-side validator flags clips outside
+27–33fps, so when swapping a camera, measure which mode actually *delivers*
+30fps (cheap UVC cams often under-deliver at their max resolution, and drop
+further in low light) and pin it in `node.env`.
 
 **Audio and the I²C/PCB sensors were removed from the capture pipeline** (video
 only for now). Their drivers/wiring still exist on the boards and the per-device
@@ -97,9 +105,16 @@ data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_NNN/
 ```
 
 It's a single blocking `ffmpeg -f v4l2` call for the full duration, then it writes
-the per-frame timestamps and `metadata.json`. `metadata.json` records `node`
+the per-frame timestamps and `metadata.json`. **The timestamps CSV is real, not
+synthetic**: after recording, `probe_frame_times()` ffprobes the finished mp4 for
+each frame's actual presentation time (the USB cams are variable-rate, so the
+nominal-fps grid would be wrong), one CSV row per actual encoded frame;
+`metadata.json`'s `frame_count` matches the video. `metadata.json` records `node`
 (`socket.gethostname()`) so recordings from `smartroom1` vs `smartroom2` are
-distinguishable when merged. Folder/recording numbers auto-increment.
+distinguishable when merged, and **embeds the camera's calibration** (see below)
+when one exists. Folder/recording numbers auto-increment — note the two Pis'
+counters must stay in step for the laptop dashboard to pair same-session
+recordings (failed/aborted attempts still consume a number).
 
 When `SMARTROOM_PREVIEW` is set in the environment, the camera ffmpeg gains a
 second output writing the latest frame to a jpg — the web UI uses this to show the
@@ -109,6 +124,32 @@ Cross-node sync: there's no shared clock between the two Pis, so align recording
 using the **clap at t=0** marker in `test/scenarios.md` (keep the Pis' clocks close
 with NTP).
 
+## Camera calibration (intrinsics)
+
+`calibrate_camera.py` computes checkerboard intrinsics (camera matrix, distortion)
+**on the Pi**, with the venv python. Two modes; photos mode is the recommended flow
+(you can frame the board on the live view, and the camera is never opened):
+
+```bash
+# 1. On the node's web page: Snap photo of the checkerboard at 10+ positions
+#    (center, corners, near, far, tilted), then press "Calibrate from photos" —
+#    or run it by hand:
+~/CityOS/.venv/bin/python ~/CityOS/calibrate_camera.py --photos   # from data/photos/*.jpg
+~/CityOS/.venv/bin/python ~/CityOS/calibrate_camera.py            # live capture (camera must be free)
+```
+
+Board: 9×6 *inner* corners, 25mm squares by default (`--cols/--rows/--square-mm`).
+Output: `calibration/<usb-serial>.json` (gitignored — machine-generated on the Pi,
+like `data/`), **keyed by the camera's USB serial** so a swapped camera never
+inherits stale intrinsics. Also writes corner-overlay debug JPGs and a
+`before.jpg`/`after.jpg`/`compare.jpg` (same frame raw vs undistorted) under
+`calibration/debug/<camera-id>/`. RMS < 1.0 px is good.
+
+`capture.py` embeds the values into every recording's `metadata.json`
+(`streams.camera_main.calibration`, resolution-scaled if needed). Videos stay
+**raw** — the laptop undistorts downstream. Requires `opencv-python-headless`
+(in `requirements.txt`).
+
 ## smartroom_video_page.py — web UI
 
 A stdlib `http.server` (`ThreadingHTTPServer`) serving `http://<node>.local:8000`
@@ -117,10 +158,22 @@ A stdlib `http.server` (`ThreadingHTTPServer`) serving `http://<node>.local:8000
 `~/CityOS`). It auto-detects the node's camera the same way `capture.py` does. It
 lives in this repo and is synced via GitHub like everything else — **after editing,
 push and `git pull` on each Pi, then `sudo systemctl restart
-smartroom-video-page.service`** there. Routes:
-- `/` — live MJPEG view (`/stream.mjpg`), a Record panel, and a list of recordings.
+smartroom-video-page.service`** there. (Without sudo: `fuser -k -TERM 8000/tcp`,
+then relaunch with `nohup python3 ~/CityOS/smartroom_video_page.py &`. Never
+`pkill -f` the script name over ssh — the pattern matches your own remote shell
+and kills the connection; also note systemd treats that SIGTERM as a clean exit,
+so `Restart=on-failure` will NOT respawn it.) Routes:
+- `/` — live MJPEG view (`/stream.mjpg`), a Record panel, Photos (snap/calibrate),
+  and a list of recordings.
 - `POST /record` (duration) → runs `run_smartroom_capture.sh`; `POST /record/cancel`
   kills the recording's process group; `/record/status` returns countdown/elapsed JSON.
+- `POST /photo` — full-resolution still to `data/photos/` (borrows the camera from
+  the preview with a busy-retry); `/photo/<name>` serves it; `POST /photo/delete`
+  removes one. Photos are page-only (not in the `/recordings` listing).
+- `POST /calibrate` + `/calibrate/status` — runs `calibrate_camera.py --photos` in
+  the background and reports the RMS/result.
+- `/recordings` — JSON listing consumed by the laptop's Save All; includes each
+  clip's `metadata.json` **and `*_timestamps.csv`** so frame timing reaches the laptop.
 - `/dataset/<rec>` zips a whole recording folder; `/video/`, `/download/` serve single files.
 
 The camera is **single-access**, so the page releases its own preview ffmpeg
@@ -147,10 +200,24 @@ are no longer in the capture pipeline**, so any of them can be re-added later.
   for realistic occupancy data; each opens with a clap at t=0 (`clap_at_t0`) as the
   cross-stream / cross-node sync marker.
 
+## The laptop counterpart: smartroom-control
+
+The analysis side lives in a **separate repo** on the dev machine,
+`~/Code/smartroom-control` (Next.js dashboard on `localhost:4000`, its own git —
+single `origin` on GitHub, commits stay local unless asked to push). It pulls
+recordings from both Pis via the pages' `/recordings` listings ("Save All"),
+merges the two cameras into one session tree keyed by matching `day/rec` names,
+validates data integrity, writes undistorted copies of calibrated clips, runs
+YOLO/RTMPose/action-recognition analyses, and serves a read-only LAN API
+(`/api/v1`, documented in its `API.md`). When changing this repo's recording
+layout, `metadata.json` schema, or the `/recordings` listing, check that repo's
+`app/api/save-all/`, `lib/detections.ts`, and `detect/` for the consuming side.
+
 ## Conventions
 
-- `data/`, `*.mp4`, `*.wav`, and `PRIVATE.md` are gitignored — recordings are not
-  version-controlled.
+- `data/` (recordings + `data/photos/` snaps), `calibration/`, `node.env`,
+  `*.mp4`, `*.wav`, `*.pdf`, and `PRIVATE.md` are gitignored — recordings and
+  machine-generated per-node state are not version-controlled.
 - Keep raw sensor values raw — capture writes uncorrected readings; any
   post-processing happens downstream, not baked into the CSVs.
 - The camera device/format are auto-detected with `SMARTROOM_CAMERA*` env
