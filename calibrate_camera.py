@@ -110,8 +110,14 @@ def detect_corners(gray, pattern):
         found, corners = cv2.findChessboardCorners(gray, pattern, flags=flags)
         if not found:
             return None
+    # Sub-pixel refinement window scaled to the square size in this view — a
+    # fixed 11x11 window spans NEIGHBORING corners on the dense 17x17 board when
+    # the squares image small, dragging corners off and inflating RMS.
+    pts = corners.reshape(-1, 2)
+    spacing = float(np.median(np.linalg.norm(np.diff(pts[: pattern[0]], axis=0), axis=1)))
+    win = int(max(3, min(11, spacing * 0.4)))
     return cv2.cornerSubPix(
-        gray, corners.astype(np.float32), (11, 11), (-1, -1),
+        gray, corners.astype(np.float32), (win, win), (-1, -1),
         (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
 
 
