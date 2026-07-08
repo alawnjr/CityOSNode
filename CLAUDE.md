@@ -138,7 +138,10 @@ with NTP).
 ~/CityOS/.venv/bin/python ~/CityOS/calibrate_camera.py            # live capture (camera must be free)
 ```
 
-Board: 9×6 *inner* corners, 25mm squares by default (`--cols/--rows/--square-mm`).
+Board: the **DFvision Q18-100-4.5 glass plate** by default — 18×18 squares on
+100×100mm, 4.5mm squares → **17×17 inner corners**. It's small: hold it
+~15–40cm from the lens. Other boards via `--cols/--rows/--square-mm` (the
+printed paper board is `--cols 9 --rows 6 --square-mm 25`).
 Output: `calibration/<usb-serial>.json` (gitignored — machine-generated on the Pi,
 like `data/`), **keyed by the camera's USB serial** so a swapped camera never
 inherits stale intrinsics. Also writes corner-overlay debug JPGs and a

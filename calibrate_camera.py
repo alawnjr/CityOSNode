@@ -23,8 +23,11 @@ reuses stale intrinsics. capture.py embeds this file's values into each
 recording's metadata.json (videos themselves stay raw; undistortion happens
 downstream).
 
-Board default: 9x6 INNER corners (a 10x7-square board), 25 mm squares —
-override with --cols/--rows/--square-mm if using a different print.
+Board default: the DFvision Q18-100-4.5 glass plate — 18x18 squares on a
+100x100mm plate, 4.5mm squares, i.e. 17x17 INNER corners. It's a SMALL board:
+hold it ~15-40cm from the lens so the pattern fills a good part of the frame.
+Override with --cols/--rows/--square-mm for a different board (e.g. the printed
+paper 10x7-square board: --cols 9 --rows 6 --square-mm 25).
 """
 
 import argparse
@@ -93,17 +96,20 @@ def board_model(pattern):
 
 
 def detect_corners(gray, pattern):
-    """Checkerboard corners in one grayscale image, or None. Detects on a
-    half-scale copy (fast enough for the Pi 3), then refines the corner
-    positions at full resolution for calibration accuracy."""
+    """Checkerboard corners in one grayscale image, or None. Tries a half-scale
+    copy first (fast on the Pi 3), falling back to full resolution — the dense
+    17x17 glass board's squares can be only a few px at half scale. Corner
+    positions are always refined at full resolution."""
+    flags = (cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+             | cv2.CALIB_CB_FAST_CHECK)
     small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-    found, corners = cv2.findChessboardCorners(
-        small, pattern,
-        flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-        | cv2.CALIB_CB_FAST_CHECK)
-    if not found:
-        return None
-    corners = corners * 2.0  # back to full-res coordinates
+    found, corners = cv2.findChessboardCorners(small, pattern, flags=flags)
+    if found:
+        corners = corners * 2.0  # back to full-res coordinates
+    else:
+        found, corners = cv2.findChessboardCorners(gray, pattern, flags=flags)
+        if not found:
+            return None
     return cv2.cornerSubPix(
         gray, corners.astype(np.float32), (11, 11), (-1, -1),
         (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
@@ -196,9 +202,11 @@ def collect_views(cap, pattern, n_views, min_move_px, debug_dir: Path):
 def main():
     ap = argparse.ArgumentParser(description="Checkerboard intrinsic calibration for this node's camera.")
     ap.add_argument("--frames", type=int, default=15, help="diverse views to collect (default 15)")
-    ap.add_argument("--cols", type=int, default=9, help="inner corners per row (default 9)")
-    ap.add_argument("--rows", type=int, default=6, help="inner corners per column (default 6)")
-    ap.add_argument("--square-mm", type=float, default=25.0, help="square edge length in mm (default 25)")
+    # Defaults = DFvision Q18-100-4.5 glass board (18x18 squares -> 17x17 inner
+    # corners, 4.5mm squares on a 100x100mm plate).
+    ap.add_argument("--cols", type=int, default=17, help="inner corners per row (default 17)")
+    ap.add_argument("--rows", type=int, default=17, help="inner corners per column (default 17)")
+    ap.add_argument("--square-mm", type=float, default=4.5, help="square edge length in mm (default 4.5)")
     ap.add_argument("--min-move", type=float, default=40.0,
                     help="min corner-centroid movement (px) between accepted views (default 40)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help="output dir (default calibration/)")
