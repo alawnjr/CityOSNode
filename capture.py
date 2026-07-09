@@ -258,9 +258,12 @@ def record_camera(path):
         proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode == 0:
             return
-        if attempt < 4 and "busy" in (proc.stderr or "").lower():
-            print(f"camera busy — retrying ({attempt + 1}/4)…", file=sys.stderr)
-            time.sleep(2)
+        # busy = preview handoff race; "no such" = the camera dropped off the
+        # USB bus and is re-enumerating (takes a few seconds on a flaky link).
+        err = (proc.stderr or "").lower()
+        if attempt < 4 and ("busy" in err or "no such" in err or "input/output error" in err):
+            print(f"camera not ready — retrying ({attempt + 1}/4)…", file=sys.stderr)
+            time.sleep(3)
             continue
         sys.stderr.write(proc.stderr or "")
         raise subprocess.CalledProcessError(proc.returncode, command)
