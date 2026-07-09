@@ -488,8 +488,26 @@ class CalibrateJob:
             return {"running": self.running, "ok": self.ok, "message": self.message}
 
 
-CALIBRATOR = CalibrateJob(["calibrate_camera.py", "--photos"])
-EXTRINSIC_CALIBRATOR = CalibrateJob(["calibrate_extrinsics.py", "--photos"])
+# Each calibration reads its own photo folder, so checkerboard and AprilTag
+# snaps never mix (see PHOTO_KINDS / the two Snap buttons).
+CALIBRATOR = CalibrateJob(["calibrate_camera.py", "--photos", "data/photos/intrinsic"])
+EXTRINSIC_CALIBRATOR = CalibrateJob(["calibrate_extrinsics.py", "--photos", "data/photos/extrinsic"])
+
+PHOTO_KINDS = ("intrinsic", "extrinsic")
+
+
+def resolve_photo(name):
+    """data/photos path for a client-supplied photo name, or None. Accepts a
+    bare filename (legacy root photos) or '<kind>/<file>' for the calibration
+    subfolders; rejects anything else (traversal guard)."""
+    parts = name.split("/")
+    if not name or len(parts) > 2 or (len(parts) == 2 and parts[0] not in PHOTO_KINDS):
+        return None
+    path = (PHOTOS_DIR / name).resolve()
+    allowed = [PHOTOS_DIR.resolve()] + [(PHOTOS_DIR / k).resolve() for k in PHOTO_KINDS]
+    if not path.name.endswith(".jpg") or path.parent not in allowed or not path.is_file():
+        return None
+    return path
 
 
 def calibration_summary():
@@ -522,19 +540,24 @@ def photo_capture_size():
     return _detect_camera_size(CAMERA_DEVICE, cap_width=1280)
 
 
-def snap_photo():
-    """Grab one full-resolution still to data/photos/. Briefly borrows the camera
-    from the live preview (same release/resume dance the recorder uses); reads a
-    handful of frames and keeps the last so auto-exposure has settled.
-    Returns (ok, message, filename|None)."""
+def snap_photo(kind=""):
+    """Grab one full-resolution still to data/photos/[<kind>/]. Briefly borrows
+    the camera from the live preview (same release/resume dance the recorder
+    uses); reads a handful of frames and keeps the last so auto-exposure has
+    settled. kind: "intrinsic" | "extrinsic" | "" (root, legacy).
+    Returns (ok, message, relative-name|None)."""
+    if kind not in PHOTO_KINDS and kind != "":
+        return False, f"Unknown photo kind '{kind}'.", None
     if RECORDER.status()["running"]:
         return False, "Recording in progress — try after it finishes.", None
     if not PHOTO_LOCK.acquire(blocking=False):
         return False, "Another photo is being taken.", None
     try:
-        PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+        dest_dir = PHOTOS_DIR / kind if kind else PHOTOS_DIR
+        dest_dir.mkdir(parents=True, exist_ok=True)
         name = time.strftime("photo_%Y%m%d_%H%M%S.jpg")
-        dest = PHOTOS_DIR / name
+        dest = dest_dir / name
+        name = f"{kind}/{name}" if kind else name
         CAMERA.shutdown_for_recording()
         try:
             # The preview's ffmpeg can take a moment to actually release the
@@ -636,7 +659,11 @@ class Handler(BaseHTTPRequestHandler):
                             200 if ok else 409)
             return
         if parsed.path == "/photo":
-            ok, message, name = snap_photo()
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            params = urllib.parse.parse_qs(raw.decode("utf-8", "ignore"))
+            kind = (params.get("kind") or [""])[0]
+            ok, message, name = snap_photo(kind)
             payload = json.dumps({"ok": ok, "message": message, "name": name})
             self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
                             200 if ok else 409)
@@ -658,10 +685,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length else b""
             params = urllib.parse.parse_qs(raw.decode("utf-8", "ignore"))
             name = (params.get("name") or [""])[0]
-            path = (PHOTOS_DIR / name).resolve()
-            # Same traversal guard as serve_photo: flat dir, .jpg only.
-            if (not name or "/" in name or not path.name.endswith(".jpg")
-                    or path.parent != PHOTOS_DIR.resolve() or not path.is_file()):
+            path = resolve_photo(name)
+            if path is None:
                 self.send_bytes(b'{"ok": false, "message": "no such photo"}',
                                 "application/json; charset=utf-8", 404)
                 return
@@ -777,27 +802,46 @@ class Handler(BaseHTTPRequestHandler):
             )
         days_html = "".join(day_links)
 
-        # Full-resolution stills from the Snap photo button, newest first: a
-        # thumbnail card each, with view (new tab) and delete.
-        photo_items = []
-        if PHOTOS_DIR.is_dir():
-            for p in sorted(PHOTOS_DIR.glob("*.jpg"), key=lambda q: q.stat().st_mtime, reverse=True):
-                pq = urllib.parse.quote(p.name, safe="")
-                safe = html.escape(p.name)
+        # Full-resolution stills, grouped by calibration purpose: a thumbnail
+        # card each, with view (new tab) and delete. Names inside the two
+        # calibration subfolders are '<kind>/<file>'.
+        def photo_cards(directory, prefix):
+            items = []
+            if not directory.is_dir():
+                return items
+            for p in sorted(directory.glob("*.jpg"), key=lambda q: q.stat().st_mtime, reverse=True):
+                rel = f"{prefix}/{p.name}" if prefix else p.name
+                pq = urllib.parse.quote(rel, safe="/")
+                safe = html.escape(rel)
                 kb = p.stat().st_size // 1024
-                photo_items.append(f'''
+                items.append(f'''
                 <div class="photo-card" style="display:inline-block;width:220px;margin:6px;vertical-align:top;">
                   <a href="/photo/{pq}" target="_blank" title="Open full size">
                     <img src="/photo/{pq}" alt="{safe}" loading="lazy"
                          style="width:100%;border-radius:8px;display:block;">
                   </a>
                   <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:4px;font-size:0.8em;">
-                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{safe} ({kb} KB)</span>
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{html.escape(p.name)} ({kb} KB)</span>
                     <button type="button" class="photo-del" data-name="{safe}"
                             style="flex-shrink:0;cursor:pointer;">Delete</button>
                   </div>
                 </div>''')
-        photos_html = "".join(photo_items) or '<span class="photo-none">No photos yet.</span>'
+            return items
+
+        photo_sections = []
+        for kind, label in (("intrinsic", "Checkerboard photos (intrinsic)"),
+                            ("extrinsic", "AprilTag photos (extrinsic)")):
+            cards_k = photo_cards(PHOTOS_DIR / kind, kind)
+            photo_sections.append(
+                f'<div style="width:100%;font-weight:700;font-size:0.85em;margin:8px 0 2px;">{label} '
+                f'<span style="opacity:.6">({len(cards_k)})</span></div>'
+                + ("".join(cards_k) or '<span class="photo-none" style="font-size:.85em">none yet</span>'))
+        legacy = photo_cards(PHOTOS_DIR, "")
+        if legacy:
+            photo_sections.append(
+                '<div style="width:100%;font-weight:700;font-size:0.85em;margin:8px 0 2px;">Other photos '
+                '<span style="opacity:.6">(not used by the calibrate buttons)</span></div>' + "".join(legacy))
+        photos_html = "".join(photo_sections)
         cal_entries = calibration_summary()
         calibration_html = ("Calibrated: " + "; ".join(html.escape(e) for e in cal_entries)
                             if cal_entries else
@@ -1093,9 +1137,10 @@ class Handler(BaseHTTPRequestHandler):
   <section class="wrap record">
     <h2>Photos</h2>
     <div class="record-controls">
-      <button type="button" id="photo-btn">&#128247; Snap photo</button>
-      <button type="button" id="cal-btn" title="Checkerboard INTRINSIC calibration from the photos below (snap the board at 10+ positions first)">&#128208; Calibrate from photos</button>
-      <button type="button" id="ext-btn" title="AprilTag EXTRINSIC calibration (camera pose) from the photos below — snap the 36h11 tag (id 1), needs intrinsics first">&#128205; Extrinsic (AprilTag)</button>
+      <button type="button" id="snap-int" title="Snap a CHECKERBOARD photo into the intrinsic set">&#128247; Snap (checkerboard)</button>
+      <button type="button" id="cal-btn" title="Checkerboard INTRINSIC calibration from the intrinsic photos below (snap the board at 10+ positions first)">&#128208; Calibrate intrinsic</button>
+      <button type="button" id="snap-ext" title="Snap an APRILTAG photo into the extrinsic set">&#128247; Snap (AprilTag)</button>
+      <button type="button" id="ext-btn" title="AprilTag EXTRINSIC calibration (camera pose) from the extrinsic photos below — 36h11 id 1; needs intrinsics first">&#128205; Calibrate extrinsic</button>
       <span id="photo-msg"></span>
     </div>
     <div id="cal-info" style="font-size:0.85em;opacity:0.85;margin:6px 0;">{calibration_html}</div>
@@ -1150,22 +1195,30 @@ class Handler(BaseHTTPRequestHandler):
 
   <script>
     (function () {{
-      var pbtn = document.getElementById('photo-btn');
       var pmsg = document.getElementById('photo-msg');
-      pbtn.addEventListener('click', function () {{
-        pbtn.disabled = true;
-        pmsg.textContent = 'Snapping…';
-        fetch('/photo', {{ method: 'POST' }}).then(function (r) {{
-          return r.json();
-        }}).then(function (j) {{
-          pmsg.textContent = j.message || (j.ok ? 'Saved.' : 'Failed.');
-          if (j.ok) {{ setTimeout(function () {{ location.reload(); }}, 900); }}
-          else {{ pbtn.disabled = false; }}
-        }}).catch(function () {{
-          pmsg.textContent = 'Request failed.';
-          pbtn.disabled = false;
+      function wireSnap(btnId, kind) {{
+        var btn = document.getElementById(btnId);
+        btn.addEventListener('click', function () {{
+          btn.disabled = true;
+          pmsg.textContent = 'Snapping…';
+          fetch('/photo', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+            body: 'kind=' + encodeURIComponent(kind)
+          }}).then(function (r) {{
+            return r.json();
+          }}).then(function (j) {{
+            pmsg.textContent = j.message || (j.ok ? 'Saved.' : 'Failed.');
+            if (j.ok) {{ setTimeout(function () {{ location.reload(); }}, 900); }}
+            else {{ btn.disabled = false; }}
+          }}).catch(function () {{
+            pmsg.textContent = 'Request failed.';
+            btn.disabled = false;
+          }});
         }});
-      }});
+      }}
+      wireSnap('snap-int', 'intrinsic');
+      wireSnap('snap-ext', 'extrinsic');
 
       var calInfo = document.getElementById('cal-info');
       function wireCalibrate(btnId, startUrl, statusUrl, label) {{
@@ -1470,11 +1523,8 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def serve_photo(self, encoded_name):
-        # Photos live flat in PHOTOS_DIR; the name check rejects any traversal.
-        name = urllib.parse.unquote(encoded_name)
-        path = (PHOTOS_DIR / name).resolve()
-        if (not name or "/" in name or not path.name.endswith(".jpg")
-                or path.parent != PHOTOS_DIR.resolve() or not path.is_file()):
+        path = resolve_photo(urllib.parse.unquote(encoded_name))
+        if path is None:
             self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
             return
         self.send_bytes(path.read_bytes(), "image/jpeg")
