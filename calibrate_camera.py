@@ -95,21 +95,33 @@ def board_model(pattern):
     return board
 
 
-def detect_corners(gray, pattern):
-    """Checkerboard corners in one grayscale image, or None. Tries a half-scale
-    copy first (fast on the Pi 3), falling back to full resolution — the dense
-    17x17 glass board's squares can be only a few px at half scale. Corner
-    positions are always refined at full resolution."""
+def detect_corners(gray, pattern, thorough=False):
+    """Checkerboard corners in one grayscale image, or None.
+
+    Fast path: classic detector on a half-scale copy with FAST_CHECK (cheap
+    enough to run per-frame in live mode). thorough=True (photos mode) adds the
+    real workhorses when the fast path misses: findChessboardCornersSB
+    (sector-based — far more robust on the dense 17x17 board; measured 23/26
+    vs 3/26 on real hand-held photos) and finally the classic detector at full
+    resolution WITHOUT FAST_CHECK (that flag rejects many valid views)."""
     flags = (cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
              | cv2.CALIB_CB_FAST_CHECK)
     small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
     found, corners = cv2.findChessboardCorners(small, pattern, flags=flags)
     if found:
         corners = corners * 2.0  # back to full-res coordinates
-    else:
-        found, corners = cv2.findChessboardCorners(gray, pattern, flags=flags)
+    elif thorough:
+        found, corners = cv2.findChessboardCornersSB(
+            gray, pattern,
+            flags=cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY)
+        if found:
+            return corners.astype(np.float32)  # SB corners are already subpixel-refined
+        found, corners = cv2.findChessboardCorners(
+            gray, pattern, flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
         if not found:
             return None
+    else:
+        return None
     # Sub-pixel refinement window scaled to the square size in this view — a
     # fixed 11x11 window spans NEIGHBORING corners on the dense 17x17 board when
     # the squares image small, dragging corners off and inflating RMS.
@@ -141,7 +153,7 @@ def collect_from_photos(paths, pattern, debug_dir: Path):
             print(f"  {p.name}: {size[0]}x{size[1]} differs from {image_size[0]}x{image_size[1]} — skipped "
                   "(all photos must share one resolution)", file=sys.stderr)
             continue
-        corners = detect_corners(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), pattern)
+        corners = detect_corners(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), pattern, thorough=True)
         if corners is None:
             print(f"  {p.name}: no board found — skipped", file=sys.stderr)
             continue
