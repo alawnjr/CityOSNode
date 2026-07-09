@@ -184,6 +184,22 @@ def load_calibration():
     return blob
 
 
+def load_extrinsics():
+    """This camera's pose in the room/tag frame (calibrate_extrinsics.py), for
+    embedding in metadata.json. None when not extrinsically calibrated."""
+    cam = camera_id()
+    if cam is None:
+        return None
+    path = CALIBRATION_DIR / f"{cam}.extrinsics.json"
+    try:
+        ext = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    keys = ("camera_id", "frame", "tag", "rvec", "tvec_mm", "rotation_cam_to_room",
+            "camera_position_mm", "reprojection_error_px", "calibrated_at")
+    return {k: ext[k] for k in keys if k in ext}
+
+
 def make_recording_dir():
     """Pick the day_NN_DATE / rec_DATE_NNN folder, matching sample_dataset."""
     now = datetime.now()
@@ -316,6 +332,9 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
     calibration = load_calibration()
     if calibration is not None:
         metadata["streams"]["camera_main"]["calibration"] = calibration
+    extrinsics = load_extrinsics()
+    if extrinsics is not None:
+        metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
     (rec_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
 

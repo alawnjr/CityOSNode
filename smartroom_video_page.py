@@ -440,11 +440,12 @@ PHOTO_LOCK = threading.Lock()
 
 
 class CalibrateJob:
-    """Runs calibrate_camera.py --photos (venv python) in the background and
-    keeps its outcome for the page to poll. Photos mode never opens the camera,
-    so the live view / recordings are unaffected while it runs."""
+    """Runs a calibration script (venv python) in the background and keeps its
+    outcome for the page to poll. Photos mode never opens the camera, so the
+    live view / recordings are unaffected while it runs."""
 
-    def __init__(self):
+    def __init__(self, script_args):
+        self.script_args = script_args
         self.lock = threading.Lock()
         self.running = False
         self.ok = None       # None until a run has finished
@@ -466,7 +467,7 @@ class CalibrateJob:
             python = Path("/usr/bin/python3")
         try:
             proc = subprocess.run(
-                [str(python), str(home / "calibrate_camera.py"), "--photos"],
+                [str(python), str(home / self.script_args[0]), *self.script_args[1:]],
                 capture_output=True, text=True, timeout=600, cwd=str(home),
             )
             # The script's summary (RMS, fx/fy, saved path) is on stderr.
@@ -487,7 +488,8 @@ class CalibrateJob:
             return {"running": self.running, "ok": self.ok, "message": self.message}
 
 
-CALIBRATOR = CalibrateJob()
+CALIBRATOR = CalibrateJob(["calibrate_camera.py", "--photos"])
+EXTRINSIC_CALIBRATOR = CalibrateJob(["calibrate_extrinsics.py", "--photos"])
 
 
 def calibration_summary():
@@ -498,8 +500,13 @@ def calibration_summary():
         try:
             d = json.loads(p.read_text())
             when = (d.get("calibrated_at") or "")[:10]
-            entries.append(f"{p.stem} — RMS {d.get('rms')} px, "
-                           f"{d.get('image_size', ['?', '?'])[0]}x{d.get('image_size', ['?', '?'])[1]}, {when}")
+            if p.stem.endswith(".extrinsics") or "camera_position_mm" in d:
+                pos = d.get("camera_position_mm", ["?"] * 3)
+                entries.append(f"extrinsic: cam at [{pos[0]}, {pos[1]}, {pos[2]}]mm in tag frame, "
+                               f"reproj {d.get('reprojection_error_px')} px, {when}")
+            else:
+                entries.append(f"{p.stem} — RMS {d.get('rms')} px, "
+                               f"{d.get('image_size', ['?', '?'])[0]}x{d.get('image_size', ['?', '?'])[1]}, {when}")
         except (OSError, ValueError):
             continue
     return entries
@@ -586,6 +593,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(json.dumps(CALIBRATOR.status()).encode("utf-8"),
                             "application/json; charset=utf-8")
             return
+        if parsed.path == "/calibrate/extrinsic/status":
+            self.send_bytes(json.dumps(EXTRINSIC_CALIBRATOR.status()).encode("utf-8"),
+                            "application/json; charset=utf-8")
+            return
         if parsed.path == "/record/status":
             self.send_bytes(json.dumps(RECORDER.status()).encode("utf-8"),
                             "application/json; charset=utf-8")
@@ -632,6 +643,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/calibrate":
             ok, message = CALIBRATOR.start()
+            payload = json.dumps({"ok": ok, "message": message})
+            self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
+                            200 if ok else 409)
+            return
+        if parsed.path == "/calibrate/extrinsic":
+            ok, message = EXTRINSIC_CALIBRATOR.start()
             payload = json.dumps({"ok": ok, "message": message})
             self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
                             200 if ok else 409)
@@ -1077,7 +1094,8 @@ class Handler(BaseHTTPRequestHandler):
     <h2>Photos</h2>
     <div class="record-controls">
       <button type="button" id="photo-btn">&#128247; Snap photo</button>
-      <button type="button" id="cal-btn" title="Checkerboard calibration from the photos below (snap the board at 10+ positions first)">&#128208; Calibrate from photos</button>
+      <button type="button" id="cal-btn" title="Checkerboard INTRINSIC calibration from the photos below (snap the board at 10+ positions first)">&#128208; Calibrate from photos</button>
+      <button type="button" id="ext-btn" title="AprilTag EXTRINSIC calibration (camera pose) from the photos below — snap the 36h11 tag (id 1), needs intrinsics first">&#128205; Extrinsic (AprilTag)</button>
       <span id="photo-msg"></span>
     </div>
     <div id="cal-info" style="font-size:0.85em;opacity:0.85;margin:6px 0;">{calibration_html}</div>
@@ -1149,25 +1167,29 @@ class Handler(BaseHTTPRequestHandler):
         }});
       }});
 
-      var calBtn = document.getElementById('cal-btn');
       var calInfo = document.getElementById('cal-info');
-      var calPoll = null;
-      function calCheck() {{
-        fetch('/calibrate/status').then(function (r) {{ return r.json(); }}).then(function (s) {{
-          if (s.running) {{ calInfo.textContent = 'Calibrating… ' + (s.message || ''); return; }}
-          if (calPoll) {{ clearInterval(calPoll); calPoll = null; }}
-          calBtn.disabled = false;
-          calInfo.textContent = (s.ok ? '✅ ' : (s.ok === false ? '❌ ' : '')) + (s.message || '');
-        }}).catch(function () {{}});
+      function wireCalibrate(btnId, startUrl, statusUrl, label) {{
+        var btn = document.getElementById(btnId);
+        var poll = null;
+        function check() {{
+          fetch(statusUrl).then(function (r) {{ return r.json(); }}).then(function (s) {{
+            if (s.running) {{ calInfo.textContent = label + ' running… ' + (s.message || ''); return; }}
+            if (poll) {{ clearInterval(poll); poll = null; }}
+            btn.disabled = false;
+            calInfo.textContent = (s.ok ? '✅ ' : (s.ok === false ? '❌ ' : '')) + (s.message || '');
+          }}).catch(function () {{}});
+        }}
+        btn.addEventListener('click', function () {{
+          btn.disabled = true;
+          calInfo.textContent = 'Starting ' + label + '…';
+          fetch(startUrl, {{ method: 'POST' }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
+            if (!j.ok) {{ calInfo.textContent = j.message || 'Could not start.'; btn.disabled = false; return; }}
+            poll = setInterval(check, 2000);
+          }}).catch(function () {{ calInfo.textContent = 'Request failed.'; btn.disabled = false; }});
+        }});
       }}
-      calBtn.addEventListener('click', function () {{
-        calBtn.disabled = true;
-        calInfo.textContent = 'Starting calibration…';
-        fetch('/calibrate', {{ method: 'POST' }}).then(function (r) {{ return r.json(); }}).then(function (j) {{
-          if (!j.ok) {{ calInfo.textContent = j.message || 'Could not start.'; calBtn.disabled = false; return; }}
-          calPoll = setInterval(calCheck, 2000);
-        }}).catch(function () {{ calInfo.textContent = 'Request failed.'; calBtn.disabled = false; }});
-      }});
+      wireCalibrate('cal-btn', '/calibrate', '/calibrate/status', 'intrinsic calibration');
+      wireCalibrate('ext-btn', '/calibrate/extrinsic', '/calibrate/extrinsic/status', 'extrinsic calibration');
 
       document.getElementById('photo-list').addEventListener('click', function (e) {{
         var del = e.target.closest('.photo-del');
