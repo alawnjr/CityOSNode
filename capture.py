@@ -250,7 +250,20 @@ def record_camera(path):
             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
             str(path),
         ]
-    subprocess.run(command, check=True)
+    # The camera can take a few seconds to actually be released (the web page's
+    # preview hands it over just before this runs, and a glitchy USB link makes
+    # the v4l2 close slow) — retry briefly on "busy" instead of failing the
+    # whole recording. Real errors still raise, with ffmpeg's stderr shown.
+    for attempt in range(5):
+        proc = subprocess.run(command, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return
+        if attempt < 4 and "busy" in (proc.stderr or "").lower():
+            print(f"camera busy — retrying ({attempt + 1}/4)…", file=sys.stderr)
+            time.sleep(2)
+            continue
+        sys.stderr.write(proc.stderr or "")
+        raise subprocess.CalledProcessError(proc.returncode, command)
 
 
 def probe_frame_times(mp4_path):
