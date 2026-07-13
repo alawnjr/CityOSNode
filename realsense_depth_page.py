@@ -212,11 +212,20 @@ class RealSenseStream:
             self.last_active = time.monotonic()
 
         try:
+            drop_toggle = False
             while True:
                 with self.cond:
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
                         break
+                    recording = (self.clients - self.viewers) > 0
                 frames = pipeline.wait_for_frames(5000)
+                # While a recorder holds the stream, process every 2nd frame:
+                # align + copies at 30fps starve the recorder's encoder feeds
+                # (the recording targets RECORD_FPS=15 anyway).
+                if recording:
+                    drop_toggle = not drop_toggle
+                    if drop_toggle:
+                        continue
                 frames = align.process(frames)
                 depth = frames.get_depth_frame()
                 color = frames.get_color_frame()
