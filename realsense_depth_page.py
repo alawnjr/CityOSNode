@@ -368,7 +368,11 @@ def list_devices():
             entry["status"] = stream.status() if stream else {}
             devices.append(entry)
     except Exception:  # noqa: BLE001 - enumeration is best-effort
-        _reset_rs_context()  # rebuild the context on the next call
+        pass
+    if not devices and _usb_realsense_present():
+        # the context can silently cache an empty device list after pipelines
+        # start/stop (it never throws) — rebuild it for the next call
+        _reset_rs_context()
     _enum_watchdog(devices)
     devices.sort(key=lambda d: d.get("name", ""), reverse=True)
     return devices
