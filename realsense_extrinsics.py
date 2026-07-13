@@ -44,8 +44,14 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUT = PROJECT_ROOT / "calibration"
 
-TAG_ID = int(os.environ.get("SMARTROOM_TAG_ID", "1"))
-TAG_SIZE_MM = float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173"))
+# Resolved at CALL time, not import time — the web page imports this module
+# before it loads node.env, so import-time reads would freeze the defaults.
+def _env_tag_id():
+    return int(os.environ.get("SMARTROOM_TAG_ID", "1"))
+
+
+def _env_tag_size_mm():
+    return float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173"))
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -83,13 +89,17 @@ def _depth_at(depth_m, px, py):
 
 
 def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
-                           tag_id=TAG_ID, tag_size_mm=TAG_SIZE_MM,
+                           tag_id=None, tag_size_mm=None,
                            out_dir=DEFAULT_OUT):
     """samples: list of (color_bgr, depth_m) with depth ALIGNED to color.
     Returns (ok, message); writes calibration/<serial>.extrinsics.json and a
     debug overlay on success."""
     if not samples:
         return False, "no frames captured"
+    if tag_id is None:
+        tag_id = _env_tag_id()
+    if tag_size_mm is None:
+        tag_size_mm = _env_tag_size_mm()
     K, dist = intrinsics_to_cv(intr)
 
     # Tag corner model for SOLVEPNP_IPPE_SQUARE (aruco corner order TL,TR,BR,BL),
@@ -313,10 +323,20 @@ def _save_room_tags(other_tags, serial, ref_tag_id, tag_size_mm, out_dir):
 def main():
     import pyrealsense2 as rs  # standalone mode only; the page imports us without it
 
+    # standalone runs need node.env too (the page loads it for the in-process path)
+    try:
+        for line in (PROJECT_ROOT / "node.env").read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+    except OSError:
+        pass
+
     ap = argparse.ArgumentParser(description="AprilTag extrinsic calibration for a RealSense camera.")
     ap.add_argument("--serial", default=None, help="camera USB serial (default: first device)")
-    ap.add_argument("--tag-id", type=int, default=TAG_ID)
-    ap.add_argument("--tag-size-mm", type=float, default=TAG_SIZE_MM)
+    ap.add_argument("--tag-id", type=int, default=_env_tag_id())
+    ap.add_argument("--tag-size-mm", type=float, default=_env_tag_size_mm())
     ap.add_argument("--frames", type=int, default=6)
     args = ap.parse_args()
 
