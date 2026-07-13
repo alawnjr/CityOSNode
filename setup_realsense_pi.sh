@@ -33,11 +33,14 @@ if [ ! -d "$SRC_DIR" ]; then
     https://github.com/IntelRealSense/librealsense.git "$SRC_DIR"
 fi
 
+# -D_GNU_SOURCE: the bundled rosbag zstd.c calls qsort_r without declaring it,
+# which GCC >= 14 (Debian 13) treats as a hard error instead of a warning.
 echo ">> configuring (RSUSB backend, python bindings -> venv)"
 mkdir -p "$SRC_DIR/build"
 cd "$SRC_DIR/build"
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="-D_GNU_SOURCE" \
   -DFORCE_RSUSB_BACKEND=ON \
   -DBUILD_PYTHON_BINDINGS=ON \
   -DPYTHON_EXECUTABLE="$VENV_PY" \
