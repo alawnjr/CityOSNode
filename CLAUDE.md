@@ -170,6 +170,10 @@ so `Restart=on-failure` will NOT respawn it.) Routes:
   and a list of recordings.
 - `POST /record` (duration) → runs `run_smartroom_capture.sh`; `POST /record/cancel`
   kills the recording's process group; `/record/status` returns countdown/elapsed JSON.
+- `POST /record/all` (duration) → records locally AND fans out `POST /record` to
+  the peer nodes (`SMARTROOM_PEERS` in node.env, default both smartroom hosts
+  minus self) — the "Record ALL nodes" button, so synced recordings don't need
+  the laptop dashboard.
 - `POST /photo` — full-resolution still to `data/photos/` (borrows the camera from
   the preview with a busy-retry); `/photo/<name>` serves it; `POST /photo/delete`
   removes one. Photos are page-only (not in the `/recordings` listing).
@@ -185,15 +189,28 @@ feed, then resumes its own camera capture when the recording ends.
 
 ## realsense_depth_page.py — D455 depth/RGB view (port 8001)
 
-A second stdlib web page for the Intel RealSense D455 on `smartroom2` — live RGB
+A second stdlib web page for the Intel RealSense cameras on `smartroom2`
+(D455 + D435, one section per connected device, keyed by USB serial) — live RGB
 and colorized depth side by side (depth aligned to color), click any pixel to
-read its distance in meters. Runs with the **venv** python (needs
-`pyrealsense2`, which has no aarch64 wheel — built from source on the Pi by
-`setup_realsense_pi.sh`, ~1–2h compile with the RSUSB backend). The D455 is a
-separate USB device from the node's main webcam, so this page and
-`smartroom_video_page.py` (port 8000) run side by side without conflict. The
-D455 should be in a **blue USB 3 port** (on USB 2 it only reaches reduced
-profiles; the page shows a warning with the negotiated USB speed).
+read its distance in meters. Runs with the **venv** python via the
+`smartroom-depth-page.service` systemd unit (needs `pyrealsense2`, which has no
+aarch64 wheel — built from source on the Pi by `setup_realsense_pi.sh`, ~1–2h
+compile with the RSUSB backend). The RealSense cameras are separate USB devices
+from the node's main webcam, so this page and `smartroom_video_page.py` (port
+8000) run side by side without conflict; the port-8000 page also **embeds this
+page's cameras** (its JSON endpoints send CORS headers for that). RealSense
+cameras must be in the **blue USB 3 ports with USB 3 cables** (on USB 2 they
+only reach reduced profiles, and two RealSense cannot share the USB 2 bus; the
+pages show the negotiated USB speed). Gotchas learned the hard way: only ONE
+long-lived `rs.context()` may exist, created before any pipeline (see comments
+in the page); per-serial 180° flips via `SMARTROOM_DEPTH_FLIP` in node.env.
+
+`realsense_extrinsics.py` — AprilTag extrinsic calibration for a RealSense
+camera using its **factory intrinsics** (no checkerboard needed) plus a
+depth-vs-PnP cross-check; same tag (36h11 id 1) and same
+`calibration/<serial>.extrinsics.json` schema as `calibrate_extrinsics.py`.
+Run from the "Calibrate extrinsic" button on either web page (executes
+in-process on live frames) or standalone with the venv python.
 
 ## `sample_dataset/` is the schema reference
 

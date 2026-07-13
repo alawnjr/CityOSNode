@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -436,6 +438,50 @@ class Recorder:
 
 RECORDER = Recorder()
 
+# All camera nodes; "Record all" fans out to every one that isn't this host.
+# Override with SMARTROOM_PEERS (comma-separated hosts) in node.env.
+PEER_HOSTS = [h.strip() for h in os.environ.get(
+    "SMARTROOM_PEERS", "smartroom1.local,smartroom2.local").split(",") if h.strip()]
+
+
+def _peer_hosts():
+    me = socket.gethostname().split(".")[0].lower()
+    return [h for h in PEER_HOSTS if h.split(".")[0].lower() != me]
+
+
+def record_all(duration):
+    """Start a recording locally AND on every peer node (their own /record).
+    Returns (local_ok, {host: message}) — a dead peer is reported, not fatal."""
+    results = {}
+    local_ok, local_message = RECORDER.start(duration)
+    results["this node"] = local_message
+
+    def hit(host):
+        try:
+            req = urllib.request.Request(
+                f"http://{host}:8000/record",
+                data=f"duration={duration}".encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=5) as res:
+                body = json.loads(res.read().decode("utf-8", "ignore"))
+                results[host] = body.get("message", "started")
+        except urllib.error.HTTPError as e:
+            try:
+                results[host] = json.loads(e.read().decode()).get("message", f"HTTP {e.code}")
+            except Exception:
+                results[host] = f"HTTP {e.code}"
+        except Exception as e:  # noqa: BLE001 - peer down is a normal outcome
+            results[host] = f"unreachable ({e})"
+
+    threads = [threading.Thread(target=hit, args=(h,), daemon=True) for h in _peer_hosts()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=6)
+    return local_ok, results
+
+
 PHOTO_LOCK = threading.Lock()
 
 
@@ -651,6 +697,20 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/record":
             self.start_recording()
+            return
+        if parsed.path == "/record/all":
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            params = urllib.parse.parse_qs(raw.decode("utf-8", "ignore"))
+            try:
+                duration = int(float(params.get("duration", ["30"])[0]))
+            except (ValueError, TypeError):
+                duration = 30
+            duration = max(1, min(duration, 3600))
+            local_ok, results = record_all(duration)
+            payload = json.dumps({"ok": local_ok, "results": results, **RECORDER.status()})
+            self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
+                            200 if local_ok else 409)
             return
         if parsed.path == "/record/cancel":
             ok, message = RECORDER.cancel()
@@ -1123,7 +1183,10 @@ class Handler(BaseHTTPRequestHandler):
         <input type="number" id="rec-seconds" min="1" max="3600" value="30">
       </label>
       <button type="button" id="rec-btn">Record</button>
+      <button type="button" id="rec-all-btn" title="Start a synced recording on every camera node"
+              style="color:#fff;background:#7c3aed;border:0;padding:10px 20px;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;">Record ALL nodes</button>
     </div>
+    <div id="rec-all-msg" style="font-size:0.85em;opacity:0.85;margin-top:6px;"></div>
     <div class="record-status hidden" id="rec-status">
       <span class="rec-dot"></span>
       <span id="rec-text">Recording&hellip;</span>
@@ -1145,6 +1208,11 @@ class Handler(BaseHTTPRequestHandler):
     </div>
     <div id="cal-info" style="font-size:0.85em;opacity:0.85;margin:6px 0;">{calibration_html}</div>
     <div class="day-list" id="photo-list">{photos_html}</div>
+  </section>
+
+  <section class="wrap record" id="depth-section" style="display:none">
+    <h2>Depth cameras</h2>
+    <div id="depth-cams"></div>
   </section>
 
   <section class="wrap days">
@@ -1265,6 +1333,8 @@ class Handler(BaseHTTPRequestHandler):
   <script>
     (function () {{
       var btn = document.getElementById('rec-btn');
+      var allBtn = document.getElementById('rec-all-btn');
+      var allMsg = document.getElementById('rec-all-msg');
       var cancelBtn = document.getElementById('rec-cancel');
       var secs = document.getElementById('rec-seconds');
       var box = document.getElementById('rec-status');
@@ -1293,6 +1363,7 @@ class Handler(BaseHTTPRequestHandler):
         text.textContent = message;
         cancelBtn.style.display = 'none';
         btn.disabled = false;
+        allBtn.disabled = false;
         secs.disabled = false;
         setTimeout(function () {{ location.reload(); }}, 1800);
       }}
@@ -1303,23 +1374,30 @@ class Handler(BaseHTTPRequestHandler):
         }}).catch(function () {{}});
       }}
 
-      btn.addEventListener('click', function () {{
+      function begin(url) {{
         var d = parseInt(secs.value, 10);
         if (!d || d < 1) {{ d = 30; }}
         cancelling = false;
         btn.disabled = true;
+        allBtn.disabled = true;
         secs.disabled = true;
         box.classList.remove('hidden');
         cancelBtn.style.display = '';
         cancelBtn.disabled = false;
         text.textContent = 'Starting...';
-        fetch('/record', {{
+        allMsg.textContent = '';
+        fetch(url, {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
           body: 'duration=' + d
         }}).then(function (r) {{
           return r.json().then(function (j) {{ return {{ ok: r.ok, body: j }}; }});
         }}).then(function (res) {{
+          if (res.body.results) {{
+            allMsg.textContent = Object.keys(res.body.results).map(function (k) {{
+              return k + ': ' + res.body.results[k];
+            }}).join('  ·  ');
+          }}
           if (!res.ok || !res.body.ok) {{ finish(res.body.message || 'Could not start recording.'); return; }}
           duration = res.body.duration;
           startMs = Date.now();
@@ -1334,7 +1412,10 @@ class Handler(BaseHTTPRequestHandler):
             previewImg.src = '/preview.jpg?t=' + Date.now();
           }}, 300);
         }}).catch(function () {{ finish('Could not start recording.'); }});
-      }});
+      }}
+
+      btn.addEventListener('click', function () {{ begin('/record'); }});
+      allBtn.addEventListener('click', function () {{ begin('/record/all'); }});
 
       cancelBtn.addEventListener('click', function () {{
         cancelling = true;
@@ -1342,6 +1423,109 @@ class Handler(BaseHTTPRequestHandler):
         text.textContent = 'Cancelling...';
         fetch('/record/cancel', {{ method: 'POST' }}).catch(function () {{}});
       }});
+    }})();
+  </script>
+
+  <script>
+    // Depth cameras (RealSense): rendered from the depth page on port 8001 of
+    // this same node (its endpoints send CORS headers). Section stays hidden
+    // when that page is down or no depth camera is plugged in.
+    (function () {{
+      var BASE = location.protocol + '//' + location.hostname + ':8001';
+      var section = document.getElementById('depth-section');
+      var host = document.getElementById('depth-cams');
+      var built = {{}};
+      var bumped = {{}};
+
+      function buildCard(dev) {{
+        var s = dev.serial, q = encodeURIComponent(s);
+        var card = document.createElement('div');
+        card.style.cssText = 'margin:14px 0;';
+        card.innerHTML =
+          '<div style="font-weight:700;">' + dev.name +
+            ' <span style="opacity:.6;font-weight:400;">(S/N ' + s + ')</span></div>' +
+          '<div class="depth-meta" style="font-size:0.85em;opacity:0.85;margin:2px 0 8px;"></div>' +
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">' +
+            '<div class="live-stage" data-kind="rgb" style="aspect-ratio:16/10;cursor:crosshair;">' +
+              '<img alt="color" style="width:100%;height:100%;object-fit:contain;display:block;"></div>' +
+            '<div class="live-stage" data-kind="depth" style="aspect-ratio:16/10;cursor:crosshair;">' +
+              '<img alt="depth" style="width:100%;height:100%;object-fit:contain;display:block;"></div>' +
+          '</div>' +
+          '<div style="margin-top:8px;font-size:0.95em;"><b class="depth-center">&mdash;</b>' +
+            ' <span style="opacity:.6">(click an image to measure that point)</span>' +
+            ' <button type="button" class="depth-cal" style="margin-left:14px;cursor:pointer;"' +
+            ' title="Camera pose from the AprilTag using the RealSense factory intrinsics + depth cross-check">' +
+            '&#128205; Calibrate extrinsic (AprilTag)</button>' +
+            ' <span class="depth-cal-msg" style="font-size:0.85em;"></span></div>';
+        card.querySelectorAll('.live-stage img').forEach(function (img) {{
+          var kind = img.parentElement.getAttribute('data-kind');
+          img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
+        }});
+        card.querySelectorAll('.live-stage').forEach(function (stage) {{
+          stage.addEventListener('click', function (e) {{
+            var rect = stage.getBoundingClientRect();
+            var x = (e.clientX - rect.left) / rect.width;
+            var y = (e.clientY - rect.top) / rect.height;
+            fetch(BASE + '/value?s=' + q + '&x=' + x.toFixed(4) + '&y=' + y.toFixed(4))
+              .then(function (r) {{ return r.json(); }})
+              .then(function (j) {{
+                card.querySelector('.depth-center').textContent =
+                  j.m != null ? j.m.toFixed(2) + ' m at click' : 'no depth at click';
+              }}).catch(function () {{}});
+          }});
+        }});
+        var calBtn = card.querySelector('.depth-cal');
+        var calMsg = card.querySelector('.depth-cal-msg');
+        calBtn.addEventListener('click', function () {{
+          calBtn.disabled = true;
+          calMsg.textContent = 'Calibrating…';
+          fetch(BASE + '/calibrate/extrinsic?s=' + q, {{ method: 'POST' }})
+            .then(function (r) {{ return r.json(); }})
+            .then(function (j) {{
+              if (!j.ok) {{ calMsg.textContent = j.message || 'could not start'; calBtn.disabled = false; return; }}
+              var poll = setInterval(function () {{
+                fetch(BASE + '/calibrate/extrinsic/status?s=' + q)
+                  .then(function (r) {{ return r.json(); }})
+                  .then(function (st) {{
+                    if (st.running) {{ calMsg.textContent = st.message || 'running…'; return; }}
+                    clearInterval(poll);
+                    calBtn.disabled = false;
+                    calMsg.textContent = (st.ok ? '✅ ' : '❌ ') + (st.message || '');
+                  }}).catch(function () {{}});
+              }}, 1000);
+            }}).catch(function () {{ calMsg.textContent = 'request failed'; calBtn.disabled = false; }});
+        }});
+        return card;
+      }}
+
+      function refresh() {{
+        fetch(BASE + '/devices').then(function (r) {{ return r.json(); }}).then(function (j) {{
+          var devs = j.devices || [];
+          section.style.display = devs.length ? '' : 'none';
+          devs.forEach(function (dev) {{
+            var s = dev.serial;
+            if (!built[s]) {{
+              built[s] = buildCard(dev);
+              host.appendChild(built[s]);
+              bumped[s] = Date.now();
+            }}
+            var st = dev.status || {{}}, info = st.info || {{}};
+            if (!st.running && !st.starting && Date.now() - (bumped[s] || 0) > 8000) {{
+              bumped[s] = Date.now();
+              built[s].querySelectorAll('.live-stage img').forEach(function (img) {{
+                img.src = img.src.split('&t=')[0] + '&t=' + Date.now();
+              }});
+            }}
+            var usb = (dev.usb && dev.usb !== '?') ? dev.usb : (info.usb || '?');
+            var bits = [];
+            if (st.running && info.profile) bits.push(info.profile);
+            bits.push('USB ' + usb);
+            built[s].querySelector('.depth-meta').textContent = bits.join(' · ');
+          }});
+        }}).catch(function () {{ section.style.display = 'none'; }});
+      }}
+      refresh();
+      setInterval(refresh, 3000);
     }})();
   </script>
 </body>

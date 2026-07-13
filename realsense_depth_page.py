@@ -34,6 +34,8 @@ from pathlib import Path
 
 import numpy as np
 
+import realsense_extrinsics
+
 
 # Per-node overrides from ~/CityOS/node.env (gitignored, machine-local), same
 # loader as capture.py / smartroom_video_page.py.
@@ -106,6 +108,8 @@ class RealSenseStream:
         self.rgb_jpeg = None
         self.depth_jpeg = None
         self.depth_m = None          # float32 HxW, meters, aligned to color
+        self.color_bgr = None        # raw color frame (for extrinsic calibration)
+        self.color_intr = None       # factory color intrinsics (rs.intrinsics)
         self.frame_id = 0
         self.clients = 0
         self.running = False
@@ -182,12 +186,18 @@ class RealSenseStream:
         align = rs.align(rs.stream.color)
         colorizer = rs.colorizer()
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        try:
+            color_intr = (profile.get_stream(rs.stream.color)
+                          .as_video_stream_profile().get_intrinsics())
+        except RuntimeError:
+            color_intr = None
 
         with self.cond:
             self.running = True
             self.starting = False
             self.error = None
             self.info = info
+            self.color_intr = color_intr
             self.last_active = time.monotonic()
 
         try:
@@ -218,6 +228,8 @@ class RealSenseStream:
                     self.rgb_jpeg = rgb_jpeg.tobytes()
                     self.depth_jpeg = depth_jpeg.tobytes()
                     self.depth_m = depth_raw.astype(np.float32) * depth_scale
+                    # copy: color_img is a view over the SDK's recycled frame buffer
+                    self.color_bgr = color_img.copy()
                     self.frame_id += 1
                     self.cond.notify_all()
         except Exception as exc:  # noqa: BLE001 - USB drop etc.
@@ -289,6 +301,55 @@ class RealSenseStream:
 # One stream per device serial, created on first use.
 _STREAMS = {}
 _STREAMS_LOCK = threading.Lock()
+
+# Extrinsic calibration jobs, one per camera serial. Runs in-process on live
+# frames from the stream (no camera handoff needed — the stream keeps running).
+_EXTRINSIC_JOBS = {}
+_EXTRINSIC_LOCK = threading.Lock()
+
+
+def extrinsic_status(serial):
+    with _EXTRINSIC_LOCK:
+        return dict(_EXTRINSIC_JOBS.get(serial) or {"running": False, "ok": None, "message": ""})
+
+
+def start_extrinsic_calibration(serial):
+    with _EXTRINSIC_LOCK:
+        job = _EXTRINSIC_JOBS.get(serial)
+        if job and job["running"]:
+            return False, "Calibration already running for this camera."
+        _EXTRINSIC_JOBS[serial] = {"running": True, "ok": None, "message": "Capturing frames…"}
+    threading.Thread(target=_run_extrinsic, args=(serial,), daemon=True).start()
+    return True, "Calibration started."
+
+
+def _run_extrinsic(serial):
+    stream = get_stream(serial)
+    stream.add_client()  # hold the pipeline open while we sample
+    try:
+        if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
+            raise RuntimeError(stream.status().get("error") or "camera unavailable")
+        samples, last_id = [], -1
+        deadline = time.monotonic() + 6.0
+        while len(samples) < 6 and time.monotonic() < deadline:
+            with stream.cond:
+                frame_id = stream.frame_id
+                color, depth, intr = stream.color_bgr, stream.depth_m, stream.color_intr
+            if frame_id != last_id and color is not None and depth is not None:
+                last_id = frame_id
+                samples.append((color, depth))
+            time.sleep(0.25)
+        if intr is None:
+            raise RuntimeError("no color intrinsics from the camera")
+        name = stream.status().get("info", {}).get("name", "RealSense")
+        ok, message = realsense_extrinsics.calibrate_from_samples(
+            samples, intr, serial, camera_name=name)
+    except Exception as exc:  # noqa: BLE001 - reported on the page
+        ok, message = False, str(exc)
+    finally:
+        stream.remove_client()
+    with _EXTRINSIC_LOCK:
+        _EXTRINSIC_JOBS[serial] = {"running": False, "ok": ok, "message": message}
 
 # One long-lived SDK context, created at startup BEFORE any pipeline exists
 # and never rebuilt. With the RSUSB backend a context probes the USB bus when
@@ -397,8 +458,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # the main video page (port 8000, different origin) embeds this page's
+        # devices/value/calibrate endpoints
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def send_json(self, payload, status=200):
         self.send_bytes(json.dumps(payload).encode("utf-8"),
@@ -419,6 +490,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/value":
             self.serve_value(params, serial)
+            return
+        if parsed.path == "/calibrate/extrinsic/status":
+            if not serial:
+                self.send_json({"ok": False, "message": "missing ?s=<serial>"}, 400)
+                return
+            self.send_json(extrinsic_status(serial))
+            return
+        self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        serial = (params.get("s") or [""])[0]
+        if parsed.path == "/calibrate/extrinsic":
+            if not serial:
+                self.send_json({"ok": False, "message": "missing ?s=<serial>"}, 400)
+                return
+            ok, message = start_extrinsic_calibration(serial)
+            self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
             return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
