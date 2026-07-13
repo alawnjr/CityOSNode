@@ -200,6 +200,25 @@ def load_extrinsics():
     return {k: ext[k] for k in keys if k in ext}
 
 
+def room_frame_info():
+    """Static facts about the room coordinate frame (defined by AprilTag 1),
+    embedded in every recording so downstream analysis can relate tag-frame
+    coordinates to the physical room. The tag center is ~111cm off the ground
+    (measured); override with SMARTROOM_TAG_HEIGHT_MM in node.env if it moves."""
+    height = float(os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110"))
+    return {
+        "reference_tag": {
+            "family": "36h11",
+            "id": int(os.environ.get("SMARTROOM_TAG_ID", "1")),
+            "size_mm": float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173")),
+        },
+        "definition": "origin=tag center, X=tag right, Y=tag up, Z=out of tag; units mm",
+        "tag_center_above_floor_mm": height,
+        # valid when the tag hangs upright (its Y axis vertical)
+        "floor_plane": f"y = {-height:.0f} mm",
+    }
+
+
 def load_room_tags():
     """The room tag map from calibration/tags.json — poses of the other
     AprilTags (tag 2, ...) in the reference tag's room frame, measured by a
@@ -364,8 +383,9 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
     extrinsics = load_extrinsics()
     if extrinsics is not None:
         metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
-    # Room tag map (tag 2 etc. in the tag-1 room frame) — recording-global,
-    # not per-stream, since the tags belong to the room.
+    # Room frame facts + tag map (tag 2 etc. in the tag-1 room frame) —
+    # recording-global, not per-stream, since the tags belong to the room.
+    metadata["room_frame"] = room_frame_info()
     room_tags = load_room_tags()
     if room_tags is not None:
         metadata["room_tags"] = room_tags
