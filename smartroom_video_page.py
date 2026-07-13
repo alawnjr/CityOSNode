@@ -1176,6 +1176,11 @@ class Handler(BaseHTTPRequestHandler):
     </div>
   </section>
 
+  <section class="wrap record" id="depth-section" style="display:none">
+    <h2>Depth cameras</h2>
+    <div id="depth-cams"></div>
+  </section>
+
   <section class="wrap record">
     <h2>Record</h2>
     <div class="record-controls">
@@ -1208,11 +1213,6 @@ class Handler(BaseHTTPRequestHandler):
     </div>
     <div id="cal-info" style="font-size:0.85em;opacity:0.85;margin:6px 0;">{calibration_html}</div>
     <div class="day-list" id="photo-list">{photos_html}</div>
-  </section>
-
-  <section class="wrap record" id="depth-section" style="display:none">
-    <h2>Depth cameras</h2>
-    <div id="depth-cams"></div>
   </section>
 
   <section class="wrap days">
