@@ -32,6 +32,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -232,6 +234,47 @@ def load_room_tags():
         return None
 
 
+# The RealSense page (same node, port 8001) owns the depth cameras and records
+# them alongside the webcam when asked: color mp4 + lossless 16-bit depth mkv
+# per camera, into the same streams/ folder. If the page is down or no depth
+# camera is plugged in, the recording is video-only as before.
+DEPTH_PAGE = os.environ.get("SMARTROOM_DEPTH_PAGE", "http://127.0.0.1:8001")
+
+
+def start_depth_recording(rec_dir, duration):
+    """Ask the depth page to record all RealSense cameras into this recording.
+    Returns True if a depth recording actually started."""
+    query = urllib.parse.urlencode({"dir": str(rec_dir / "streams"), "duration": duration})
+    try:
+        req = urllib.request.Request(f"{DEPTH_PAGE}/record/start?{query}", data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=5) as res:
+            body = json.loads(res.read().decode("utf-8", "ignore"))
+    except Exception as error:  # noqa: BLE001 - page down / no cameras is normal
+        print(f"depth cameras: not recording ({error})", file=sys.stderr)
+        return False
+    print(f"depth cameras: {body.get('message', '?')}", file=sys.stderr)
+    return bool(body.get("ok"))
+
+
+def collect_depth_streams(timeout=30):
+    """Wait for the depth recording to finish and return its metadata stream
+    entries ({} on any failure — the webcam recording stands alone)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            with urllib.request.urlopen(f"{DEPTH_PAGE}/record/status", timeout=5) as res:
+                body = json.loads(res.read().decode("utf-8", "ignore"))
+        except Exception:  # noqa: BLE001
+            return {}
+        if not body.get("running"):
+            for key, error in (body.get("errors") or {}).items():
+                print(f"depth {key}: {error}", file=sys.stderr)
+            return body.get("streams") or {}
+        time.sleep(1)
+    print("depth cameras: still recording after timeout — metadata omits them", file=sys.stderr)
+    return {}
+
+
 def make_recording_dir():
     """Pick the day_NN_DATE / rec_DATE_NNN folder, matching sample_dataset."""
     now = datetime.now()
@@ -353,7 +396,7 @@ def write_camera_timestamps(path, mp4_path, fps):
     return len(times)
 
 
-def write_metadata(rec_dir, start_time, end_time, frame_count):
+def write_metadata(rec_dir, start_time, end_time, frame_count, extra_streams=None):
     metadata = {
         "recording_id": rec_dir.name,
         "node": socket.gethostname(),  # which Pi recorded this (smartroom1/smartroom2/...)
@@ -383,6 +426,9 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
     extrinsics = load_extrinsics()
     if extrinsics is not None:
         metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
+    # Depth camera streams recorded by the RealSense page (color + raw depth).
+    if extra_streams:
+        metadata["streams"].update(extra_streams)
     # Room frame facts + tag map (tag 2 etc. in the tag-1 room frame) —
     # recording-global, not per-stream, since the tags belong to the room.
     metadata["room_frame"] = room_frame_info()
@@ -404,12 +450,14 @@ def main():
     print(f"Recording {DURATION_SECONDS}s from {CAMERA} -> {rec_dir}", file=sys.stderr)
 
     mp4_path = streams / "camera_main.mp4"
+    depth_started = start_depth_recording(rec_dir, DURATION_SECONDS)
     start_time = datetime.now().astimezone()
     record_camera(mp4_path)  # blocks for DURATION_SECONDS
     end_time = datetime.now().astimezone()
 
     frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", mp4_path, CAMERA_FPS)
-    write_metadata(rec_dir, start_time, end_time, frame_count)
+    extra_streams = collect_depth_streams() if depth_started else None
+    write_metadata(rec_dir, start_time, end_time, frame_count, extra_streams)
     print(f"Done -> {rec_dir}", file=sys.stderr)
 
 

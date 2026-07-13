@@ -23,9 +23,12 @@ Bandwidth note: RealSense streams are uncompressed (~35+ MB/s per camera at
 640x480), so two of them cannot share the Pi 4's single USB 2 bus — put them
 in the blue USB 3 ports. The compressed MJPG webcam (C920) is fine on USB 2.
 """
+import csv
+import datetime as dt
 import json
 import os
 import socket
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -108,6 +111,8 @@ class RealSenseStream:
         self.rgb_jpeg = None
         self.depth_jpeg = None
         self.depth_m = None          # float32 HxW, meters, aligned to color
+        self.depth_z16 = None        # raw uint16 depth (for lossless recording)
+        self.depth_scale = None      # meters per z16 unit
         self.color_bgr = None        # raw color frame (for extrinsic calibration)
         self.color_intr = None       # factory color intrinsics (rs.intrinsics)
         self.frame_id = 0
@@ -198,6 +203,7 @@ class RealSenseStream:
             self.error = None
             self.info = info
             self.color_intr = color_intr
+            self.depth_scale = depth_scale
             self.last_active = time.monotonic()
 
         try:
@@ -228,7 +234,8 @@ class RealSenseStream:
                     self.rgb_jpeg = rgb_jpeg.tobytes()
                     self.depth_jpeg = depth_jpeg.tobytes()
                     self.depth_m = depth_raw.astype(np.float32) * depth_scale
-                    # copy: color_img is a view over the SDK's recycled frame buffer
+                    # copies: the arrays are views over the SDK's recycled frame buffers
+                    self.depth_z16 = depth_raw.copy()
                     self.color_bgr = color_img.copy()
                     self.frame_id += 1
                     self.cond.notify_all()
@@ -301,6 +308,173 @@ class RealSenseStream:
 # One stream per device serial, created on first use.
 _STREAMS = {}
 _STREAMS_LOCK = threading.Lock()
+
+RECORD_FPS = float(os.environ.get("SMARTROOM_DEPTH_RECORD_FPS", "15"))
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _load_depth_extrinsics(serial):
+    """This camera's room-frame pose from calibration/<serial>.extrinsics.json,
+    trimmed the same way capture.py embeds the webcam's. None if uncalibrated."""
+    try:
+        ext = json.loads((PROJECT_ROOT / "calibration" / f"{serial}.extrinsics.json").read_text())
+    except (OSError, ValueError):
+        return None
+    keys = ("camera_id", "frame", "tag", "rvec", "tvec_mm", "rotation_cam_to_room",
+            "camera_position_mm", "reprojection_error_px", "depth_agreement_mm",
+            "anchored_by_tag", "calibrated_at")
+    return {k: ext[k] for k in keys if k in ext}
+
+
+class DepthRecordJob:
+    """Records every connected RealSense camera into a recording's streams/
+    folder: color as H.264 mp4, depth as LOSSLESS 16-bit FFV1 mkv (raw z16
+    units — multiply by depth_scale_m for meters), both at RECORD_FPS with a
+    real per-frame timestamps CSV each. Runs on the live streams in-process,
+    so the web preview keeps working while recording. capture.py triggers this
+    via POST /record/start and merges the returned stream metadata."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.pending = 0
+        self.streams = {}   # metadata stream entries, filled as cameras finish
+        self.errors = {}
+
+    def start(self, out_dir, duration):
+        devices = list_devices()
+        if not devices:
+            return False, "no RealSense cameras connected"
+        with self.lock:
+            if self.running:
+                return False, "depth recording already in progress"
+            self.running = True
+            self.pending = len(devices)
+            self.streams, self.errors = {}, {}
+        for dev in devices:
+            model = (dev.get("name") or "realsense").split()[-1].lower()  # 'd455'
+            threading.Thread(target=self._record_one,
+                             args=(dev["serial"], model, Path(out_dir), duration),
+                             daemon=True).start()
+        return True, f"recording {len(devices)} depth camera(s)"
+
+    def status(self):
+        with self.lock:
+            return {"running": self.running, "streams": self.streams, "errors": self.errors}
+
+    def _finish_one(self, key, error=None):
+        with self.lock:
+            if error is not None:
+                self.errors[key] = error
+            self.pending -= 1
+            if self.pending <= 0:
+                self.running = False
+
+    def _record_one(self, serial, model, out_dir, duration):
+        key = f"camera_{model}"
+        stream = get_stream(serial)
+        stream.add_client()  # keeps the pipeline open for the whole recording
+        color_proc = depth_proc = None
+        try:
+            if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
+                raise RuntimeError(stream.status().get("error") or "camera unavailable")
+            with stream.cond:
+                height, width = stream.depth_z16.shape
+                intr = stream.color_intr
+                depth_scale = stream.depth_scale
+                info = dict(stream.info)
+
+            color_path = out_dir / f"{key}_color.mp4"
+            depth_path = out_dir / f"{key}_depth.mkv"
+            color_proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", "-y",
+                 "-f", "image2pipe", "-vcodec", "mjpeg", "-r", str(RECORD_FPS), "-i", "pipe:0",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 str(color_path)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            depth_proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", "-y",
+                 "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
+                 "-r", str(RECORD_FPS), "-i", "pipe:0",
+                 "-c:v", "ffv1", "-level", "3", str(depth_path)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            start_time = dt.datetime.now().astimezone()
+            mono0 = time.monotonic()
+            deadline = mono0 + duration
+            interval = 1.0 / RECORD_FPS
+            last_id, next_due, times = -1, 0.0, []
+            while time.monotonic() < deadline:
+                with stream.cond:
+                    if stream.frame_id == last_id:
+                        stream.cond.wait(timeout=0.5)
+                    if stream.frame_id == last_id or stream.depth_z16 is None:
+                        continue
+                    last_id = stream.frame_id
+                    jpeg, z16 = stream.rgb_jpeg, stream.depth_z16
+                t_rel = time.monotonic() - mono0
+                if t_rel < next_due:
+                    continue  # cap at RECORD_FPS; always the newest frame
+                color_proc.stdin.write(jpeg)
+                depth_proc.stdin.write(z16.tobytes())
+                times.append(t_rel)
+                next_due = t_rel + interval * 0.9
+
+            for proc in (color_proc, depth_proc):
+                proc.stdin.close()
+                proc.wait(timeout=60)
+            if not times:
+                raise RuntimeError("no frames captured")
+
+            for suffix in ("color", "depth"):
+                with (out_dir / f"{key}_{suffix}_timestamps.csv").open("w", newline="") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["frame_index", "timestamp_seconds"])
+                    for i, t in enumerate(times):
+                        writer.writerow([i, f"{t:.6f}"])
+
+            calibration = None
+            if intr is not None:
+                calibration = {"fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy,
+                               "width": intr.width, "height": intr.height,
+                               "model": getattr(intr.model, "name", str(intr.model)),
+                               "coeffs": list(intr.coeffs), "source": "realsense_factory"}
+            extrinsics = _load_depth_extrinsics(serial)
+            common = {"device": f"realsense:{serial}", "camera": info.get("name"),
+                      "resolution": [width, height], "fps": RECORD_FPS,
+                      "frame_count": len(times), "start_time": start_time.isoformat()}
+            color_entry = {"modality": "video", "path": f"streams/{color_path.name}",
+                           "codec": "h264",
+                           "timestamps_path": f"streams/{key}_color_timestamps.csv", **common}
+            depth_entry = {"modality": "depth", "path": f"streams/{depth_path.name}",
+                           "codec": "ffv1/gray16le (lossless z16)",
+                           "depth_scale_m": depth_scale, "aligned_to": f"{key}_color",
+                           "timestamps_path": f"streams/{key}_depth_timestamps.csv", **common}
+            if calibration:
+                color_entry["calibration"] = calibration
+                depth_entry["calibration"] = calibration
+            if extrinsics:
+                color_entry["extrinsics"] = extrinsics
+                depth_entry["extrinsics"] = extrinsics
+            with self.lock:
+                self.streams[f"{key}_color"] = color_entry
+                self.streams[f"{key}_depth"] = depth_entry
+            self._finish_one(key)
+        except Exception as exc:  # noqa: BLE001 - reported via /record/status
+            for proc in (color_proc, depth_proc):
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._finish_one(key, error=str(exc))
+        finally:
+            stream.remove_client()
+
+
+DEPTH_RECORDER = DepthRecordJob()
+
 
 # Extrinsic calibration jobs, one per camera serial. Runs in-process on live
 # frames from the stream (no camera handoff needed — the stream keeps running).
@@ -497,6 +671,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(extrinsic_status(serial))
             return
+        if parsed.path == "/record/status":
+            self.send_json(DEPTH_RECORDER.status())
+            return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
     def do_POST(self):
@@ -508,6 +685,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "message": "missing ?s=<serial>"}, 400)
                 return
             ok, message = start_extrinsic_calibration(serial)
+            self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
+            return
+        if parsed.path == "/record/start":
+            out_dir = (params.get("dir") or [""])[0]
+            try:
+                duration = max(1, min(int(float((params.get("duration") or ["30"])[0])), 3600))
+            except ValueError:
+                duration = 30
+            # only ever record into this repo's data/ tree
+            target = Path(out_dir).resolve() if out_dir else None
+            if target is None or DATA_DIR.resolve() not in target.parents:
+                self.send_json({"ok": False, "message": "dir must be under data/"}, 400)
+                return
+            target.mkdir(parents=True, exist_ok=True)
+            ok, message = DEPTH_RECORDER.start(target, duration)
             self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
             return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)

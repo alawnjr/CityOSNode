@@ -106,7 +106,14 @@ data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_NNN/
 ```
 
 It's a single blocking `ffmpeg -f v4l2` call for the full duration, then it writes
-the per-frame timestamps and `metadata.json`. **The timestamps CSV is real, not
+the per-frame timestamps and `metadata.json`. **Depth cameras are recorded too**:
+capture.py asks the RealSense page (port 8001, `POST /record/start`) to record
+every connected depth camera into the same `streams/` folder — color as
+`camera_d4xx_color.mp4` (h264, 15fps) and depth as `camera_d4xx_depth.mkv`
+(**lossless FFV1 gray16le, raw z16 units × `depth_scale_m` = meters**, aligned
+to color), each with a real timestamps CSV, merged into `metadata.json`'s
+`streams{}` with factory intrinsics + room-frame extrinsics. If the page is
+down or no depth camera is plugged in, recordings are webcam-only as before. **The timestamps CSV is real, not
 synthetic**: after recording, `probe_frame_times()` ffprobes the finished mp4 for
 each frame's actual presentation time (the USB cams are variable-rate, so the
 nominal-fps grid would be wrong), one CSV row per actual encoded frame;
