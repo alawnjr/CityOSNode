@@ -63,6 +63,10 @@ JPEG_QUALITY = 70
 # sent only the newest frame at most this often, so a slow wifi link shows a
 # lower frame rate instead of accumulating seconds of latency.
 VIEW_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_FPS", "30"))
+# Comma-separated camera serials whose frames are rotated 180 degrees (for
+# upside-down mounted cameras) — set per node in node.env. The raw depth grid
+# is rotated too, so click-to-measure coordinates stay correct.
+FLIP_SERIALS = {s.strip() for s in os.environ.get("SMARTROOM_DEPTH_FLIP", "").split(",") if s.strip()}
 
 # The SDK import is allowed to fail so the page can still come up and explain
 # itself while librealsense is not built yet (or the module is missing).
@@ -197,6 +201,10 @@ class RealSenseStream:
                 color_img = np.asanyarray(color.get_data())
                 depth_vis = np.asanyarray(colorizer.colorize(depth).get_data())
                 depth_raw = np.asanyarray(depth.get_data())
+                if self.serial in FLIP_SERIALS:
+                    color_img = cv2.rotate(color_img, cv2.ROTATE_180)
+                    depth_vis = cv2.rotate(depth_vis, cv2.ROTATE_180)
+                    depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
                 ok_rgb, rgb_jpeg = cv2.imencode(".jpg", color_img, encode_params)
                 # the colorizer outputs RGB; cv2 encodes BGR
                 ok_depth, depth_jpeg = cv2.imencode(
