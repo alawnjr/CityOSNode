@@ -111,41 +111,76 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         err = float(np.linalg.norm(proj.reshape(4, 2) - img_pts, axis=1).mean())
         return err, rvec, tvec, img_pts
 
-    results = []      # reference tag: (reproj_err, rvec, tvec, img_pts, color_bgr, depth_m)
+    # Anchor tags: other tags whose room-frame pose was previously measured (by
+    # a camera that saw them together with the reference tag) — lets a camera
+    # that can't see the reference tag still be placed in the room frame.
+    anchors = _load_room_tags(out_dir)  # {tag id: (Q room<-tag, p room, mm)}
+
+    # results: (err, room_rvec, room_tvec, raw_rvec, raw_tvec, img_pts,
+    #           color_bgr, depth_m, anchor_id)
+    # room_rvec/room_tvec express the ROOM frame in the camera (same convention
+    # as a direct tag-1 solve, so everything downstream is identical); raw_* is
+    # the pose of the tag actually detected — used for the depth cross-check.
+    results = []
     other_tags = {}   # other tag id -> list of (err, R_room, pos_room_mm) per frame
+    seen_ids = set()
     for color_bgr, depth_m in samples:
         corners, ids, _ = detector.detectMarkers(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY))
         if ids is None:
             continue
-        flat = ids.flatten()
-        hits = np.where(flat == tag_id)[0]
-        if not len(hits):
+        flat = [int(i) for i in ids.flatten()]
+        seen_ids.update(flat)
+        if tag_id in flat:
+            ref = tag_pose(corners[flat.index(tag_id)])
+            if ref is None:
+                continue
+            err, rvec, tvec, img_pts = ref
+            results.append((err, rvec, tvec, rvec, tvec, img_pts, color_bgr, depth_m, None))
+            # Tag chaining: every OTHER tag visible in the same frame gets its
+            # pose expressed in the reference tag's (room) frame, so it can
+            # anchor cameras that can't see the reference tag. Assumes the same
+            # printed tag size for all tags.
+            R1, _ = cv2.Rodrigues(rvec)
+            for j, other_id in enumerate(flat):
+                if other_id == tag_id:
+                    continue
+                other = tag_pose(corners[j])
+                if other is None:
+                    continue
+                err2, rvec2, tvec2, _pts2 = other
+                R2, _ = cv2.Rodrigues(rvec2)
+                pos_room = (R1.T @ (tvec2 - tvec)).flatten()        # tag center, mm
+                R_room = R1.T @ R2                                   # tag axes in room frame
+                other_tags.setdefault(other_id, []).append((max(err, err2), R_room, pos_room))
             continue
-        ref = tag_pose(corners[int(hits[0])])
-        if ref is None:
-            continue
-        err, rvec, tvec, img_pts = ref
-        results.append((err, rvec, tvec, img_pts, color_bgr, depth_m))
-        # Tag chaining: every OTHER tag visible in the same frame gets its pose
-        # expressed in the reference tag's (room) frame, so it can anchor
-        # cameras that can't see the reference tag. Assumes the same printed
-        # tag size for all tags.
-        R1, _ = cv2.Rodrigues(rvec)
+        # Reference tag not in this frame — fall back to a known anchor tag and
+        # compose: T_cam<-room = T_cam<-anchor · T_anchor<-room.
         for j, other_id in enumerate(flat):
-            if int(other_id) == tag_id:
+            if other_id not in anchors:
                 continue
-            other = tag_pose(corners[j])
-            if other is None:
+            got = tag_pose(corners[j])
+            if got is None:
                 continue
-            err2, rvec2, tvec2, _pts2 = other
-            R2, _ = cv2.Rodrigues(rvec2)
-            pos_room = (R1.T @ (tvec2 - tvec)).flatten()        # tag center, mm
-            R_room = R1.T @ R2                                   # tag axes in room frame
-            other_tags.setdefault(int(other_id), []).append((max(err, err2), R_room, pos_room))
+            err, rvec_k, tvec_k, img_pts = got
+            Rk, _ = cv2.Rodrigues(rvec_k)
+            Q, p = anchors[other_id]                     # anchor tag in room frame
+            R_cam_room = Rk @ Q.T
+            room_tvec = tvec_k - R_cam_room @ p.reshape(3, 1)
+            room_rvec, _ = cv2.Rodrigues(R_cam_room)
+            results.append((err, room_rvec, room_tvec, rvec_k, tvec_k,
+                            img_pts, color_bgr, depth_m, other_id))
+            break
 
     if not results:
-        return False, (f"tag {tag_id} (36h11) not seen by the color camera — make sure "
-                       "it's flat, well lit and large enough in frame")
+        known = ", ".join(str(k) for k in sorted(anchors)) or "none measured yet"
+        return False, (f"no usable tag seen (36h11 ids detected: {sorted(seen_ids) or 'none'}) — "
+                       f"need tag {tag_id} or a known anchor tag (known: {known})")
+
+    # Direct reference-tag views beat chained anchor views — use them when any exist.
+    direct = [r for r in results if r[-1] is None]
+    if direct:
+        results = direct
+    anchor_id = results[0][-1]
 
     positions = []
     for err, rvec, tvec, *_ in results:
@@ -153,14 +188,17 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         positions.append((-R.T @ tvec).flatten())
     spread = float(np.linalg.norm(np.std(np.array(positions), axis=0))) if len(positions) > 1 else 0.0
 
-    err, rvec, tvec, img_pts, color_bgr, depth_m = min(results, key=lambda r: r[0])
+    (err, rvec, tvec, raw_rvec, raw_tvec, img_pts,
+     color_bgr, depth_m, anchor_id) = min(results, key=lambda r: r[0])
     R, _ = cv2.Rodrigues(rvec)
     cam_pos = (-R.T @ tvec).flatten()
 
     # Native cross-check: the camera's own depth at each tag corner vs the
     # distance the PnP pose predicts for that corner. Independent measurements —
     # small disagreement means both the pose and the printed tag size are right.
-    pnp_corners_cam = (R @ obj.T + tvec).T  # 4x3, mm, camera frame
+    # Uses the DETECTED tag's raw pose (obj is that tag's corner model).
+    R_raw, _ = cv2.Rodrigues(raw_rvec)
+    pnp_corners_cam = (R_raw @ obj.T + raw_tvec).T  # 4x3, mm, camera frame
     diffs = []
     for (px, py), pnp_pt in zip(img_pts, pnp_corners_cam):
         z = _depth_at(depth_m, px, py)
@@ -174,7 +212,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     debug_dir.mkdir(parents=True, exist_ok=True)
     overlay = color_bgr.copy()
     cv2.aruco.drawDetectedMarkers(overlay, [img_pts.reshape(1, 4, 2).astype(np.float32)])
-    cv2.drawFrameAxes(overlay, K, dist, rvec, tvec, tag_size_mm * 0.75)
+    cv2.drawFrameAxes(overlay, K, dist, raw_rvec, raw_tvec, tag_size_mm * 0.75)
     cv2.imwrite(str(debug_dir / "extrinsic_live.jpg"), overlay)
 
     out_path = out_dir / f"{serial}.extrinsics.json"
@@ -195,6 +233,9 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "depth_agreement_mm": depth_agreement_mm,
         "frames_used": len(results),
         "position_spread_mm": round(spread, 1),
+        # present when the pose came via a secondary tag (camera couldn't see
+        # the reference tag) — chained through tags.json, so two PnP errors stack
+        **({"anchored_by_tag": anchor_id} if anchor_id is not None else {}),
         "calibrated_at": dt.datetime.now().astimezone().isoformat(),
     })
 
@@ -203,9 +244,29 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     dist_m = float(np.linalg.norm(cam_pos)) / 1000.0
     agree = (f", depth agrees within {depth_agreement_mm} mm" if depth_agreement_mm is not None
              else ", no depth at corners")
-    return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in tag frame "
-                  f"({dist_m:.2f} m from tag), reproj {err:.2f} px over {len(results)} frame(s)"
+    via = f" (anchored via tag {anchor_id})" if anchor_id is not None else ""
+    return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in room frame"
+                  f"{via} ({dist_m:.2f} m from origin), reproj {err:.2f} px over {len(results)} frame(s)"
                   f"{agree}{tag_notes} — saved {out_path.name}")
+
+
+def _load_room_tags(out_dir):
+    """tags.json -> {tag id: (Q rotation tag->room, p position mm)} for use as
+    calibration anchors. Empty when never measured."""
+    try:
+        data = json.loads((out_dir / "tags.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    anchors = {}
+    for key, entry in (data.get("tags") or {}).items():
+        try:
+            anchors[int(key)] = (
+                np.array(entry["rotation_tag_to_room"], dtype=np.float64),
+                np.array(entry["position_mm"], dtype=np.float64),
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+    return anchors
 
 
 def _save_room_tags(other_tags, serial, ref_tag_id, tag_size_mm, out_dir):
