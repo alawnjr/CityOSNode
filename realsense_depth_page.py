@@ -116,24 +116,29 @@ class RealSenseStream:
         self.color_bgr = None        # raw color frame (for extrinsic calibration)
         self.color_intr = None       # factory color intrinsics (rs.intrinsics)
         self.frame_id = 0
-        self.clients = 0
+        self.clients = 0     # anything holding the pipeline open (viewers, recorder, calibration)
+        self.viewers = 0     # MJPEG viewers only — gates the colorize/JPEG-encode work
         self.running = False
         self.starting = False
         self.last_active = 0.0
         self.error = RS_IMPORT_ERROR
         self.info = {}               # device name/serial/fw/usb + active profile
 
-    def add_client(self):
+    def add_client(self, viewer=True):
         with self.cond:
             self.clients += 1
+            if viewer:
+                self.viewers += 1
             self.last_active = time.monotonic()
             if not self.running and not self.starting and rs is not None:
                 self.starting = True
                 threading.Thread(target=self._run, daemon=True).start()
 
-    def remove_client(self):
+    def remove_client(self, viewer=True):
         with self.cond:
             self.clients = max(0, self.clients - 1)
+            if viewer:
+                self.viewers = max(0, self.viewers - 1)
             self.last_active = time.monotonic()
 
     def _usb_version(self):
@@ -218,21 +223,30 @@ class RealSenseStream:
                 if not depth or not color:
                     continue
                 color_img = np.asanyarray(color.get_data())
-                depth_vis = np.asanyarray(colorizer.colorize(depth).get_data())
                 depth_raw = np.asanyarray(depth.get_data())
                 if self.serial in FLIP_SERIALS:
                     color_img = cv2.rotate(color_img, cv2.ROTATE_180)
-                    depth_vis = cv2.rotate(depth_vis, cv2.ROTATE_180)
                     depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
-                ok_rgb, rgb_jpeg = cv2.imencode(".jpg", color_img, encode_params)
-                # the colorizer outputs RGB; cv2 encodes BGR
-                ok_depth, depth_jpeg = cv2.imencode(
-                    ".jpg", cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR), encode_params)
-                if not (ok_rgb and ok_depth):
-                    continue
+                # Colorize + JPEG-encode only for actual MJPEG viewers — it's
+                # the expensive part of this loop, and the recorder/measurement
+                # paths work from the raw arrays.
                 with self.cond:
-                    self.rgb_jpeg = rgb_jpeg.tobytes()
-                    self.depth_jpeg = depth_jpeg.tobytes()
+                    encode_view = self.viewers > 0
+                rgb_jpeg = depth_jpeg = None
+                if encode_view:
+                    depth_vis = np.asanyarray(colorizer.colorize(depth).get_data())
+                    if self.serial in FLIP_SERIALS:
+                        depth_vis = cv2.rotate(depth_vis, cv2.ROTATE_180)
+                    ok_rgb, rgb_buf = cv2.imencode(".jpg", color_img, encode_params)
+                    # the colorizer outputs RGB; cv2 encodes BGR
+                    ok_depth, depth_buf = cv2.imencode(
+                        ".jpg", cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR), encode_params)
+                    if ok_rgb and ok_depth:
+                        rgb_jpeg, depth_jpeg = rgb_buf.tobytes(), depth_buf.tobytes()
+                with self.cond:
+                    if rgb_jpeg is not None:
+                        self.rgb_jpeg = rgb_jpeg
+                        self.depth_jpeg = depth_jpeg
                     self.depth_m = depth_raw.astype(np.float32) * depth_scale
                     # copies: the arrays are views over the SDK's recycled frame buffers
                     self.depth_z16 = depth_raw.copy()
@@ -254,7 +268,7 @@ class RealSenseStream:
     def wait_first_frame(self, timeout):
         end = time.monotonic() + timeout
         with self.cond:
-            while self.frame_id == 0 or self.rgb_jpeg is None:
+            while self.frame_id == 0:
                 if not (self.running or self.starting):
                     return False
                 remaining = end - time.monotonic()
@@ -345,6 +359,9 @@ class DepthRecordJob:
     def start(self, out_dir, duration):
         devices = list_devices()
         if not devices:
+            time.sleep(1.0)  # enumeration can transiently miss devices — one retry
+            devices = list_devices()
+        if not devices:
             return False, "no RealSense cameras connected"
         with self.lock:
             if self.running:
@@ -352,12 +369,14 @@ class DepthRecordJob:
             self.running = True
             self.pending = len(devices)
             self.streams, self.errors = {}, {}
+        names = []
         for dev in devices:
             model = (dev.get("name") or "realsense").split()[-1].lower()  # 'd455'
+            names.append(model)
             threading.Thread(target=self._record_one,
                              args=(dev["serial"], model, Path(out_dir), duration),
                              daemon=True).start()
-        return True, f"recording {len(devices)} depth camera(s)"
+        return True, f"recording {len(devices)} depth camera(s): {', '.join(names)}"
 
     def status(self):
         with self.lock:
@@ -374,7 +393,7 @@ class DepthRecordJob:
     def _record_one(self, serial, model, out_dir, duration):
         key = f"camera_{model}"
         stream = get_stream(serial)
-        stream.add_client()  # keeps the pipeline open for the whole recording
+        stream.add_client(viewer=False)  # hold the pipeline open, no viewer encoding
         color_proc = depth_proc = None
         try:
             if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
@@ -389,7 +408,8 @@ class DepthRecordJob:
             depth_path = out_dir / f"{key}_depth.mkv"
             color_proc = subprocess.Popen(
                 ["ffmpeg", "-loglevel", "error", "-y",
-                 "-f", "image2pipe", "-vcodec", "mjpeg", "-r", str(RECORD_FPS), "-i", "pipe:0",
+                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+                 "-r", str(RECORD_FPS), "-i", "pipe:0",
                  "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                  str(color_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -413,11 +433,11 @@ class DepthRecordJob:
                     if stream.frame_id == last_id or stream.depth_z16 is None:
                         continue
                     last_id = stream.frame_id
-                    jpeg, z16 = stream.rgb_jpeg, stream.depth_z16
+                    bgr, z16 = stream.color_bgr, stream.depth_z16
                 t_rel = time.monotonic() - mono0
                 if t_rel < next_due:
                     continue  # cap at RECORD_FPS; always the newest frame
-                color_proc.stdin.write(jpeg)
+                color_proc.stdin.write(bgr.tobytes())
                 depth_proc.stdin.write(z16.tobytes())
                 times.append(t_rel)
                 next_due = t_rel + interval * 0.9
@@ -471,7 +491,7 @@ class DepthRecordJob:
                         pass
             self._finish_one(key, error=str(exc))
         finally:
-            stream.remove_client()
+            stream.remove_client(viewer=False)
 
 
 DEPTH_RECORDER = DepthRecordJob()
@@ -500,7 +520,7 @@ def start_extrinsic_calibration(serial):
 
 def _run_extrinsic(serial):
     stream = get_stream(serial)
-    stream.add_client()  # hold the pipeline open while we sample
+    stream.add_client(viewer=False)  # hold the pipeline open while we sample
     try:
         if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
             raise RuntimeError(stream.status().get("error") or "camera unavailable")
@@ -522,7 +542,7 @@ def _run_extrinsic(serial):
     except Exception as exc:  # noqa: BLE001 - reported on the page
         ok, message = False, str(exc)
     finally:
-        stream.remove_client()
+        stream.remove_client(viewer=False)
     with _EXTRINSIC_LOCK:
         _EXTRINSIC_JOBS[serial] = {"running": False, "ok": ok, "message": message}
 
