@@ -210,7 +210,10 @@ camera using its **factory intrinsics** (no checkerboard needed) plus a
 depth-vs-PnP cross-check; same tag (36h11 id 1) and same
 `calibration/<serial>.extrinsics.json` schema as `calibrate_extrinsics.py`.
 Run from the "Calibrate extrinsic" button on either web page (executes
-in-process on live frames) or standalone with the venv python.
+in-process on live frames) or standalone with the venv python. **Tag
+chaining**: other 36h11 tags seen in the same frame as tag 1 get their
+room-frame pose saved to `calibration/tags.json`, and `capture.py` embeds
+that map into every recording's `metadata.json` (top-level `room_tags`).
 
 ## `sample_dataset/` is the schema reference
 

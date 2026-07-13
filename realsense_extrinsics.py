@@ -20,6 +20,12 @@ venv python (the camera must be free — stop the depth page first):
 
 Tag: 36h11, id 1, black-square edge 173mm by default — override with
 --tag-id / --tag-size-mm or SMARTROOM_TAG_ID / SMARTROOM_TAG_SIZE_MM (node.env).
+
+Tag chaining: any OTHER 36h11 tag (tag 2, ...) visible in the same frame as the
+reference tag gets its pose computed in the room frame and merged into
+calibration/tags.json (all tags assumed printed at the same size). capture.py
+embeds that map into every recording's metadata.json, so a camera that can only
+see tag 2 can still be placed in the one room frame downstream.
 """
 
 import argparse
@@ -95,22 +101,47 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11),
         cv2.aruco.DetectorParameters())
 
-    results = []  # (reproj_err, rvec, tvec, img_pts, color_bgr, depth_m)
-    for color_bgr, depth_m in samples:
-        corners, ids, _ = detector.detectMarkers(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY))
-        idx = None
-        if ids is not None:
-            hits = np.where(ids.flatten() == tag_id)[0]
-            idx = int(hits[0]) if len(hits) else None
-        if idx is None:
-            continue
-        img_pts = corners[idx].reshape(4, 2).astype(np.float64)
+    def tag_pose(corners_1x4):
+        """(reproj_err, rvec, tvec) for one detected tag, or None."""
+        img_pts = corners_1x4.reshape(4, 2).astype(np.float64)
         ok, rvec, tvec = cv2.solvePnP(obj, img_pts, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
         if not ok:
-            continue
+            return None
         proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
         err = float(np.linalg.norm(proj.reshape(4, 2) - img_pts, axis=1).mean())
+        return err, rvec, tvec, img_pts
+
+    results = []      # reference tag: (reproj_err, rvec, tvec, img_pts, color_bgr, depth_m)
+    other_tags = {}   # other tag id -> list of (err, R_room, pos_room_mm) per frame
+    for color_bgr, depth_m in samples:
+        corners, ids, _ = detector.detectMarkers(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY))
+        if ids is None:
+            continue
+        flat = ids.flatten()
+        hits = np.where(flat == tag_id)[0]
+        if not len(hits):
+            continue
+        ref = tag_pose(corners[int(hits[0])])
+        if ref is None:
+            continue
+        err, rvec, tvec, img_pts = ref
         results.append((err, rvec, tvec, img_pts, color_bgr, depth_m))
+        # Tag chaining: every OTHER tag visible in the same frame gets its pose
+        # expressed in the reference tag's (room) frame, so it can anchor
+        # cameras that can't see the reference tag. Assumes the same printed
+        # tag size for all tags.
+        R1, _ = cv2.Rodrigues(rvec)
+        for j, other_id in enumerate(flat):
+            if int(other_id) == tag_id:
+                continue
+            other = tag_pose(corners[j])
+            if other is None:
+                continue
+            err2, rvec2, tvec2, _pts2 = other
+            R2, _ = cv2.Rodrigues(rvec2)
+            pos_room = (R1.T @ (tvec2 - tvec)).flatten()        # tag center, mm
+            R_room = R1.T @ R2                                   # tag axes in room frame
+            other_tags.setdefault(int(other_id), []).append((max(err, err2), R_room, pos_room))
 
     if not results:
         return False, (f"tag {tag_id} (36h11) not seen by the color camera — make sure "
@@ -167,12 +198,55 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "calibrated_at": dt.datetime.now().astimezone().isoformat(),
     })
 
+    tag_notes = _save_room_tags(other_tags, serial, tag_id, tag_size_mm, out_dir)
+
     dist_m = float(np.linalg.norm(cam_pos)) / 1000.0
     agree = (f", depth agrees within {depth_agreement_mm} mm" if depth_agreement_mm is not None
              else ", no depth at corners")
     return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in tag frame "
                   f"({dist_m:.2f} m from tag), reproj {err:.2f} px over {len(results)} frame(s)"
-                  f"{agree} — saved {out_path.name}")
+                  f"{agree}{tag_notes} — saved {out_path.name}")
+
+
+def _save_room_tags(other_tags, serial, ref_tag_id, tag_size_mm, out_dir):
+    """Merge every chained tag's room-frame pose into calibration/tags.json —
+    the shared room tag map that capture.py embeds into each recording's
+    metadata. Returns a short note for the status message ('' if no other
+    tags were seen)."""
+    if not other_tags:
+        return ""
+    path = out_dir / "tags.json"
+    try:
+        tag_map = json.loads(path.read_text())
+    except (OSError, ValueError):
+        tag_map = {
+            "schema_version": "1",
+            "frame": f"tag {ref_tag_id}: origin=center, X=right, Y=up, Z=out of tag; units mm",
+            "reference_tag": {"family": "36h11", "id": ref_tag_id, "size_mm": tag_size_mm},
+            "tags": {},
+        }
+    notes = []
+    for other_id, observations in sorted(other_tags.items()):
+        # best (lowest joint reprojection error) observation gives the rotation;
+        # the position is the mean, with the spread as the consistency check
+        observations.sort(key=lambda o: o[0])
+        best_err, R_room, _ = observations[0]
+        positions = np.array([o[2] for o in observations])
+        pos = positions.mean(axis=0)
+        spread = float(np.linalg.norm(positions.std(axis=0))) if len(positions) > 1 else 0.0
+        tag_map["tags"][str(other_id)] = {
+            "position_mm": [round(float(v), 1) for v in pos],
+            "rotation_tag_to_room": R_room.tolist(),
+            "size_mm": tag_size_mm,
+            "reprojection_error_px": round(best_err, 3),
+            "position_spread_mm": round(spread, 1),
+            "frames_used": len(observations),
+            "observed_by": serial,
+            "measured_at": dt.datetime.now().astimezone().isoformat(),
+        }
+        notes.append(f"tag {other_id} at [{pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}] mm")
+    _atomic_write_json(path, tag_map)
+    return "; " + ", ".join(notes) + " (room frame, saved to tags.json)"
 
 
 def main():

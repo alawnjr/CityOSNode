@@ -200,6 +200,19 @@ def load_extrinsics():
     return {k: ext[k] for k in keys if k in ext}
 
 
+def load_room_tags():
+    """The room tag map from calibration/tags.json — poses of the other
+    AprilTags (tag 2, ...) in the reference tag's room frame, measured by a
+    camera that saw both tags at once (realsense_extrinsics.py). Embedded in
+    metadata.json so downstream analysis can chain any camera that only sees a
+    secondary tag into the one room frame. None when never measured."""
+    path = CALIBRATION_DIR / "tags.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
 def make_recording_dir():
     """Pick the day_NN_DATE / rec_DATE_NNN folder, matching sample_dataset."""
     now = datetime.now()
@@ -351,6 +364,11 @@ def write_metadata(rec_dir, start_time, end_time, frame_count):
     extrinsics = load_extrinsics()
     if extrinsics is not None:
         metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
+    # Room tag map (tag 2 etc. in the tag-1 room frame) — recording-global,
+    # not per-stream, since the tags belong to the room.
+    room_tags = load_room_tags()
+    if room_tags is not None:
+        metadata["room_tags"] = room_tags
     (rec_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
