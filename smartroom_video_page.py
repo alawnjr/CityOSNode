@@ -1039,17 +1039,6 @@ class Handler(BaseHTTPRequestHandler):
       border: 1px solid var(--line);
       border-radius: 6px;
     }}
-    #rec-btn {{
-      color: #fff;
-      background: #d62b2b;
-      border: 0;
-      padding: 10px 20px;
-      border-radius: 6px;
-      font-weight: 700;
-      font-size: 15px;
-      cursor: pointer;
-    }}
-    #rec-btn:disabled {{ background: #b98c8c; cursor: default; }}
     #rec-cancel {{
       color: #fff;
       background: #4a5563;
@@ -1187,7 +1176,6 @@ class Handler(BaseHTTPRequestHandler):
       <label>Length (seconds)
         <input type="number" id="rec-seconds" min="1" max="3600" value="30">
       </label>
-      <button type="button" id="rec-btn">Record</button>
       <button type="button" id="rec-all-btn" title="Start a synced recording on every camera node"
               style="color:#fff;background:#7c3aed;border:0;padding:10px 20px;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;">Record ALL nodes</button>
     </div>
@@ -1332,7 +1320,6 @@ class Handler(BaseHTTPRequestHandler):
 
   <script>
     (function () {{
-      var btn = document.getElementById('rec-btn');
       var allBtn = document.getElementById('rec-all-btn');
       var allMsg = document.getElementById('rec-all-msg');
       var cancelBtn = document.getElementById('rec-cancel');
@@ -1362,7 +1349,6 @@ class Handler(BaseHTTPRequestHandler):
         if (refresh) {{ clearInterval(refresh); refresh = null; }}
         text.textContent = message;
         cancelBtn.style.display = 'none';
-        btn.disabled = false;
         allBtn.disabled = false;
         secs.disabled = false;
         setTimeout(function () {{ location.reload(); }}, 1800);
@@ -1378,7 +1364,6 @@ class Handler(BaseHTTPRequestHandler):
         var d = parseInt(secs.value, 10);
         if (!d || d < 1) {{ d = 30; }}
         cancelling = false;
-        btn.disabled = true;
         allBtn.disabled = true;
         secs.disabled = true;
         box.classList.remove('hidden');
@@ -1414,7 +1399,6 @@ class Handler(BaseHTTPRequestHandler):
         }}).catch(function () {{ finish('Could not start recording.'); }});
       }}
 
-      btn.addEventListener('click', function () {{ begin('/record'); }});
       allBtn.addEventListener('click', function () {{ begin('/record/all'); }});
 
       cancelBtn.addEventListener('click', function () {{
