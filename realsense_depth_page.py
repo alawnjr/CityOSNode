@@ -62,7 +62,7 @@ JPEG_QUALITY = 70
 # Browser-bound frame rate cap. The capture runs at the camera rate; viewers are
 # sent only the newest frame at most this often, so a slow wifi link shows a
 # lower frame rate instead of accumulating seconds of latency.
-VIEW_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_FPS", "12"))
+VIEW_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_FPS", "24"))
 
 # The SDK import is allowed to fail so the page can still come up and explain
 # itself while librealsense is not built yet (or the module is missing).
