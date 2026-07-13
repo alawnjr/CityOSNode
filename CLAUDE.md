@@ -12,12 +12,13 @@ kept — see below).
 
 ## Critical: code runs on the Raspberry Pis, not the dev machine
 
-There are **two camera nodes**, each a Pi running the same checkout of this repo:
+**As of 2026-07-13 there is ONE active camera node** (`smartroom1` — a Pi 3 with
+a Logitech Webcam Pro 9000 pinned to 800×600 — is decommissioned; two-node
+instructions below are historical):
 
-| Host | Board | Camera |
+| Host | Board | Cameras |
 |---|---|---|
-| `smartroom1.local` | Raspberry Pi 3 | Logitech Webcam Pro 9000 — pinned to 800×600 via `node.env` (see below) |
-| `smartroom2.local` | Raspberry Pi 4 | Logitech (C920-class) USB camera — 1280×720@30 |
+| `smartroom2.local` | Raspberry Pi 4 | Logitech C920 (1280×720@30, main capture) + Intel RealSense D455 and D435 (depth, port-8001 page) |
 
 User is `smartroom` on both; credentials in `PRIVATE.md` (gitignored). The cameras
 are accessed via `ffmpeg -f v4l2`, so capture itself needs no special libraries —
@@ -170,10 +171,6 @@ so `Restart=on-failure` will NOT respawn it.) Routes:
   and a list of recordings.
 - `POST /record` (duration) → runs `run_smartroom_capture.sh`; `POST /record/cancel`
   kills the recording's process group; `/record/status` returns countdown/elapsed JSON.
-- `POST /record/all` (duration) → records locally AND fans out `POST /record` to
-  the peer nodes (`SMARTROOM_PEERS` in node.env, default both smartroom hosts
-  minus self) — the "Record ALL nodes" button, so synced recordings don't need
-  the laptop dashboard.
 - `POST /photo` — full-resolution still to `data/photos/` (borrows the camera from
   the preview with a busy-retry); `/photo/<name>` serves it; `POST /photo/delete`
   removes one. Photos are page-only (not in the `/recordings` listing).

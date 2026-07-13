@@ -9,9 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -438,50 +436,6 @@ class Recorder:
 
 RECORDER = Recorder()
 
-# All camera nodes; "Record all" fans out to every one that isn't this host.
-# Override with SMARTROOM_PEERS (comma-separated hosts) in node.env.
-PEER_HOSTS = [h.strip() for h in os.environ.get(
-    "SMARTROOM_PEERS", "smartroom1.local,smartroom2.local").split(",") if h.strip()]
-
-
-def _peer_hosts():
-    me = socket.gethostname().split(".")[0].lower()
-    return [h for h in PEER_HOSTS if h.split(".")[0].lower() != me]
-
-
-def record_all(duration):
-    """Start a recording locally AND on every peer node (their own /record).
-    Returns (local_ok, {host: message}) — a dead peer is reported, not fatal."""
-    results = {}
-    local_ok, local_message = RECORDER.start(duration)
-    results["this node"] = local_message
-
-    def hit(host):
-        try:
-            req = urllib.request.Request(
-                f"http://{host}:8000/record",
-                data=f"duration={duration}".encode(),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                method="POST")
-            with urllib.request.urlopen(req, timeout=5) as res:
-                body = json.loads(res.read().decode("utf-8", "ignore"))
-                results[host] = body.get("message", "started")
-        except urllib.error.HTTPError as e:
-            try:
-                results[host] = json.loads(e.read().decode()).get("message", f"HTTP {e.code}")
-            except Exception:
-                results[host] = f"HTTP {e.code}"
-        except Exception as e:  # noqa: BLE001 - peer down is a normal outcome
-            results[host] = f"unreachable ({e})"
-
-    threads = [threading.Thread(target=hit, args=(h,), daemon=True) for h in _peer_hosts()]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=6)
-    return local_ok, results
-
-
 PHOTO_LOCK = threading.Lock()
 
 
@@ -697,20 +651,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/record":
             self.start_recording()
-            return
-        if parsed.path == "/record/all":
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b""
-            params = urllib.parse.parse_qs(raw.decode("utf-8", "ignore"))
-            try:
-                duration = int(float(params.get("duration", ["30"])[0]))
-            except (ValueError, TypeError):
-                duration = 30
-            duration = max(1, min(duration, 3600))
-            local_ok, results = record_all(duration)
-            payload = json.dumps({"ok": local_ok, "results": results, **RECORDER.status()})
-            self.send_bytes(payload.encode("utf-8"), "application/json; charset=utf-8",
-                            200 if local_ok else 409)
             return
         if parsed.path == "/record/cancel":
             ok, message = RECORDER.cancel()
@@ -1176,8 +1116,8 @@ class Handler(BaseHTTPRequestHandler):
       <label>Length (seconds)
         <input type="number" id="rec-seconds" min="1" max="3600" value="30">
       </label>
-      <button type="button" id="rec-all-btn" title="Start a synced recording on every camera node"
-              style="color:#fff;background:#7c3aed;border:0;padding:10px 20px;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;">Record ALL nodes</button>
+      <button type="button" id="rec-all-btn"
+              style="color:#fff;background:#7c3aed;border:0;padding:10px 20px;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;">Record</button>
     </div>
     <div id="rec-all-msg" style="font-size:0.85em;opacity:0.85;margin-top:6px;"></div>
     <div class="record-status hidden" id="rec-status">
@@ -1399,7 +1339,7 @@ class Handler(BaseHTTPRequestHandler):
         }}).catch(function () {{ finish('Could not start recording.'); }});
       }}
 
-      allBtn.addEventListener('click', function () {{ begin('/record/all'); }});
+      allBtn.addEventListener('click', function () {{ begin('/record'); }});
 
       cancelBtn.addEventListener('click', function () {{
         cancelling = true;
