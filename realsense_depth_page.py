@@ -410,7 +410,8 @@ class DepthRecordJob:
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
                  "-r", str(RECORD_FPS), "-i", "pipe:0",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 # Pi 4 hardware encoder — the CPU is needed for FFV1 depth
+                 "-c:v", "h264_v4l2m2m", "-b:v", "2M", "-pix_fmt", "yuv420p",
                  str(color_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             depth_proc = subprocess.Popen(

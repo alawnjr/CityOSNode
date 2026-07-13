@@ -293,6 +293,15 @@ def make_recording_dir():
     return rec_dir
 
 
+# H.264 encoder for recordings. The Pi 4's hardware encoder (h264_v4l2m2m)
+# leaves the CPU free for the depth cameras' lossless encoding — software x264
+# at 720p30 eats half the Pi by itself. SMARTROOM_SW_ENCODE=1 falls back.
+def h264_encoder_args():
+    if os.environ.get("SMARTROOM_SW_ENCODE"):
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "h264_v4l2m2m", "-b:v", "4M", "-pix_fmt", "yuv420p"]
+
+
 def record_camera(path):
     timestamp_filter = (
         f"drawtext=fontfile={TIMESTAMP_FONT}:"
@@ -313,16 +322,14 @@ def record_camera(path):
         # unbounded second output would keep ffmpeg running forever).
         command = source + [
             "-t", str(DURATION_SECONDS), "-i", CAMERA,
-            "-map", "0:v:0", "-vf", timestamp_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-map", "0:v:0", "-vf", timestamp_filter, *h264_encoder_args(),
             str(path),
             "-map", "0:v:0", "-r", "5", "-update", "1", "-y", preview_path,
         ]
     else:
         command = source + [
             "-i", CAMERA, "-t", str(DURATION_SECONDS),
-            "-vf", timestamp_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-vf", timestamp_filter, *h264_encoder_args(),
             str(path),
         ]
     # The camera can take a few seconds to actually be released (the web page's
