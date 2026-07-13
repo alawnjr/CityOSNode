@@ -137,8 +137,11 @@ class RealSenseStream:
         return "?"
 
     def _start_pipeline(self):
-        attempts = (PROFILE_ATTEMPTS_USB3 if self._usb_version().startswith("3")
-                    else PROFILE_ATTEMPTS_USB2)
+        # prefer 15fps only when we positively know we're on USB 2; if the
+        # version is unknown, the full list already falls through to the USB 2
+        # profiles when the higher ones are rejected
+        attempts = (PROFILE_ATTEMPTS_USB2 if self._usb_version().startswith("2")
+                    else PROFILE_ATTEMPTS_USB3)
         pipeline = rs.pipeline()
         last_error = None
         for width, height, fps in attempts:
@@ -287,9 +290,10 @@ class RealSenseStream:
 _STREAMS = {}
 _STREAMS_LOCK = threading.Lock()
 
-# One long-lived SDK context, shared by every enumeration. Creating a fresh
-# rs.context() per request re-probes the whole USB bus (RSUSB backend), which
-# races active pipelines and other enumerations and randomly comes up empty.
+# One long-lived SDK context, created at startup BEFORE any pipeline exists
+# and never rebuilt. With the RSUSB backend a context probes the USB bus when
+# created — a context created while our own pipelines hold the devices' USB
+# interfaces can't open them and enumerates empty, permanently.
 _RS_CTX = {"ctx": None}
 _RS_CTX_LOCK = threading.Lock()
 
@@ -299,11 +303,6 @@ def _rs_context():
         if _RS_CTX["ctx"] is None:
             _RS_CTX["ctx"] = rs.context()
         return _RS_CTX["ctx"]
-
-
-def _reset_rs_context():
-    with _RS_CTX_LOCK:
-        _RS_CTX["ctx"] = None
 
 
 def get_stream(serial):
@@ -349,12 +348,11 @@ def _enum_watchdog(found_devices):
 def list_devices():
     """All connected RealSense devices (name/serial/usb), D455 before D435 so
     the primary depth camera renders first, plus each stream's status."""
-    devices = []
     if rs is None:
-        return devices
+        return []
+    by_serial = {}
     try:
-        ctx = _rs_context()
-        for device in ctx.devices:
+        for device in _rs_context().devices:
             entry = {}
             for label, key in (("name", rs.camera_info.name),
                                ("serial", rs.camera_info.serial_number),
@@ -363,16 +361,26 @@ def list_devices():
                     entry[label] = device.get_info(key)
                 except RuntimeError:
                     entry[label] = "?"
-            with _STREAMS_LOCK:
-                stream = _STREAMS.get(entry["serial"])
-            entry["status"] = stream.status() if stream else {}
-            devices.append(entry)
+            by_serial[entry["serial"]] = entry
     except Exception:  # noqa: BLE001 - enumeration is best-effort
         pass
-    if not devices and _usb_realsense_present():
-        # the context can silently cache an empty device list after pipelines
-        # start/stop (it never throws) — rebuild it for the next call
-        _reset_rs_context()
+    # Enumeration can miss devices whose USB interfaces our own pipelines have
+    # claimed — merge in the cameras we are actively streaming from.
+    with _STREAMS_LOCK:
+        streams = list(_STREAMS.items())
+    for serial, stream in streams:
+        status = stream.status()
+        info = status.get("info") or {}
+        if serial not in by_serial and (status["running"] or status["starting"]) and info:
+            by_serial[serial] = {"name": info.get("name", "RealSense"),
+                                 "serial": serial,
+                                 "usb": info.get("usb", "?")}
+    devices = []
+    for serial, entry in by_serial.items():
+        with _STREAMS_LOCK:
+            stream = _STREAMS.get(serial)
+        entry["status"] = stream.status() if stream else {}
+        devices.append(entry)
     _enum_watchdog(devices)
     devices.sort(key=lambda d: d.get("name", ""), reverse=True)
     return devices
@@ -647,6 +655,11 @@ PAGE = """<!doctype html>
 
 
 def main():
+    if rs is not None:
+        try:
+            _rs_context()  # create the context before any pipeline can exist
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: could not create RealSense context: {exc}")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"RealSense depth page running at http://0.0.0.0:{PORT}")
     if RS_IMPORT_ERROR:
