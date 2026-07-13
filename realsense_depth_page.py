@@ -427,7 +427,10 @@ class DepthRecordJob:
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
                  "-r", str(RECORD_FPS), "-i", "pipe:0",
-                 "-c:v", "ffv1", "-level", "3", "-slices", "4", "-threads", "4",
+                 # golomb-rice coder + slices: ~2x faster than the default range
+                 # coder on the Pi, still lossless — worth the ~10% larger files
+                 "-c:v", "ffv1", "-level", "3", "-coder", "0", "-context", "0",
+                 "-slices", "4", "-threads", "4",
                  str(depth_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
