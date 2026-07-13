@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Live RGB + depth view for the Intel RealSense D455, on port 8001.
+"""Live RGB + depth view for Intel RealSense cameras, on port 8001.
 
-Serves http://<node>.local:8001 with the color stream and the colorized depth
-stream side by side (depth aligned to color, so the same pixel in both panes is
-the same point in the room). Click anywhere on either pane to read the depth at
-that pixel in meters; the center-pixel distance is shown continuously.
+Serves http://<node>.local:8001 with one section per connected RealSense
+device (e.g. a D455 and a D435 at the same time): the color stream and the
+colorized depth stream side by side (depth aligned to color, so the same pixel
+in both panes is the same point in the room). Click anywhere on either pane to
+read the depth at that pixel in meters; the center-pixel distance is shown
+continuously per camera.
 
 Uses the Intel RealSense SDK (pyrealsense2) — on a Pi that's built from source
 into the venv by setup_realsense_pi.sh (no aarch64 pip wheel exists). Run with
@@ -12,10 +14,14 @@ the venv python:
 
     ~/CityOS/.venv/bin/python ~/CityOS/realsense_depth_page.py
 
-This is separate from smartroom_video_page.py (port 8000): the D455 is its own
-USB device, so both pages can run at once without fighting over a camera. Like
-the main page, the RealSense pipeline starts on demand and is released a few
-seconds after the last viewer leaves.
+This is separate from smartroom_video_page.py (port 8000): the RealSense
+cameras are their own USB devices, so both pages run at once without fighting
+over a camera. Each device's pipeline starts on demand and is released a few
+seconds after its last viewer leaves.
+
+Bandwidth note: RealSense streams are uncompressed (~35+ MB/s per camera at
+640x480), so two of them cannot share the Pi 4's single USB 2 bus — put them
+in the blue USB 3 ports. The compressed MJPG webcam (C920) is fine on USB 2.
 """
 import json
 import os
@@ -49,7 +55,7 @@ _load_node_env()
 
 PORT = int(os.environ.get("SMARTROOM_DEPTH_PORT", "8001"))
 STREAM_BOUNDARY = "frame"
-IDLE_TIMEOUT = 5.0   # release the camera this many seconds after the last viewer leaves
+IDLE_TIMEOUT = 5.0   # release a camera this many seconds after its last viewer leaves
 FIRST_FRAME_TIMEOUT = 8.0  # pipeline start + first frames can take a few seconds
 JPEG_QUALITY = 80
 
@@ -64,7 +70,7 @@ except ImportError as exc:  # pragma: no cover - depends on node state
     RS_IMPORT_ERROR = str(exc)
 
 # Depth and color at the same resolution so the aligned panes map 1:1. Tried in
-# order; the later entries are what the SDK will actually accept when the D455
+# order; the later entries are what the SDK will actually accept when a camera
 # is on a USB 2 port (USB 3 allows the higher ones).
 PROFILE_ATTEMPTS = (
     (848, 480, 30),
@@ -75,11 +81,13 @@ PROFILE_ATTEMPTS = (
 
 
 class RealSenseStream:
-    """One shared pyrealsense2 pipeline broadcasting color + colorized-depth
-    JPEGs to any number of MJPEG viewers, plus the latest raw depth (meters)
-    for point queries. Starts on demand, stops when idle."""
+    """One shared pyrealsense2 pipeline for one device (by serial),
+    broadcasting color + colorized-depth JPEGs to any number of MJPEG viewers,
+    plus the latest raw depth (meters) for point queries. Starts on demand,
+    stops when idle."""
 
-    def __init__(self):
+    def __init__(self, serial):
+        self.serial = serial
         self.cond = threading.Condition()
         self.rgb_jpeg = None
         self.depth_jpeg = None
@@ -110,6 +118,7 @@ class RealSenseStream:
         last_error = None
         for width, height, fps in PROFILE_ATTEMPTS:
             config = rs.config()
+            config.enable_device(self.serial)
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
             config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
             try:
@@ -117,7 +126,7 @@ class RealSenseStream:
                 return pipeline, profile, (width, height, fps)
             except RuntimeError as exc:
                 last_error = exc
-        raise last_error if last_error else RuntimeError("no usable D455 profile")
+        raise last_error if last_error else RuntimeError("no usable RealSense profile")
 
     def _run(self):
         try:
@@ -241,11 +250,48 @@ class RealSenseStream:
             }
 
 
-STREAM = RealSenseStream()
+# One stream per device serial, created on first use.
+_STREAMS = {}
+_STREAMS_LOCK = threading.Lock()
+
+
+def get_stream(serial):
+    with _STREAMS_LOCK:
+        stream = _STREAMS.get(serial)
+        if stream is None:
+            stream = _STREAMS[serial] = RealSenseStream(serial)
+        return stream
+
+
+def list_devices():
+    """All connected RealSense devices (name/serial/usb), D455 before D435 so
+    the primary depth camera renders first, plus each stream's status."""
+    devices = []
+    if rs is None:
+        return devices
+    try:
+        ctx = rs.context()
+        for device in ctx.devices:
+            entry = {}
+            for label, key in (("name", rs.camera_info.name),
+                               ("serial", rs.camera_info.serial_number),
+                               ("usb", rs.camera_info.usb_type_descriptor)):
+                try:
+                    entry[label] = device.get_info(key)
+                except RuntimeError:
+                    entry[label] = "?"
+            with _STREAMS_LOCK:
+                stream = _STREAMS.get(entry["serial"])
+            entry["status"] = stream.status() if stream else {}
+            devices.append(entry)
+    except Exception:  # noqa: BLE001 - enumeration is best-effort
+        pass
+    devices.sort(key=lambda d: d.get("name", ""), reverse=True)
+    return devices
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SmartroomDepthPage/1.0"
+    server_version = "SmartroomDepthPage/2.0"
 
     def log_message(self, fmt, *args):
         return
@@ -264,30 +310,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        serial = (params.get("s") or [""])[0]
         if parsed.path == "/":
             self.send_bytes(PAGE.encode("utf-8"))
             return
+        if parsed.path == "/devices":
+            self.send_json({"devices": list_devices(), "sdk_error": RS_IMPORT_ERROR})
+            return
         if parsed.path in ("/rgb.mjpg", "/depth.mjpg"):
-            self.serve_stream("rgb" if parsed.path == "/rgb.mjpg" else "depth")
+            self.serve_stream("rgb" if parsed.path == "/rgb.mjpg" else "depth", serial)
             return
         if parsed.path == "/value":
-            self.serve_value(parsed.query)
-            return
-        if parsed.path == "/info":
-            self.send_json(STREAM.status())
+            self.serve_value(params, serial)
             return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
-    def serve_value(self, query):
-        params = urllib.parse.parse_qs(query)
+    def serve_value(self, params, serial):
+        if not serial:
+            self.send_json({"ok": False, "message": "missing ?s=<serial>"}, 400)
+            return
         try:
             x = min(1.0, max(0.0, float(params.get("x", ["0.5"])[0])))
             y = min(1.0, max(0.0, float(params.get("y", ["0.5"])[0])))
         except ValueError:
             self.send_json({"ok": False, "message": "bad coordinates"}, 400)
             return
-        meters, px, py = STREAM.depth_at(x, y)
-        center_m, _, _ = STREAM.depth_at(0.5, 0.5)
+        stream = get_stream(serial)
+        meters, px, py = stream.depth_at(x, y)
+        center_m, _, _ = stream.depth_at(0.5, 0.5)
         self.send_json({
             "ok": meters is not None,
             "m": round(meters, 3) if meters is not None else None,
@@ -295,17 +346,21 @@ class Handler(BaseHTTPRequestHandler):
             "center_m": round(center_m, 3) if center_m is not None else None,
         })
 
-    def serve_stream(self, which):
+    def serve_stream(self, which, serial):
         if rs is None:
             self.send_bytes(
                 f"pyrealsense2 is not installed on this node: {RS_IMPORT_ERROR}\n"
                 f"Build it with setup_realsense_pi.sh, then restart this page.".encode("utf-8"),
                 "text/plain; charset=utf-8", 503)
             return
-        STREAM.add_client()
+        if not serial:
+            self.send_bytes(b"missing ?s=<serial>", "text/plain; charset=utf-8", 400)
+            return
+        stream = get_stream(serial)
+        stream.add_client()
         try:
-            if not STREAM.wait_first_frame(FIRST_FRAME_TIMEOUT):
-                message = STREAM.status().get("error") or "RealSense camera unavailable."
+            if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
+                message = stream.status().get("error") or "RealSense camera unavailable."
                 self.send_bytes(message.encode("utf-8"), "text/plain; charset=utf-8", 503)
                 return
             self.send_response(200)
@@ -314,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Pragma", "no-cache")
             self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={STREAM_BOUNDARY}")
             self.end_headers()
-            for frame in STREAM.frames(which):
+            for frame in stream.frames(which):
                 try:
                     self.wfile.write(b"--" + STREAM_BOUNDARY.encode() + b"\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -324,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
         finally:
-            STREAM.remove_client()
+            stream.remove_client()
 
 
 PAGE = """<!doctype html>
@@ -332,7 +387,7 @@ PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>D455 Depth View</title>
+  <title>RealSense Depth View</title>
   <style>
     :root { color-scheme: light; --bg:#f6f8fb; --panel:#fff; --ink:#18202a;
             --muted:#687384; --line:#d9e0e8; --accent:#1267c3; }
@@ -341,13 +396,17 @@ PAGE = """<!doctype html>
     header { padding:24px clamp(16px,4vw,44px) 14px; border-bottom:1px solid var(--line); background:var(--panel); }
     h1 { margin:0; font-size:clamp(24px,4vw,36px); }
     header p { margin:6px 0 0; color:var(--muted); font-size:15px; }
-    #usb-warn { color:#b23c3c; font-weight:700; }
     .wrap { width:min(1400px, calc(100% - 32px)); margin:0 auto; }
-    .panes { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; margin:20px auto; }
-    .pane h2 { margin:0 0 8px; font-size:18px; }
+    .device { margin:26px 0 10px; padding:16px; background:var(--panel);
+              border:1px solid var(--line); border-radius:12px; }
+    .device > h2 { margin:0 0 2px; font-size:20px; }
+    .device .meta { color:var(--muted); font-size:14px; margin:0 0 12px; }
+    .usb-warn { color:#b23c3c; font-weight:700; }
+    .panes { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
+    .pane h3 { margin:0 0 6px; font-size:15px; color:var(--muted); font-weight:700; }
     .stage { position:relative; background:#10151c; border:1px solid var(--line);
              border-radius:10px; overflow:hidden; cursor:crosshair; }
-    .stage img { width:100%; display:block; }
+    .stage img { width:100%; display:block; min-height:120px; }
     .marker { position:absolute; width:14px; height:14px; margin:-7px 0 0 -7px;
               border:2px solid #fff; border-radius:50%; box-shadow:0 0 3px #000;
               pointer-events:none; display:none; }
@@ -359,98 +418,116 @@ PAGE = """<!doctype html>
     .cross:before, .cross:after { content:""; position:absolute; background:#ffd23c; }
     .cross:before { left:5px; top:0; width:2px; height:12px; }
     .cross:after  { left:0; top:5px; width:12px; height:2px; }
-    .readout { margin:4px 0 30px; font-size:16px; }
-    .readout b { font-size:20px; }
-    .err { background:#fdeaea; border:1px solid #e6b5b5; color:#8d2323;
-           border-radius:8px; padding:12px 16px; margin:16px auto; display:none; }
+    .readout { margin:10px 0 2px; font-size:15px; }
+    .readout b { font-size:19px; }
+    .note { background:#fdeaea; border:1px solid #e6b5b5; color:#8d2323;
+            border-radius:8px; padding:12px 16px; margin:16px 0; }
+    .empty { color:var(--muted); padding:30px 0; }
   </style>
 </head>
 <body>
   <header>
-    <h1>D455 Depth View</h1>
-    <p id="dev-info">Connecting to camera&hellip;</p>
+    <h1>RealSense Depth View</h1>
+    <p id="summary">Looking for cameras&hellip;</p>
   </header>
   <div class="wrap">
-    <div class="err" id="err"></div>
-    <div class="panes">
-      <div class="pane">
-        <h2>Color (RGB)</h2>
-        <div class="stage" id="rgb-stage">
-          <img id="rgb" alt="RGB stream">
-          <span class="cross"></span>
-          <span class="marker" id="rgb-marker"></span>
-          <span class="tag" id="rgb-tag"></span>
-        </div>
-      </div>
-      <div class="pane">
-        <h2>Depth (colorized, aligned to color)</h2>
-        <div class="stage" id="depth-stage">
-          <img id="depth" alt="Depth stream">
-          <span class="cross"></span>
-          <span class="marker" id="depth-marker"></span>
-          <span class="tag" id="depth-tag"></span>
-        </div>
-      </div>
-    </div>
-    <div class="readout">
-      Center distance: <b id="center">&mdash;</b>
-      <span style="color:var(--muted)">&nbsp;&mdash; click anywhere on either image to measure that point</span>
-    </div>
+    <div class="note" id="note" style="display:none"></div>
+    <div id="devices"></div>
+    <p class="empty" id="empty" style="display:none">
+      No RealSense camera detected. Check the USB connection, then refresh.</p>
   </div>
   <script>
     (function () {
-      var err = document.getElementById('err');
-      function start() {
-        document.getElementById('rgb').src = '/rgb.mjpg?t=' + Date.now();
-        document.getElementById('depth').src = '/depth.mjpg?t=' + Date.now();
-      }
-      function showInfo() {
-        fetch('/info').then(function (r) { return r.json(); }).then(function (s) {
-          if (s.error) { err.textContent = s.error; err.style.display = ''; }
-          else { err.style.display = 'none'; }
-          if (s.info && s.info.name) {
-            var usb = s.info.usb || '?';
-            var warn = usb.indexOf('3') !== 0
-              ? ' <span id="usb-warn">&#9888; on USB ' + usb +
-                ' — replug into a blue USB 3 port for full resolution</span>' : '';
-            document.getElementById('dev-info').innerHTML =
-              s.info.name + ' · S/N ' + s.info.serial + ' · FW ' + s.info.firmware +
-              ' · ' + s.info.profile + ' · USB ' + usb + warn;
-          }
-        }).catch(function () {});
-      }
-      setInterval(showInfo, 3000); showInfo();
+      var built = {};   // serial -> section element
 
-      function pollCenter() {
-        fetch('/value?x=0.5&y=0.5').then(function (r) { return r.json(); }).then(function (j) {
-          document.getElementById('center').textContent =
-            j.center_m != null ? j.center_m.toFixed(2) + ' m' : 'no depth';
-        }).catch(function () {});
-      }
-      setInterval(pollCenter, 500);
+      function buildSection(dev) {
+        var s = dev.serial;
+        var section = document.createElement('div');
+        section.className = 'device';
+        section.innerHTML =
+          '<h2></h2><p class="meta"></p>' +
+          '<div class="panes">' +
+            '<div class="pane"><h3>Color (RGB)</h3>' +
+              '<div class="stage" data-role="rgb"><img alt="RGB">' +
+              '<span class="cross"></span><span class="marker"></span><span class="tag"></span></div></div>' +
+            '<div class="pane"><h3>Depth (aligned to color)</h3>' +
+              '<div class="stage" data-role="depth"><img alt="Depth">' +
+              '<span class="cross"></span><span class="marker"></span><span class="tag"></span></div></div>' +
+          '</div>' +
+          '<div class="readout">Center distance: <b>&mdash;</b>' +
+          ' <span style="color:var(--muted)">&nbsp;&mdash; click either image to measure that point</span></div>';
+        section.querySelector('h2').textContent = dev.name + '  (S/N ' + s + ')';
+        var q = encodeURIComponent(s);
+        section.querySelector('[data-role="rgb"] img').src = '/rgb.mjpg?s=' + q + '&t=' + Date.now();
+        section.querySelector('[data-role="depth"] img').src = '/depth.mjpg?s=' + q + '&t=' + Date.now();
 
-      function wire(stageId) {
-        var stage = document.getElementById(stageId);
-        stage.addEventListener('click', function (e) {
-          var rect = stage.getBoundingClientRect();
-          var x = (e.clientX - rect.left) / rect.width;
-          var y = (e.clientY - rect.top) / rect.height;
-          fetch('/value?x=' + x.toFixed(4) + '&y=' + y.toFixed(4))
+        var center = section.querySelector('.readout b');
+        setInterval(function () {
+          fetch('/value?s=' + q + '&x=0.5&y=0.5')
             .then(function (r) { return r.json(); })
             .then(function (j) {
-              ['rgb', 'depth'].forEach(function (p) {
-                var m = document.getElementById(p + '-marker');
-                var t = document.getElementById(p + '-tag');
-                m.style.left = (x * 100) + '%'; m.style.top = (y * 100) + '%';
-                t.style.left = (x * 100) + '%'; t.style.top = (y * 100) + '%';
-                t.textContent = j.m != null ? j.m.toFixed(2) + ' m' : 'no depth';
-                m.style.display = ''; t.style.display = '';
-              });
+              center.textContent = j.center_m != null ? j.center_m.toFixed(2) + ' m' : 'no depth';
             }).catch(function () {});
+        }, 600);
+
+        section.querySelectorAll('.stage').forEach(function (stage) {
+          stage.addEventListener('click', function (e) {
+            var rect = stage.getBoundingClientRect();
+            var x = (e.clientX - rect.left) / rect.width;
+            var y = (e.clientY - rect.top) / rect.height;
+            fetch('/value?s=' + q + '&x=' + x.toFixed(4) + '&y=' + y.toFixed(4))
+              .then(function (r) { return r.json(); })
+              .then(function (j) {
+                section.querySelectorAll('.stage').forEach(function (st) {
+                  var m = st.querySelector('.marker'), t = st.querySelector('.tag');
+                  m.style.left = (x * 100) + '%'; m.style.top = (y * 100) + '%';
+                  t.style.left = (x * 100) + '%'; t.style.top = (y * 100) + '%';
+                  t.textContent = j.m != null ? j.m.toFixed(2) + ' m' : 'no depth';
+                  m.style.display = ''; t.style.display = '';
+                });
+              }).catch(function () {});
+          });
         });
+        return section;
       }
-      wire('rgb-stage'); wire('depth-stage');
-      start();
+
+      function refresh() {
+        fetch('/devices').then(function (r) { return r.json(); }).then(function (j) {
+          var devs = j.devices || [];
+          var note = document.getElementById('note');
+          if (j.sdk_error) {
+            note.textContent = 'RealSense SDK not available: ' + j.sdk_error;
+            note.style.display = '';
+          }
+          document.getElementById('empty').style.display =
+            (devs.length === 0 && !j.sdk_error) ? '' : 'none';
+          document.getElementById('summary').textContent =
+            devs.length ? devs.length + ' camera' + (devs.length > 1 ? 's' : '') + ' connected'
+                        : 'No cameras connected';
+
+          var container = document.getElementById('devices');
+          devs.forEach(function (dev) {
+            if (!built[dev.serial]) {
+              built[dev.serial] = buildSection(dev);
+              container.appendChild(built[dev.serial]);
+            }
+            var meta = built[dev.serial].querySelector('.meta');
+            var st = dev.status || {}, info = st.info || {};
+            var usb = info.usb || dev.usb || '?';
+            var bits = [];
+            if (info.firmware) bits.push('FW ' + info.firmware);
+            if (info.profile) bits.push(info.profile);
+            bits.push('USB ' + usb);
+            meta.innerHTML = bits.join(' &middot; ') +
+              (String(usb).indexOf('3') !== 0
+                ? ' <span class="usb-warn">&#9888; on USB ' + usb +
+                  ' — use a blue USB 3 port for full resolution</span>' : '') +
+              (st.error ? ' <span class="usb-warn">' + st.error + '</span>' : '');
+          });
+        }).catch(function () {});
+      }
+      refresh();
+      setInterval(refresh, 3000);
     })();
   </script>
 </body>
@@ -459,7 +536,7 @@ PAGE = """<!doctype html>
 
 def main():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"D455 depth page running at http://0.0.0.0:{PORT}")
+    print(f"RealSense depth page running at http://0.0.0.0:{PORT}")
     if RS_IMPORT_ERROR:
         print(f"WARNING: pyrealsense2 not available yet: {RS_IMPORT_ERROR}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
