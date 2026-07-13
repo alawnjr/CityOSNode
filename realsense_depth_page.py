@@ -397,7 +397,8 @@ class DepthRecordJob:
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
                  "-r", str(RECORD_FPS), "-i", "pipe:0",
-                 "-c:v", "ffv1", "-level", "3", str(depth_path)],
+                 "-c:v", "ffv1", "-level", "3", "-slices", "4", "-threads", "4",
+                 str(depth_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             start_time = dt.datetime.now().astimezone()
