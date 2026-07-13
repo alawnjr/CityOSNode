@@ -299,6 +299,35 @@ def get_stream(serial):
 _ENUM_FAILS = {"n": 0}
 
 
+def _usb_realsense_present():
+    """True if any Intel USB device is on the bus (sysfs, no SDK involved) —
+    distinguishes 'no camera plugged in' from 'SDK enumeration is wedged'."""
+    for vendor_file in Path("/sys/bus/usb/devices").glob("*/idVendor"):
+        try:
+            if vendor_file.read_text().strip() == "8086":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _enum_watchdog(found_devices):
+    """A replug while a pipeline is open can leave this process holding stale
+    USB claims ('failed to set power state') or a cached empty device list,
+    poisoning every later enumeration until the process dies. If enumeration
+    keeps coming up empty while sysfs says a RealSense is physically present
+    and no stream is active, exit so systemd hands us a clean process."""
+    if found_devices or not _usb_realsense_present():
+        _ENUM_FAILS["n"] = 0
+        return
+    _ENUM_FAILS["n"] += 1
+    with _STREAMS_LOCK:
+        active = any(s.running or s.starting for s in _STREAMS.values())
+    if not active and _ENUM_FAILS["n"] >= 3:
+        print("RealSense enumeration wedged; exiting for a clean restart")
+        os._exit(1)
+
+
 def list_devices():
     """All connected RealSense devices (name/serial/usb), D455 before D435 so
     the primary depth camera renders first, plus each stream's status."""
@@ -320,18 +349,9 @@ def list_devices():
                 stream = _STREAMS.get(entry["serial"])
             entry["status"] = stream.status() if stream else {}
             devices.append(entry)
-        _ENUM_FAILS["n"] = 0
     except Exception:  # noqa: BLE001 - enumeration is best-effort
-        # Replugging a camera while its pipeline is open can leave this process
-        # holding stale USB claims ("failed to set power state"), which poisons
-        # every later enumeration until the process dies. If it keeps failing
-        # with no stream active, exit so systemd hands us a clean process.
-        _ENUM_FAILS["n"] += 1
-        with _STREAMS_LOCK:
-            active = any(s.running or s.starting for s in _STREAMS.values())
-        if not active and _ENUM_FAILS["n"] >= 3:
-            print("RealSense enumeration wedged; exiting for a clean restart")
-            os._exit(1)
+        pass
+    _enum_watchdog(devices)
     devices.sort(key=lambda d: d.get("name", ""), reverse=True)
     return devices
 
