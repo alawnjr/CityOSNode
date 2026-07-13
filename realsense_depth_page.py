@@ -471,7 +471,8 @@ PAGE = """<!doctype html>
   </div>
   <script>
     (function () {
-      var built = {};   // serial -> section element
+      var built = {};    // serial -> section element
+      var bumped = {};   // serial -> last time we restarted its <img> streams
 
       function buildSection(dev) {
         var s = dev.serial;
@@ -540,22 +541,37 @@ PAGE = """<!doctype html>
 
           var container = document.getElementById('devices');
           devs.forEach(function (dev) {
-            if (!built[dev.serial]) {
-              built[dev.serial] = buildSection(dev);
-              container.appendChild(built[dev.serial]);
+            var s = dev.serial;
+            if (!built[s]) {
+              built[s] = buildSection(dev);
+              container.appendChild(built[s]);
+              bumped[s] = Date.now();
             }
-            var meta = built[dev.serial].querySelector('.meta');
             var st = dev.status || {}, info = st.info || {};
-            var usb = info.usb || dev.usb || '?';
+            // the device is present but its stream is down (USB replug, bus
+            // starvation, ...) — restart the <img> streams, which re-opens the
+            // pipeline server-side. Grace period so we don't kill a stream
+            // that is still connecting.
+            if (!st.running && !st.starting && Date.now() - (bumped[s] || 0) > 8000) {
+              bumped[s] = Date.now();
+              built[s].querySelectorAll('.stage img').forEach(function (img) {
+                img.src = img.src.split('&t=')[0] + '&t=' + Date.now();
+              });
+            }
+            var meta = built[s].querySelector('.meta');
+            // live enumeration first: info.* is from the last pipeline run and
+            // goes stale when the camera is re-plugged into a different port
+            var usb = (dev.usb && dev.usb !== '?') ? dev.usb : (info.usb || '?');
             var bits = [];
             if (info.firmware) bits.push('FW ' + info.firmware);
-            if (info.profile) bits.push(info.profile);
+            if (st.running && info.profile) bits.push(info.profile);
             bits.push('USB ' + usb);
             meta.innerHTML = bits.join(' &middot; ') +
               (String(usb).indexOf('3') !== 0
                 ? ' <span class="usb-warn">&#9888; on USB ' + usb +
                   ' — use a blue USB 3 port for full resolution</span>' : '') +
-              (st.error ? ' <span class="usb-warn">' + st.error + '</span>' : '');
+              (!st.running && st.error
+                ? ' <span class="usb-warn">' + st.error + ' — reconnecting&hellip;</span>' : '');
           });
         }).catch(function () {});
       }
