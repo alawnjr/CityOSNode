@@ -25,6 +25,7 @@ in the blue USB 3 ports. The compressed MJPG webcam (C920) is fine on USB 2.
 """
 import json
 import os
+import socket
 import threading
 import time
 import urllib.parse
@@ -57,7 +58,11 @@ PORT = int(os.environ.get("SMARTROOM_DEPTH_PORT", "8001"))
 STREAM_BOUNDARY = "frame"
 IDLE_TIMEOUT = 5.0   # release a camera this many seconds after its last viewer leaves
 FIRST_FRAME_TIMEOUT = 8.0  # pipeline start + first frames can take a few seconds
-JPEG_QUALITY = 80
+JPEG_QUALITY = 70
+# Browser-bound frame rate cap. The capture runs at the camera rate; viewers are
+# sent only the newest frame at most this often, so a slow wifi link shows a
+# lower frame rate instead of accumulating seconds of latency.
+VIEW_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_FPS", "12"))
 
 # The SDK import is allowed to fail so the page can still come up and explain
 # itself while librealsense is not built yet (or the module is missing).
@@ -69,12 +74,17 @@ except ImportError as exc:  # pragma: no cover - depends on node state
     rs = None
     RS_IMPORT_ERROR = str(exc)
 
-# Depth and color at the same resolution so the aligned panes map 1:1. Tried in
-# order; the later entries are what the SDK will actually accept when a camera
-# is on a USB 2 port (USB 3 allows the higher ones).
-PROFILE_ATTEMPTS = (
+# Depth and color at the same resolution so the aligned panes map 1:1, tried in
+# order. On USB 2 start at 15fps: the whole USB 2 bus is ~40 MB/s and a single
+# 640x480@30 depth+color pair nearly fills it — 15fps halves the load so two
+# cameras can coexist and frames stop stalling.
+PROFILE_ATTEMPTS_USB3 = (
     (848, 480, 30),
     (640, 480, 30),
+    (640, 480, 15),
+    (424, 240, 15),
+)
+PROFILE_ATTEMPTS_USB2 = (
     (640, 480, 15),
     (424, 240, 15),
 )
@@ -113,10 +123,21 @@ class RealSenseStream:
             self.clients = max(0, self.clients - 1)
             self.last_active = time.monotonic()
 
+    def _usb_version(self):
+        try:
+            for device in rs.context().devices:
+                if device.get_info(rs.camera_info.serial_number) == self.serial:
+                    return device.get_info(rs.camera_info.usb_type_descriptor)
+        except RuntimeError:
+            pass
+        return "?"
+
     def _start_pipeline(self):
+        attempts = (PROFILE_ATTEMPTS_USB3 if self._usb_version().startswith("3")
+                    else PROFILE_ATTEMPTS_USB2)
         pipeline = rs.pipeline()
         last_error = None
-        for width, height, fps in PROFILE_ATTEMPTS:
+        for width, height, fps in attempts:
             config = rs.config()
             config.enable_device(self.serial)
             config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
@@ -214,6 +235,7 @@ class RealSenseStream:
 
     def frames(self, which):
         last_sent = -1
+        interval = 1.0 / VIEW_FPS if VIEW_FPS > 0 else 0.0
         while True:
             with self.cond:
                 while self.frame_id == last_sent and (self.running or self.starting):
@@ -224,6 +246,9 @@ class RealSenseStream:
                 frame = self.rgb_jpeg if which == "rgb" else self.depth_jpeg
             if frame is not None:
                 yield frame
+                # throttle: on wake the loop above picks the NEWEST frame, so a
+                # viewer sees fresh frames at <= VIEW_FPS instead of a backlog.
+                time.sleep(interval)
 
     def depth_at(self, x_frac, y_frac):
         """Depth in meters at fractional image coords (0..1), median of the
@@ -357,6 +382,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(b"missing ?s=<serial>", "text/plain; charset=utf-8", 400)
             return
         stream = get_stream(serial)
+        # Bound how much video can sit in the kernel's send buffer: with the
+        # default several-hundred-KB buffer a slow wifi client watches seconds-old
+        # frames; ~128KB is a couple of frames at most.
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
+        except OSError:
+            pass
         stream.add_client()
         try:
             if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
