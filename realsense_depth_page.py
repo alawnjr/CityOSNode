@@ -25,6 +25,7 @@ in the blue USB 3 ports. The compressed MJPG webcam (C920) is fine on USB 2.
 """
 import csv
 import datetime as dt
+import fcntl
 import json
 import os
 import socket
@@ -433,6 +434,14 @@ class DepthRecordJob:
                  "-slices", "4", "-threads", "4",
                  str(depth_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 1MB pipes: a whole frame fits, so writes don't block the sampling
+            # loop while the encoders chew (F_SETPIPE_SZ; default is 64KB)
+            for proc in (color_proc, depth_proc):
+                try:
+                    fcntl.fcntl(proc.stdin.fileno(), 1031, 1 << 20)
+                except OSError:
+                    pass
 
             start_time = dt.datetime.now().astimezone()
             mono0 = time.monotonic()
