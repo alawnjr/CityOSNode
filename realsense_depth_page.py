@@ -129,7 +129,7 @@ class RealSenseStream:
 
     def _usb_version(self):
         try:
-            for device in rs.context().devices:
+            for device in _rs_context().devices:
                 if device.get_info(rs.camera_info.serial_number) == self.serial:
                     return device.get_info(rs.camera_info.usb_type_descriptor)
         except RuntimeError:
@@ -287,6 +287,24 @@ class RealSenseStream:
 _STREAMS = {}
 _STREAMS_LOCK = threading.Lock()
 
+# One long-lived SDK context, shared by every enumeration. Creating a fresh
+# rs.context() per request re-probes the whole USB bus (RSUSB backend), which
+# races active pipelines and other enumerations and randomly comes up empty.
+_RS_CTX = {"ctx": None}
+_RS_CTX_LOCK = threading.Lock()
+
+
+def _rs_context():
+    with _RS_CTX_LOCK:
+        if _RS_CTX["ctx"] is None:
+            _RS_CTX["ctx"] = rs.context()
+        return _RS_CTX["ctx"]
+
+
+def _reset_rs_context():
+    with _RS_CTX_LOCK:
+        _RS_CTX["ctx"] = None
+
 
 def get_stream(serial):
     with _STREAMS_LOCK:
@@ -335,7 +353,7 @@ def list_devices():
     if rs is None:
         return devices
     try:
-        ctx = rs.context()
+        ctx = _rs_context()
         for device in ctx.devices:
             entry = {}
             for label, key in (("name", rs.camera_info.name),
@@ -350,7 +368,7 @@ def list_devices():
             entry["status"] = stream.status() if stream else {}
             devices.append(entry)
     except Exception:  # noqa: BLE001 - enumeration is best-effort
-        pass
+        _reset_rs_context()  # rebuild the context on the next call
     _enum_watchdog(devices)
     devices.sort(key=lambda d: d.get("name", ""), reverse=True)
     return devices
