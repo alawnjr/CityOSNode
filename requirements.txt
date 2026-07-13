@@ -15,3 +15,7 @@ adafruit-circuitpython-tcs34725==3.3.28   # color / light
 adafruit-circuitpython-adxl34x==1.12.20   # accelerometer
 adafruit-circuitpython-mlx90393==2.4.2    # magnetometer
 gpiozero==2.0.1                           # GPIO sensor test
+
+# pyrealsense2 (Intel RealSense SDK, for the D455 / realsense_depth_page.py) has
+# no aarch64 wheel — on a Pi it is built from source into this venv by
+# setup_realsense_pi.sh, not pip-installed.

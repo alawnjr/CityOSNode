@@ -183,6 +183,18 @@ The camera is **single-access**, so the page releases its own preview ffmpeg
 before a recording starts and instead relays the recorder's `SMARTROOM_PREVIEW`
 feed, then resumes its own camera capture when the recording ends.
 
+## realsense_depth_page.py — D455 depth/RGB view (port 8001)
+
+A second stdlib web page for the Intel RealSense D455 on `smartroom2` — live RGB
+and colorized depth side by side (depth aligned to color), click any pixel to
+read its distance in meters. Runs with the **venv** python (needs
+`pyrealsense2`, which has no aarch64 wheel — built from source on the Pi by
+`setup_realsense_pi.sh`, ~1–2h compile with the RSUSB backend). The D455 is a
+separate USB device from the node's main webcam, so this page and
+`smartroom_video_page.py` (port 8000) run side by side without conflict. The
+D455 should be in a **blue USB 3 port** (on USB 2 it only reaches reduced
+profiles; the page shows a warning with the negotiated USB speed).
+
 ## `sample_dataset/` is the schema reference
 
 `run_smartroom_capture.py` is a thin wrapper that calls `capture.py` (kept for the
