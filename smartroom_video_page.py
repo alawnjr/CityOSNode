@@ -1112,6 +1112,12 @@ class Handler(BaseHTTPRequestHandler):
 
   <section class="wrap record" id="depth-section" style="display:none">
     <h2>Depth cameras</h2>
+    <div class="record-controls">
+      <button type="button" id="timing-btn" style="cursor:pointer;"
+              title="Measure the clock offset between the two depth cameras: stand where BOTH cameras can see you and wave a hand for the whole 15s">
+        &#9201; Calibrate camera timing (wave at both cameras)</button>
+      <span id="timing-msg" style="font-size:0.85em;opacity:0.9;"></span>
+    </div>
     <div id="depth-cams"></div>
   </section>
 
@@ -1459,6 +1465,32 @@ class Handler(BaseHTTPRequestHandler):
       }}
       refresh();
       setInterval(refresh, 3000);
+
+      // Cross-camera timing calibration: wave a hand visible to BOTH cameras
+      // while it runs; the page reports the measured clock offset when done.
+      var tBtn = document.getElementById('timing-btn');
+      var tMsg = document.getElementById('timing-msg');
+      tBtn.addEventListener('click', function () {{
+        tBtn.disabled = true;
+        tMsg.textContent = 'Starting…';
+        fetch(BASE + '/calibrate/timing?duration=15', {{ method: 'POST' }})
+          .then(function (r) {{ return r.json(); }})
+          .then(function (j) {{
+            if (!j.ok) {{ tMsg.textContent = j.message || 'could not start'; tBtn.disabled = false; return; }}
+            tMsg.textContent = 'Recording 15s — WAVE NOW, visible to both cameras…';
+            var poll = setInterval(function () {{
+              fetch(BASE + '/calibrate/timing/status')
+                .then(function (r) {{ return r.json(); }})
+                .then(function (st) {{
+                  if (st.running) {{ if (st.message) tMsg.textContent = st.message; return; }}
+                  clearInterval(poll);
+                  tBtn.disabled = false;
+                  tMsg.textContent = (st.ok ? '✅ ' : '❌ ') + (st.message || '');
+                }}).catch(function () {{}});
+            }}, 2000);
+          }})
+          .catch(function () {{ tMsg.textContent = 'request failed'; tBtn.disabled = false; }});
+      }});
     }})();
   </script>
 </body>
