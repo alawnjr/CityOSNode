@@ -138,6 +138,7 @@ class RealSenseStream:
         self.error = RS_IMPORT_ERROR
         self.info = {}               # device name/serial/fw/usb + active profile
         self.record_queues = []      # per-recorder frame queues (see _record_one)
+        self.stats = {"recv": 0, "proc": 0, "sensor_gaps": 0}  # frame accounting
 
     def add_client(self, viewer=True):
         with self.cond:
@@ -255,6 +256,7 @@ class RealSenseStream:
                             return
                     frameset = pipeline.wait_for_frames(5000)
                     frameset.keep()
+                    self.stats["recv"] += 1
                     with fs_cond:
                         fs_queue.append(frameset)
                         fs_cond.notify()
@@ -284,6 +286,11 @@ class RealSenseStream:
                 color = frames.get_color_frame()
                 if not depth or not color:
                     continue
+                self.stats["proc"] += 1
+                number = color.get_frame_number()
+                if getattr(self, "_last_fn", None) is not None and number > self._last_fn + 1:
+                    self.stats["sensor_gaps"] += number - self._last_fn - 1
+                self._last_fn = number
                 color_img = np.asanyarray(color.get_data())
                 depth_raw = np.asanyarray(depth.get_data())
                 if self.serial in FLIP_SERIALS:
@@ -402,6 +409,7 @@ class RealSenseStream:
                 "starting": self.starting,
                 "error": self.error,
                 "info": self.info,
+                "stats": dict(self.stats),
             }
 
 
