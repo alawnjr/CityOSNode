@@ -938,8 +938,9 @@ def start_timing_calibration(duration):
         if len(WORKERS) < 2:
             return False, "need two cameras connected"
         TIMING.update(running=True, ok=None,
-                      message="Watching for motion on both cameras — wave a hand "
-                              "somewhere BOTH cameras can see it…")
+                      message="Watching both cameras — toggle the room lights on/off "
+                              "3-4 times (a light change hits every pixel of both "
+                              "cameras at once, no shared view needed)…")
     threading.Thread(target=_run_timing, args=(duration,), daemon=True).start()
     return True, "Timing calibration started."
 
@@ -974,8 +975,8 @@ def _run_timing(duration):
             offset, corr, overlap = _correlate(series[reference], series[other])
             if corr < 0.35:
                 raise RuntimeError(
-                    f"correlation too weak ({corr:.2f}) — the cameras didn't see the "
-                    "same motion; wave a hand visible to BOTH and rerun")
+                    f"correlation too weak ({corr:.2f}) — the cameras didn't see a "
+                    "common change; toggle the room lights on/off a few times and rerun")
             offsets[other] = round(offset, 1)
             corrs[other] = round(corr, 3)
         offsets[reference] = 0.0
@@ -1014,15 +1015,21 @@ def _correlate(series_a, series_b, step_ms=5.0, max_lag_ms=300.0):
         raise RuntimeError("no motion seen — wave a hand visible to both cameras")
     a /= a.std(); b /= b.std()
     n = len(grid)
-    lags = range(-int(max_lag_ms / step_ms), int(max_lag_ms / step_ms) + 1)
-    best_lag, best_corr = 0, -2.0
+    lags = list(range(-int(max_lag_ms / step_ms), int(max_lag_ms / step_ms) + 1))
+    corr = []
     for lag in lags:  # b shifted right (later) by `lag` samples vs a
         if lag >= 0:
-            c = float(np.dot(a[: n - lag], b[lag:]) / (n - lag)) if n - lag > 50 else -2.0
+            corr.append(float(np.dot(a[: n - lag], b[lag:]) / (n - lag)) if n - lag > 50 else -2.0)
         else:
-            c = float(np.dot(a[-lag:], b[: n + lag]) / (n + lag)) if n + lag > 50 else -2.0
-        if c > best_corr:
-            best_corr, best_lag = c, lag
+            corr.append(float(np.dot(a[-lag:], b[: n + lag]) / (n + lag)) if n + lag > 50 else -2.0)
+    i = int(np.argmax(corr))
+    best_lag, best_corr = float(lags[i]), corr[i]
+    # parabolic sub-sample refinement around the peak — a sharp common edge
+    # (lights toggling) supports better than one grid step of precision
+    if 0 < i < len(corr) - 1:
+        denom = corr[i - 1] - 2 * corr[i] + corr[i + 1]
+        if abs(denom) > 1e-9:
+            best_lag += max(-1.0, min(1.0, 0.5 * (corr[i - 1] - corr[i + 1]) / denom))
     return best_lag * step_ms, best_corr, (t1 - t0) / 1000.0
 
 

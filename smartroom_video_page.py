@@ -1114,8 +1114,8 @@ class Handler(BaseHTTPRequestHandler):
     <h2>Depth cameras</h2>
     <div class="record-controls">
       <button type="button" id="timing-btn" style="cursor:pointer;"
-              title="Measure the clock offset between the two depth cameras: stand where BOTH cameras can see you and wave a hand for the whole 15s">
-        &#9201; Calibrate camera timing (wave at both cameras)</button>
+              title="Measure the clock offset between the two depth cameras: toggle the room lights on/off 3-4 times during the 15s — a light change hits both cameras at the same instant">
+        &#9201; Calibrate camera timing (toggle the lights)</button>
       <span id="timing-msg" style="font-size:0.85em;opacity:0.9;"></span>
     </div>
     <div id="depth-cams"></div>
@@ -1477,7 +1477,7 @@ class Handler(BaseHTTPRequestHandler):
           .then(function (r) {{ return r.json(); }})
           .then(function (j) {{
             if (!j.ok) {{ tMsg.textContent = j.message || 'could not start'; tBtn.disabled = false; return; }}
-            tMsg.textContent = 'Recording 15s — WAVE NOW, visible to both cameras…';
+            tMsg.textContent = 'Recording 15s — TOGGLE THE LIGHTS on/off a few times now…';
             var poll = setInterval(function () {{
               fetch(BASE + '/calibrate/timing/status')
                 .then(function (r) {{ return r.json(); }})
