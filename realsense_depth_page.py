@@ -69,6 +69,10 @@ JPEG_QUALITY = 70
 # sent only the newest frame at most this often, so a slow wifi link shows a
 # lower frame rate instead of accumulating seconds of latency.
 VIEW_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_FPS", "30"))
+# The colorize+JPEG work for the live view is the most expensive part of the
+# capture loop — cap how often it runs so 30fps pipelines don't burn the CPU
+# the recorder needs. Purely a preview smoothness knob.
+VIEW_ENCODE_FPS = float(os.environ.get("SMARTROOM_DEPTH_VIEW_ENCODE_FPS", "12"))
 # Comma-separated camera serials whose frames are rotated 180 degrees (for
 # upside-down mounted cameras) — set per node in node.env. The raw depth grid
 # is rotated too, so click-to-measure coordinates stay correct.
@@ -119,8 +123,7 @@ class RealSenseStream:
         self.cond = threading.Condition()
         self.rgb_jpeg = None
         self.depth_jpeg = None
-        self.depth_m = None          # float32 HxW, meters, aligned to color
-        self.depth_z16 = None        # raw uint16 depth (for lossless recording)
+        self.depth_z16 = None        # raw uint16 depth, aligned to color
         self.depth_scale = None      # meters per z16 unit
         self.color_bgr = None        # raw color frame (for extrinsic calibration)
         self.color_intr = None       # factory color intrinsics (rs.intrinsics)
@@ -234,6 +237,7 @@ class RealSenseStream:
             self.last_active = time.monotonic()
 
         try:
+            next_view_encode = 0.0
             while True:
                 with self.cond:
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
@@ -249,11 +253,14 @@ class RealSenseStream:
                 if self.serial in FLIP_SERIALS:
                     color_img = cv2.rotate(color_img, cv2.ROTATE_180)
                     depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
-                # Colorize + JPEG-encode only for actual MJPEG viewers — it's
-                # the expensive part of this loop, and the recorder/measurement
-                # paths work from the raw arrays.
+                # Colorize + JPEG-encode only for actual MJPEG viewers, capped
+                # at VIEW_ENCODE_FPS — it's the expensive part of this loop,
+                # and the recorder/measurement paths work from the raw arrays.
+                now = time.monotonic()
                 with self.cond:
-                    encode_view = self.viewers > 0
+                    encode_view = self.viewers > 0 and now >= next_view_encode
+                if encode_view:
+                    next_view_encode = now + 1.0 / VIEW_ENCODE_FPS
                 rgb_jpeg = depth_jpeg = None
                 if encode_view:
                     depth_vis = np.asanyarray(colorizer.colorize(depth).get_data())
@@ -269,7 +276,6 @@ class RealSenseStream:
                     if rgb_jpeg is not None:
                         self.rgb_jpeg = rgb_jpeg
                         self.depth_jpeg = depth_jpeg
-                    self.depth_m = depth_raw.astype(np.float32) * depth_scale
                     # copies: the arrays are views over the SDK's recycled frame buffers
                     self.depth_z16 = depth_raw.copy()
                     self.color_bgr = color_img.copy()
@@ -318,17 +324,20 @@ class RealSenseStream:
 
     def depth_at(self, x_frac, y_frac):
         """Depth in meters at fractional image coords (0..1), median of the
-        valid readings in a small window (single pixels are often 0/no-data)."""
+        valid readings in a small window (single pixels are often 0/no-data).
+        Computed from the raw z16 on demand — converting whole frames to
+        meters at 30fps was pure waste."""
         with self.cond:
-            depth = self.depth_m
-        if depth is None:
+            depth = self.depth_z16
+            scale = self.depth_scale
+        if depth is None or scale is None:
             return None, None, None
         h, w = depth.shape
         px = min(w - 1, max(0, int(x_frac * w)))
         py = min(h - 1, max(0, int(y_frac * h)))
         window = depth[max(0, py - 2):py + 3, max(0, px - 2):px + 3]
         valid = window[window > 0]
-        meters = float(np.median(valid)) if valid.size else None
+        meters = float(np.median(valid)) * scale if valid.size else None
         return meters, px, py
 
     def status(self):
@@ -603,10 +612,11 @@ def _run_extrinsic(serial):
         while len(samples) < 6 and time.monotonic() < deadline:
             with stream.cond:
                 frame_id = stream.frame_id
-                color, depth, intr = stream.color_bgr, stream.depth_m, stream.color_intr
-            if frame_id != last_id and color is not None and depth is not None:
+                color, z16, intr = stream.color_bgr, stream.depth_z16, stream.color_intr
+                scale = stream.depth_scale
+            if frame_id != last_id and color is not None and z16 is not None:
                 last_id = frame_id
-                samples.append((color, depth))
+                samples.append((color, z16.astype(np.float32) * (scale or 0.001)))
             time.sleep(0.25)
         if intr is None:
             raise RuntimeError("no color intrinsics from the camera")
