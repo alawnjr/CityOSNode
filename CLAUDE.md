@@ -114,11 +114,16 @@ every connected depth camera into the same `streams/` folder — color as
 `depth_scale_m` = meters**, aligned to color), each with a real timestamps
 CSV, merged into `metadata.json`'s `streams{}` with factory intrinsics +
 room-frame extrinsics. Recording runs at the camera's pipeline rate
-(**D455 640x480@30, D435 640x480@15** — `SMARTROOM_DEPTH_PROFILE_D4XX` in
-node.env overrides): depth is captured RAW (to /dev/shm, or the SD card for
-long clips) and FFV1-encoded *after* the recording ends (~1-2x the clip
-length; `/record/status` stays running until done), and both containers are
-timed to the measured rate so playback matches wall clock. If the page is
+(**both cameras 640x480@30** — `SMARTROOM_DEPTH_PROFILE_D4XX` in node.env
+overrides): depth is captured RAW (to /dev/shm, or the SD card for long
+clips) and FFV1-encoded *after* the recording ends (~1-2x the clip length;
+`/record/status` stays running until done), and both containers are timed to
+the measured rate so playback matches wall clock. **Frame sync**: every
+timestamps CSV has a `hw_timestamp_ms` column — librealsense global time
+(sensor mid-exposure mapped to the host clock, ms since epoch) — match
+frames across cameras on it (~1-2ms; the sensors free-run, so pair nearest
+frames, up to ±17ms at 30fps) and use each stream's embedded room-frame
+extrinsics to fuse 3D points into the one tag-1 frame. If the page is
 down or no depth camera is plugged in, recordings are webcam-only as before.
 **On smartroom2 the webcam is EXCLUDED from recordings** (`SMARTROOM_SKIP_WEBCAM=1`
 in node.env): its mjpeg-decode + overlay + encode pipeline cost the D455 its
@@ -216,9 +221,16 @@ from the node's main webcam, so this page and `smartroom_video_page.py` (port
 page's cameras** (its JSON endpoints send CORS headers for that). RealSense
 cameras must be in the **blue USB 3 ports with USB 3 cables** (on USB 2 they
 only reach reduced profiles, and two RealSense cannot share the USB 2 bus; the
-pages show the negotiated USB speed). Gotchas learned the hard way: only ONE
-long-lived `rs.context()` may exist, created before any pipeline (see comments
-in the page); per-serial 180° flips via `SMARTROOM_DEPTH_FLIP` in node.env.
+pages show the negotiated USB speed). **One worker subprocess per camera**
+(multiprocessing spawn): two 30fps pipelines in one Python process starve each
+other on the GIL — the HTTP front end supervises workers over command pipes; a
+watchdog respawns dead workers and exits the page (systemd respawns it) when
+the plugged-camera set changes. Gotchas learned the hard way: enumerate ONCE
+before any worker/pipeline exists (a context probing the bus while another
+process holds the devices enumerates empty); per-serial 180° flips via
+`SMARTROOM_DEPTH_FLIP` in node.env are applied OFF the capture path (ffmpeg /
+view encoder / coordinate transform — in-loop rotation cost the flipped
+camera 5fps).
 
 `realsense_extrinsics.py` — AprilTag extrinsic calibration for a RealSense
 camera using its **factory intrinsics** (no checkerboard needed) plus a
