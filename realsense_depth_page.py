@@ -596,12 +596,21 @@ class CameraWorker:
                                "model": getattr(intr.model, "name", str(intr.model)),
                                "coeffs": list(intr.coeffs), "source": "realsense_factory"}
             extrinsics = _load_depth_extrinsics(self.serial)
+            # measured inter-camera clock offset (calibration/camera_timing.json):
+            # subtract from THIS stream's hw timestamps to align with the reference
+            timing = None
+            try:
+                timing = json.loads((PROJECT_ROOT / "calibration" / "camera_timing.json").read_text())
+            except (OSError, ValueError):
+                pass
+            hw_offset = float((timing or {}).get("offsets_ms", {}).get(self.serial, 0.0))
             common = {"device": f"realsense:{self.serial}", "camera": info.get("name"),
                       "resolution": [width, height],
                       "fps": round(fps_actual, 2), "nominal_fps": fps_nominal,
                       "frame_count": len(times), "start_time": start_time.isoformat(),
                       "hw_timestamp_domain": hw_domain,
-                      "sync": "match frames across cameras on hw_timestamp_ms"}
+                      "hw_clock_offset_ms": hw_offset,
+                      "sync": "match frames across cameras on hw_timestamp_ms - hw_clock_offset_ms"}
             color_entry = {"modality": "video", "path": f"streams/{color_path.name}",
                            "codec": "h264",
                            "timestamps_path": f"streams/{key}_color_timestamps.csv", **common}
@@ -628,6 +637,35 @@ class CameraWorker:
             if raw_path is not None:
                 Path(raw_path).unlink(missing_ok=True)
             self._rec_finish(error=str(exc), key=key)
+        finally:
+            self.remove_client()
+
+    # ---------------------------------------------------- timing samples ---
+    def motion_series(self, duration):
+        """(hw_timestamp_ms, motion_energy) per frame for `duration` seconds —
+        the raw material for cross-camera timing calibration. Motion energy is
+        the mean abs difference between consecutive downscaled gray frames."""
+        self.add_client()
+        try:
+            if not self.wait_first_frame(FIRST_FRAME_TIMEOUT):
+                raise RuntimeError(self.status().get("error") or "camera unavailable")
+            series, prev, last_id = [], None, -1
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline:
+                with self.cond:
+                    if self.frame_id == last_id:
+                        self.cond.wait(timeout=0.25)
+                        if self.frame_id == last_id:
+                            continue
+                    last_id = self.frame_id
+                    bgr, hw = self.color_bgr, self.last_hw_ts
+                if bgr is None or not hw:
+                    continue
+                gray = cv2.cvtColor(cv2.resize(bgr, (160, 120)), cv2.COLOR_BGR2GRAY)
+                if prev is not None:
+                    series.append((hw, float(cv2.absdiff(gray, prev).mean())))
+                prev = gray
+            return series
         finally:
             self.remove_client()
 
@@ -709,6 +747,8 @@ def worker_main(serial, name, usb, conn, view_queue):
                 reply = {"ok": ok, "message": message}
             elif op == "cal_status":
                 reply = worker.cal_status()
+            elif op == "motion":
+                reply = {"ok": True, "series": worker.motion_series(float(msg["duration"]))}
             else:
                 reply = {"ok": False, "error": f"unknown op {op}"}
         except Exception as exc:  # noqa: BLE001 - never kill the cmd loop
@@ -878,6 +918,114 @@ def _watchdog():
             misses = 0
 
 
+# ---------------------------------------------------------------------------
+# Cross-camera timing calibration: both cameras watch the same motion for a
+# few seconds; the lag that maximizes the cross-correlation of their motion-
+# energy series IS the constant offset between their hardware clocks.
+# Stored in calibration/camera_timing.json; recordings embed each stream's
+# hw_clock_offset_ms (subtract it from that stream's hw timestamps to align
+# with the reference camera).
+# ---------------------------------------------------------------------------
+TIMING = {"running": False, "ok": None, "message": ""}
+TIMING_LOCK = threading.Lock()
+TIMING_PATH = PROJECT_ROOT / "calibration" / "camera_timing.json"
+
+
+def start_timing_calibration(duration):
+    with TIMING_LOCK:
+        if TIMING["running"]:
+            return False, "Timing calibration already running."
+        if len(WORKERS) < 2:
+            return False, "need two cameras connected"
+        TIMING.update(running=True, ok=None,
+                      message="Watching for motion on both cameras — wave a hand "
+                              "somewhere BOTH cameras can see it…")
+    threading.Thread(target=_run_timing, args=(duration,), daemon=True).start()
+    return True, "Timing calibration started."
+
+
+def _run_timing(duration):
+    try:
+        results = {}
+        threads = []
+
+        def grab(serial, worker):
+            results[serial] = worker.call("motion", duration=duration, timeout=duration + 20)
+
+        for serial, worker in WORKERS.items():
+            t = threading.Thread(target=grab, args=(serial, worker), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=duration + 25)
+
+        series = {}
+        for serial, reply in results.items():
+            if not (isinstance(reply, dict) and reply.get("ok")):
+                raise RuntimeError(f"{serial}: {(reply or {}).get('error', 'no data')}")
+            if len(reply["series"]) < 30:
+                raise RuntimeError(f"{serial}: too few frames")
+            series[serial] = reply["series"]
+
+        serials = sorted(series)
+        reference = serials[0]
+        offsets, corrs = {}, {}
+        for other in serials[1:]:
+            offset, corr, overlap = _correlate(series[reference], series[other])
+            if corr < 0.35:
+                raise RuntimeError(
+                    f"correlation too weak ({corr:.2f}) — the cameras didn't see the "
+                    "same motion; wave a hand visible to BOTH and rerun")
+            offsets[other] = round(offset, 1)
+            corrs[other] = round(corr, 3)
+        offsets[reference] = 0.0
+
+        TIMING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TIMING_PATH.write_text(json.dumps({
+            "schema_version": "1",
+            "reference": reference,
+            "offsets_ms": offsets,   # subtract from that camera's hw timestamps
+            "peak_correlation": corrs,
+            "duration_s": duration,
+            "measured_at": dt.datetime.now().astimezone().isoformat(),
+        }, indent=2))
+        detail = ", ".join(f"{s}: {offsets[s]:+.1f} ms (r={corrs[s]:.2f})" for s in serials[1:])
+        message = f"clock offsets vs {reference}: {detail} — saved camera_timing.json"
+        with TIMING_LOCK:
+            TIMING.update(running=False, ok=True, message=message)
+    except Exception as exc:  # noqa: BLE001 - reported via status
+        with TIMING_LOCK:
+            TIMING.update(running=False, ok=False, message=str(exc))
+
+
+def _correlate(series_a, series_b, step_ms=5.0, max_lag_ms=300.0):
+    """(offset_ms, peak_correlation, overlap_s): offset > 0 means camera B's
+    hardware clock stamps the same physical event LATER than camera A's."""
+    ta = np.array([p[0] for p in series_a]); ea = np.array([p[1] for p in series_a])
+    tb = np.array([p[0] for p in series_b]); eb = np.array([p[1] for p in series_b])
+    t0, t1 = max(ta[0], tb[0]), min(ta[-1], tb[-1])
+    if t1 - t0 < 3000:
+        raise RuntimeError("cameras overlapped for under 3s — rerun")
+    grid = np.arange(t0, t1, step_ms)
+    a = np.interp(grid, ta, ea)
+    b = np.interp(grid, tb, eb)
+    a -= a.mean(); b -= b.mean()
+    if a.std() < 1e-6 or b.std() < 1e-6:
+        raise RuntimeError("no motion seen — wave a hand visible to both cameras")
+    a /= a.std(); b /= b.std()
+    n = len(grid)
+    lags = range(-int(max_lag_ms / step_ms), int(max_lag_ms / step_ms) + 1)
+    best_lag, best_corr = 0, -2.0
+    for lag in lags:  # b shifted right (later) by `lag` samples vs a
+        if lag >= 0:
+            c = float(np.dot(a[: n - lag], b[lag:]) / (n - lag)) if n - lag > 50 else -2.0
+        else:
+            c = float(np.dot(a[-lag:], b[: n + lag]) / (n + lag)) if n + lag > 50 else -2.0
+        if c > best_corr:
+            best_corr, best_lag = c, lag
+    return best_lag * step_ms, best_corr, (t1 - t0) / 1000.0
+
+
 def record_start_all(target, duration):
     if not WORKERS:
         return False, "no RealSense cameras connected"
@@ -980,6 +1128,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/record/status":
             self.send_json(record_status_all())
             return
+        if parsed.path == "/calibrate/timing/status":
+            with TIMING_LOCK:
+                self.send_json(dict(TIMING))
+            return
         self.send_bytes(b"Not found", "text/plain; charset=utf-8", 404)
 
     def do_POST(self):
@@ -995,6 +1147,14 @@ class Handler(BaseHTTPRequestHandler):
             ok = bool(reply.get("ok"))
             self.send_json({"ok": ok, "message": reply.get("message") or reply.get("error", "")},
                            200 if ok else 409)
+            return
+        if parsed.path == "/calibrate/timing":
+            try:
+                duration = max(5, min(int(float((params.get("duration") or ["12"])[0])), 60))
+            except ValueError:
+                duration = 12
+            ok, message = start_timing_calibration(duration)
+            self.send_json({"ok": ok, "message": message}, 200 if ok else 409)
             return
         if parsed.path == "/record/start":
             out_dir = (params.get("dir") or [""])[0]
