@@ -23,6 +23,7 @@ Bandwidth note: RealSense streams are uncompressed (~35+ MB/s per camera at
 640x480), so two of them cannot share the Pi 4's single USB 2 bus — put them
 in the blue USB 3 ports. The compressed MJPG webcam (C920) is fine on USB 2.
 """
+import collections
 import csv
 import datetime as dt
 import fcntl
@@ -136,6 +137,7 @@ class RealSenseStream:
         self.last_active = 0.0
         self.error = RS_IMPORT_ERROR
         self.info = {}               # device name/serial/fw/usb + active profile
+        self.record_queues = []      # per-recorder frame queues (see _record_one)
 
     def add_client(self, viewer=True):
         with self.cond:
@@ -236,12 +238,47 @@ class RealSenseStream:
             self.last_active = time.monotonic()
 
         threading.Thread(target=self._view_encoder, daemon=True).start()
+
+        # Waiter/processor split: the waiter only receives framesets and queues
+        # them (keep() detaches them from the SDK's recycle pool), so a slow
+        # moment in processing costs LATENCY, never a dropped frame — the
+        # camera's full rate arrives as long as processing keeps up on average.
+        fs_queue = collections.deque(maxlen=4)
+        fs_state = {"stop": False, "error": None}
+        fs_cond = threading.Condition()
+
+        def waiter():
+            try:
+                while True:
+                    with fs_cond:
+                        if fs_state["stop"]:
+                            return
+                    frameset = pipeline.wait_for_frames(5000)
+                    frameset.keep()
+                    with fs_cond:
+                        fs_queue.append(frameset)
+                        fs_cond.notify()
+            except Exception as exc:  # noqa: BLE001 - USB drop etc.
+                with fs_cond:
+                    fs_state["error"] = str(exc)
+                    fs_state["stop"] = True
+                    fs_cond.notify()
+
+        waiter_thread = threading.Thread(target=waiter, daemon=True)
+        waiter_thread.start()
         try:
             while True:
                 with self.cond:
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
                         break
-                frames = pipeline.wait_for_frames(5000)
+                with fs_cond:
+                    if not fs_queue and not fs_state["stop"]:
+                        fs_cond.wait(timeout=0.5)
+                    if fs_state["stop"]:
+                        raise RuntimeError(fs_state["error"] or "capture stopped")
+                    frames = fs_queue.popleft() if fs_queue else None
+                if frames is None:
+                    continue
                 frames = align.process(frames)
                 depth = frames.get_depth_frame()
                 color = frames.get_color_frame()
@@ -252,20 +289,26 @@ class RealSenseStream:
                 if self.serial in FLIP_SERIALS:
                     color_img = cv2.rotate(color_img, cv2.ROTATE_180)
                     depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
+                stamp = time.monotonic()
                 with self.cond:
                     # copies: the arrays are views over the SDK's recycled frame buffers
                     self.depth_z16 = depth_raw.copy()
                     self.color_bgr = color_img.copy()
                     self.frame_id += 1
+                    for rq in self.record_queues:
+                        rq.append((self.color_bgr, self.depth_z16, stamp))
                     self.cond.notify_all()
         except Exception as exc:  # noqa: BLE001 - USB drop etc.
             with self.cond:
                 self.error = f"RealSense stream stopped: {exc}"
         finally:
+            with fs_cond:
+                fs_state["stop"] = True
             try:
                 pipeline.stop()
             except Exception:
                 pass
+            waiter_thread.join(timeout=6)
             with self.cond:
                 self.running = False
                 self.cond.notify_all()
@@ -484,22 +527,36 @@ class DepthRecordJob:
             except OSError:
                 pass
 
+            # Frames arrive via a queue the capture thread fills (bounded, so a
+            # stalled recorder degrades instead of leaking memory) — every
+            # captured frame gets recorded, not just the ones we win a race for.
+            frame_queue = collections.deque(maxlen=90)
             start_time = dt.datetime.now().astimezone()
             mono0 = time.monotonic()
             deadline = mono0 + duration
-            last_id, times = -1, []
-            while time.monotonic() < deadline:
-                with stream.cond:
-                    if stream.frame_id == last_id:
-                        stream.cond.wait(timeout=0.5)
-                    if stream.frame_id == last_id or stream.depth_z16 is None:
+            with stream.cond:
+                stream.record_queues.append(frame_queue)
+            times = []
+            try:
+                while True:
+                    with stream.cond:
+                        if not frame_queue:
+                            if time.monotonic() >= deadline:
+                                break
+                            stream.cond.wait(timeout=0.25)
+                        item = frame_queue.popleft() if frame_queue else None
+                    if item is None:
                         continue
-                    last_id = stream.frame_id
-                    bgr, z16 = stream.color_bgr, stream.depth_z16
-                t_rel = time.monotonic() - mono0
-                color_proc.stdin.write(bgr.tobytes())
-                raw_file.write(z16.tobytes())
-                times.append(t_rel)
+                    bgr, z16, stamp = item
+                    if stamp >= deadline:
+                        break
+                    color_proc.stdin.write(bgr.tobytes())
+                    raw_file.write(z16.tobytes())
+                    times.append(stamp - mono0)
+            finally:
+                with stream.cond:
+                    if frame_queue in stream.record_queues:
+                        stream.record_queues.remove(frame_queue)
 
             raw_file.close()
             color_proc.stdin.close()
