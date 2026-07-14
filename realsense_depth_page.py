@@ -147,6 +147,7 @@ class CameraWorker:
         self.serial = serial
         self.name = name
         self.usb = usb
+        self.flip = serial in FLIP_SERIALS
         self.view_queue = view_queue
         self.cond = threading.Condition()
         self.depth_z16 = None        # raw uint16 depth, aligned to color
@@ -335,9 +336,10 @@ class CameraWorker:
                 self._last_fn = number
                 color_img = np.asanyarray(color.get_data())
                 depth_raw = np.asanyarray(depth.get_data())
-                if self.serial in FLIP_SERIALS:
-                    color_img = cv2.rotate(color_img, cv2.ROTATE_180)
-                    depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
+                # NOTE: frames are stored UNROTATED even for flipped cameras —
+                # rotating here costs the 30fps budget. The flip happens at the
+                # consumers: view encoder (12fps), ffmpeg (recordings),
+                # depth_at (coordinate transform), calibration (6 frames).
                 stamp = time.monotonic()
                 with self.cond:
                     # copies: the arrays are views over the SDK's recycled frame buffers
@@ -381,6 +383,9 @@ class CameraWorker:
                 bgr, z16, scale = self.color_bgr, self.depth_z16, self.depth_scale
             if bgr is None or z16 is None:
                 continue
+            if self.flip:  # flipped camera: rotate at view rate, not capture rate
+                bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                z16 = cv2.rotate(z16, cv2.ROTATE_180)
             # colorized depth from the raw z16, fixed 0-6m range. All-OpenCV
             # ops (they release the GIL); near=red, far=blue.
             d8 = cv2.convertScaleAbs(z16, alpha=255.0 * (scale or 0.001) / 6.0)
@@ -409,6 +414,8 @@ class CameraWorker:
             return True
 
     def depth_at(self, x_frac, y_frac):
+        if self.flip:  # viewers see the rotated image — flip the query back
+            x_frac, y_frac = 1.0 - x_frac, 1.0 - y_frac
         with self.cond:
             depth = self.depth_z16
             scale = self.depth_scale
@@ -482,11 +489,14 @@ class CameraWorker:
             raw_path = raw_dir / f".{key}_depth_{os.getpid()}.raw"
             raw_file = raw_path.open("wb", buffering=1 << 20)
 
+            # flipped cameras: frames arrive unrotated (capture-loop budget) —
+            # ffmpeg applies the 180° rotation, off the worker's GIL
+            flip_args = ["-vf", "hflip,vflip"] if self.flip else []
             color_path = out_dir / f"{key}_color.mp4"
             color_proc = subprocess.Popen(
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-                 "-r", str(fps_nominal), "-i", "pipe:0",
+                 "-r", str(fps_nominal), "-i", "pipe:0", *flip_args,
                  # Pi 4 hardware encoder — near-zero CPU
                  "-c:v", "h264_v4l2m2m", "-b:v", "2M", "-pix_fmt", "yuv420p",
                  str(color_path)],
@@ -518,8 +528,9 @@ class CameraWorker:
                     bgr, z16, stamp, hw_ts = item
                     if stamp >= deadline:
                         break
-                    color_proc.stdin.write(bgr.tobytes())
-                    raw_file.write(z16.tobytes())
+                    # numpy arrays go straight to the pipes (buffer protocol)
+                    color_proc.stdin.write(bgr)
+                    raw_file.write(z16)
                     times.append(stamp - mono0)
                     hw_times.append(hw_ts)
             finally:
@@ -549,7 +560,7 @@ class CameraWorker:
             subprocess.run(
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
-                 "-r", f"{fps_actual:.4f}", "-i", str(raw_path),
+                 "-r", f"{fps_actual:.4f}", "-i", str(raw_path), *flip_args,
                  # golomb-rice coder + slices: ~2x faster than the default
                  # range coder on the Pi, still lossless
                  "-c:v", "ffv1", "-level", "3", "-coder", "0", "-context", "0",
@@ -648,6 +659,9 @@ class CameraWorker:
                     scale = self.depth_scale
                 if frame_id != last_id and color is not None and z16 is not None:
                     last_id = frame_id
+                    if self.flip:  # calibration must match the recorded (flipped) view
+                        color = cv2.rotate(color, cv2.ROTATE_180)
+                        z16 = cv2.rotate(z16, cv2.ROTATE_180)
                     samples.append((color, z16.astype(np.float32) * (scale or 0.001)))
                 time.sleep(0.25)
             if intr is None:
