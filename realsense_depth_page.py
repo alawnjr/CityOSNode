@@ -194,6 +194,16 @@ class RealSenseStream:
 
         device = profile.get_device()
         depth_scale = device.first_depth_sensor().get_depth_scale()
+        # Auto-exposure PRIORITY lets the color sensor stretch exposure beyond
+        # the frame interval in dim light, halving/thirding the delivered fps
+        # (and the whole synced frameset with it). Disable it: constant fps,
+        # auto-exposure adapts within the frame budget instead.
+        for sensor in device.query_sensors():
+            try:
+                if sensor.supports(rs.option.auto_exposure_priority):
+                    sensor.set_option(rs.option.auto_exposure_priority, 0)
+            except RuntimeError:
+                pass
         info = {}
         for label, key in (("name", rs.camera_info.name),
                            ("serial", rs.camera_info.serial_number),
