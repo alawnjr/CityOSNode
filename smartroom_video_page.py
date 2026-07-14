@@ -90,6 +90,10 @@ def _detect_camera_size(device, cap_width=640):
 
 CAMERA_DEVICE = _detect_camera()
 CAMERA_SIZE = _detect_camera_size(CAMERA_DEVICE)
+# SMARTROOM_SKIP_WEBCAM (node.env): recordings are depth-cameras-only, so the
+# webcam never needs to be handed over to the recorder — the live view keeps
+# running during recordings instead of swapping to the preview jpg.
+WEBCAM_RECORDED = not os.environ.get("SMARTROOM_SKIP_WEBCAM")
 STREAM_BOUNDARY = "frame"
 IDLE_TIMEOUT = 5.0  # release the camera this many seconds after the last viewer leaves
 FIRST_FRAME_TIMEOUT = 4.0
@@ -371,16 +375,17 @@ class Recorder:
                 return False, "A recording is already in progress."
             if not RECORD_SCRIPT.exists():
                 return False, "Recorder script not found on the Pi."
-        # Free the camera from the live stream so the recorder can open it. The
-        # recorder writes preview frames to PREVIEW_PATH, which we serve directly.
-        CAMERA.shutdown_for_recording()
-        try:
-            os.unlink(PREVIEW_PATH)
-        except OSError:
-            pass
-        time.sleep(0.8)  # let the device free up before the recorder opens it
         env = dict(os.environ)
-        env["SMARTROOM_PREVIEW"] = PREVIEW_PATH  # capture.py writes the live frame here
+        if WEBCAM_RECORDED:
+            # Free the camera from the live stream so the recorder can open it.
+            # The recorder writes preview frames to PREVIEW_PATH, served directly.
+            CAMERA.shutdown_for_recording()
+            try:
+                os.unlink(PREVIEW_PATH)
+            except OSError:
+                pass
+            time.sleep(0.8)  # let the device free up before the recorder opens it
+            env["SMARTROOM_PREVIEW"] = PREVIEW_PATH  # capture.py writes the live frame here
         try:
             process = subprocess.Popen(
                 ["/bin/sh", str(RECORD_SCRIPT), str(duration)],
@@ -1270,6 +1275,7 @@ class Handler(BaseHTTPRequestHandler):
       var previewStage = document.getElementById('rec-preview-stage');
       var previewImg = document.getElementById('rec-preview');
       var tick = null, poll = null, refresh = null, startMs = 0, duration = 0, cancelling = false;
+      var webcamRecorded = {json.dumps(WEBCAM_RECORDED)};
 
       function fmt(s) {{
         s = Math.max(0, Math.round(s));
@@ -1329,13 +1335,16 @@ class Handler(BaseHTTPRequestHandler):
           render();
           tick = setInterval(render, 250);
           poll = setInterval(checkStatus, 1500);
-          // the live MJPEG view can't run while recording (camera is busy), so
-          // hide it and show the recorder's preview frame, refreshed a few times/sec
-          if (liveSection) {{ liveSection.style.display = 'none'; }}
-          previewStage.style.display = '';
-          refresh = setInterval(function () {{
-            previewImg.src = '/preview.jpg?t=' + Date.now();
-          }}, 300);
+          // when the webcam is being recorded its live MJPEG view can't run
+          // (camera busy) — swap to the recorder's preview frame. With
+          // depth-only recordings the live view just keeps running.
+          if (webcamRecorded) {{
+            if (liveSection) {{ liveSection.style.display = 'none'; }}
+            previewStage.style.display = '';
+            refresh = setInterval(function () {{
+              previewImg.src = '/preview.jpg?t=' + Date.now();
+            }}, 300);
+          }}
         }}).catch(function () {{ finish('Could not start recording.'); }});
       }}
 

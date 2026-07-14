@@ -119,7 +119,12 @@ node.env overrides): depth is captured RAW (to /dev/shm, or the SD card for
 long clips) and FFV1-encoded *after* the recording ends (~1-2x the clip
 length; `/record/status` stays running until done), and both containers are
 timed to the measured rate so playback matches wall clock. If the page is
-down or no depth camera is plugged in, recordings are webcam-only as before. **The timestamps CSV is real, not
+down or no depth camera is plugged in, recordings are webcam-only as before.
+**On smartroom2 the webcam is EXCLUDED from recordings** (`SMARTROOM_SKIP_WEBCAM=1`
+in node.env): its mjpeg-decode + overlay + encode pipeline cost the D455 its
+30fps, so recordings are depth-cameras-only (`camera_d455_color.mp4` is the RGB
+record; no `camera_main`) — the C920 still serves the live view. Unset the flag
+to bring the webcam back into recordings. **The timestamps CSV is real, not
 synthetic**: after recording, `probe_frame_times()` ffprobes the finished mp4 for
 each frame's actual presentation time (the USB cams are variable-rate, so the
 nominal-fps grid would be wrong), one CSV row per actual encoded frame;

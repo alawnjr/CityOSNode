@@ -404,6 +404,8 @@ def write_camera_timestamps(path, mp4_path, fps):
 
 
 def write_metadata(rec_dir, start_time, end_time, frame_count, extra_streams=None):
+    """frame_count None means the webcam was skipped (SMARTROOM_SKIP_WEBCAM) —
+    the recording then only carries the depth cameras' streams."""
     metadata = {
         "recording_id": rec_dir.name,
         "node": socket.gethostname(),  # which Pi recorded this (smartroom1/smartroom2/...)
@@ -412,27 +414,27 @@ def write_metadata(rec_dir, start_time, end_time, frame_count, extra_streams=Non
         "end_time": end_time.isoformat(),
         "duration_seconds": DURATION_SECONDS,
         "schema_version": "0.1",
-        "streams": {
-            "camera_main": {
-                "modality": "video",
-                "path": "streams/camera_main.mp4",
-                "codec": "h264",
-                "device": CAMERA,
-                "resolution": [CAMERA_WIDTH, CAMERA_HEIGHT],
-                "fps": CAMERA_FPS,
-                "frame_count": frame_count,
-                "timestamps_path": "streams/camera_main_timestamps.csv",
-            },
-        },
+        "streams": {},
     }
-    # Intrinsics from calibrate_camera.py, when this camera has been calibrated.
-    # Videos stay raw — downstream analysis uses these to undistort as needed.
-    calibration = load_calibration()
-    if calibration is not None:
-        metadata["streams"]["camera_main"]["calibration"] = calibration
-    extrinsics = load_extrinsics()
-    if extrinsics is not None:
-        metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
+    if frame_count is not None:
+        metadata["streams"]["camera_main"] = {
+            "modality": "video",
+            "path": "streams/camera_main.mp4",
+            "codec": "h264",
+            "device": CAMERA,
+            "resolution": [CAMERA_WIDTH, CAMERA_HEIGHT],
+            "fps": CAMERA_FPS,
+            "frame_count": frame_count,
+            "timestamps_path": "streams/camera_main_timestamps.csv",
+        }
+        # Intrinsics from calibrate_camera.py, when this camera has been
+        # calibrated. Videos stay raw — downstream undistorts as needed.
+        calibration = load_calibration()
+        if calibration is not None:
+            metadata["streams"]["camera_main"]["calibration"] = calibration
+        extrinsics = load_extrinsics()
+        if extrinsics is not None:
+            metadata["streams"]["camera_main"]["extrinsics"] = extrinsics
     # Depth camera streams recorded by the RealSense page (color + raw depth).
     if extra_streams:
         metadata["streams"].update(extra_streams)
@@ -454,15 +456,29 @@ def main():
 
     rec_dir = make_recording_dir()
     streams = rec_dir / "streams"
-    print(f"Recording {DURATION_SECONDS}s from {CAMERA} -> {rec_dir}", file=sys.stderr)
+    # SMARTROOM_SKIP_WEBCAM (node.env): depth-cameras-only recordings — the
+    # webcam's mjpeg-decode + overlay + encode pipeline costs the D455 its
+    # 30fps, and the D455's color stream stands in as the RGB record.
+    skip_webcam = bool(os.environ.get("SMARTROOM_SKIP_WEBCAM"))
+    source = "depth cameras only" if skip_webcam else CAMERA
+    print(f"Recording {DURATION_SECONDS}s from {source} -> {rec_dir}", file=sys.stderr)
 
     mp4_path = streams / "camera_main.mp4"
     depth_started = start_depth_recording(rec_dir, DURATION_SECONDS)
+    if skip_webcam and not depth_started:
+        print("ERROR: webcam recording is disabled and no depth camera is recording.",
+              file=sys.stderr)
+        sys.exit(1)
     start_time = datetime.now().astimezone()
-    record_camera(mp4_path)  # blocks for DURATION_SECONDS
+    frame_count = None
+    if skip_webcam:
+        time.sleep(DURATION_SECONDS)  # span the recording window (depth runs async)
+    else:
+        record_camera(mp4_path)  # blocks for DURATION_SECONDS
     end_time = datetime.now().astimezone()
 
-    frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", mp4_path, CAMERA_FPS)
+    if not skip_webcam:
+        frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", mp4_path, CAMERA_FPS)
     # depth is captured raw and FFV1-encoded after the recording ends — allow
     # roughly another 1-2x the clip length for that encode before giving up
     extra_streams = collect_depth_streams(timeout=120 + DURATION_SECONDS * 4) if depth_started else None
