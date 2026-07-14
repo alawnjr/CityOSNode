@@ -497,8 +497,12 @@ class CameraWorker:
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
                  "-r", str(fps_nominal), "-i", "pipe:0", *flip_args,
-                 # Pi 4 hardware encoder — near-zero CPU
-                 "-c:v", "h264_v4l2m2m", "-b:v", "2M", "-pix_fmt", "yuv420p",
+                 # Pi 4 hardware encoder — near-zero CPU. ALL-INTRA (-g 1):
+                 # the dashboard's synced player steps frames by seeking, and
+                 # long GOPs make seek decode cost large and asymmetric across
+                 # cameras (visible as one camera lagging). Higher bitrate
+                 # compensates for intra-only coding.
+                 "-c:v", "h264_v4l2m2m", "-g", "1", "-b:v", "4M", "-pix_fmt", "yuv420p",
                  str(color_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:  # 1MB pipe so a whole frame never blocks the sampling loop
