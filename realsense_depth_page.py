@@ -31,8 +31,13 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
+
+# Frame threads block on the GIL behind other threads for multiples of the
+# switch interval; the default 5ms costs the D455's 33ms frame budget fast.
+sys.setswitchinterval(0.001)
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -244,7 +249,7 @@ class RealSenseStream:
         # them (keep() detaches them from the SDK's recycle pool), so a slow
         # moment in processing costs LATENCY, never a dropped frame — the
         # camera's full rate arrives as long as processing keeps up on average.
-        fs_queue = collections.deque(maxlen=4)
+        fs_queue = collections.deque(maxlen=8)
         fs_state = {"stop": False, "error": None}
         fs_cond = threading.Condition()
 
