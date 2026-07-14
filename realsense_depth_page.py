@@ -287,18 +287,13 @@ class RealSenseStream:
                 bgr, z16, scale = self.color_bgr, self.depth_z16, self.depth_scale
             if bgr is None or z16 is None:
                 continue
-            # colorized depth from the raw z16: percentile-scaled JET, like the
-            # SDK's colorizer (which needs the live frame object we don't keep)
-            meters = z16.astype(np.float32) * (scale or 0.001)
-            valid = meters > 0
-            if valid.any():
-                lo = float(np.percentile(meters[valid], 5))
-                hi = max(float(np.percentile(meters[valid], 95)), lo + 0.1)
-            else:
-                lo, hi = 0.0, 1.0
-            d8 = np.clip((meters - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-            vis = cv2.applyColorMap(255 - d8, cv2.COLORMAP_JET)
-            vis[~valid] = 0
+            # colorized depth from the raw z16, fixed 0-6m range. All-OpenCV
+            # ops (they release the GIL — numpy math here starved the capture
+            # threads); near=red, far=blue like the SDK's colorizer.
+            max_m = 6.0
+            d8 = cv2.convertScaleAbs(z16, alpha=255.0 * (scale or 0.001) / max_m)
+            vis = cv2.applyColorMap(cv2.subtract(255, d8), cv2.COLORMAP_JET)
+            vis[z16 == 0] = 0
             ok_rgb, rgb_buf = cv2.imencode(".jpg", bgr, encode_params)
             ok_depth, depth_buf = cv2.imencode(".jpg", vis, encode_params)
             if ok_rgb and ok_depth:
