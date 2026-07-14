@@ -128,6 +128,7 @@ class RealSenseStream:
         self.color_bgr = None        # raw color frame (for extrinsic calibration)
         self.color_intr = None       # factory color intrinsics (rs.intrinsics)
         self.frame_id = 0
+        self.view_id = 0     # bumps when fresh viewer JPEGs land (encoder thread)
         self.clients = 0     # anything holding the pipeline open (viewers, recorder, calibration)
         self.viewers = 0     # MJPEG viewers only — gates the colorize/JPEG-encode work
         self.running = False
@@ -219,8 +220,6 @@ class RealSenseStream:
         info["profile"] = f"{width}x{height}@{fps}"
 
         align = rs.align(rs.stream.color)
-        colorizer = rs.colorizer()
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
         try:
             color_intr = (profile.get_stream(rs.stream.color)
                           .as_video_stream_profile().get_intrinsics())
@@ -236,8 +235,8 @@ class RealSenseStream:
             self.depth_scale = depth_scale
             self.last_active = time.monotonic()
 
+        threading.Thread(target=self._view_encoder, daemon=True).start()
         try:
-            next_view_encode = 0.0
             while True:
                 with self.cond:
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
@@ -253,29 +252,7 @@ class RealSenseStream:
                 if self.serial in FLIP_SERIALS:
                     color_img = cv2.rotate(color_img, cv2.ROTATE_180)
                     depth_raw = cv2.rotate(depth_raw, cv2.ROTATE_180)
-                # Colorize + JPEG-encode only for actual MJPEG viewers, capped
-                # at VIEW_ENCODE_FPS — it's the expensive part of this loop,
-                # and the recorder/measurement paths work from the raw arrays.
-                now = time.monotonic()
                 with self.cond:
-                    encode_view = self.viewers > 0 and now >= next_view_encode
-                if encode_view:
-                    next_view_encode = now + 1.0 / VIEW_ENCODE_FPS
-                rgb_jpeg = depth_jpeg = None
-                if encode_view:
-                    depth_vis = np.asanyarray(colorizer.colorize(depth).get_data())
-                    if self.serial in FLIP_SERIALS:
-                        depth_vis = cv2.rotate(depth_vis, cv2.ROTATE_180)
-                    ok_rgb, rgb_buf = cv2.imencode(".jpg", color_img, encode_params)
-                    # the colorizer outputs RGB; cv2 encodes BGR
-                    ok_depth, depth_buf = cv2.imencode(
-                        ".jpg", cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR), encode_params)
-                    if ok_rgb and ok_depth:
-                        rgb_jpeg, depth_jpeg = rgb_buf.tobytes(), depth_buf.tobytes()
-                with self.cond:
-                    if rgb_jpeg is not None:
-                        self.rgb_jpeg = rgb_jpeg
-                        self.depth_jpeg = depth_jpeg
                     # copies: the arrays are views over the SDK's recycled frame buffers
                     self.depth_z16 = depth_raw.copy()
                     self.color_bgr = color_img.copy()
@@ -293,10 +270,50 @@ class RealSenseStream:
                 self.running = False
                 self.cond.notify_all()
 
-    def wait_first_frame(self, timeout):
+    def _view_encoder(self):
+        """Colorize + JPEG-encode for MJPEG viewers, decoupled from the capture
+        loop so a slow encode never costs the recorder a frame. Runs at most
+        VIEW_ENCODE_FPS; exits when the pipeline stops."""
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        interval = 1.0 / VIEW_ENCODE_FPS if VIEW_ENCODE_FPS > 0 else 0.0
+        last_id = -1
+        while True:
+            with self.cond:
+                while (self.frame_id == last_id or self.viewers == 0) and self.running:
+                    self.cond.wait(timeout=1.0)
+                if not (self.running or self.starting):
+                    return
+                last_id = self.frame_id
+                bgr, z16, scale = self.color_bgr, self.depth_z16, self.depth_scale
+            if bgr is None or z16 is None:
+                continue
+            # colorized depth from the raw z16: percentile-scaled JET, like the
+            # SDK's colorizer (which needs the live frame object we don't keep)
+            meters = z16.astype(np.float32) * (scale or 0.001)
+            valid = meters > 0
+            if valid.any():
+                lo = float(np.percentile(meters[valid], 5))
+                hi = max(float(np.percentile(meters[valid], 95)), lo + 0.1)
+            else:
+                lo, hi = 0.0, 1.0
+            d8 = np.clip((meters - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+            vis = cv2.applyColorMap(255 - d8, cv2.COLORMAP_JET)
+            vis[~valid] = 0
+            ok_rgb, rgb_buf = cv2.imencode(".jpg", bgr, encode_params)
+            ok_depth, depth_buf = cv2.imencode(".jpg", vis, encode_params)
+            if ok_rgb and ok_depth:
+                with self.cond:
+                    self.rgb_jpeg = rgb_buf.tobytes()
+                    self.depth_jpeg = depth_buf.tobytes()
+                    self.view_id += 1
+                    self.cond.notify_all()
+            time.sleep(interval)
+
+    def wait_first_frame(self, timeout, view=False):
+        """Wait for the first captured frame (view=True: first viewer JPEG)."""
         end = time.monotonic() + timeout
         with self.cond:
-            while self.frame_id == 0:
+            while (self.view_id if view else self.frame_id) == 0:
                 if not (self.running or self.starting):
                     return False
                 remaining = end - time.monotonic()
@@ -310,11 +327,11 @@ class RealSenseStream:
         interval = 1.0 / VIEW_FPS if VIEW_FPS > 0 else 0.0
         while True:
             with self.cond:
-                while self.frame_id == last_sent and (self.running or self.starting):
+                while self.view_id == last_sent and (self.running or self.starting):
                     self.cond.wait(timeout=2.0)
-                if self.frame_id == last_sent and not (self.running or self.starting):
+                if self.view_id == last_sent and not (self.running or self.starting):
                     return
-                last_sent = self.frame_id
+                last_sent = self.view_id
                 frame = self.rgb_jpeg if which == "rgb" else self.depth_jpeg
             if frame is not None:
                 yield frame
@@ -850,7 +867,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         stream.add_client()
         try:
-            if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
+            if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT, view=True):
                 message = stream.status().get("error") or "RealSense camera unavailable."
                 self.send_bytes(message.encode("utf-8"), "text/plain; charset=utf-8", 503)
                 return
