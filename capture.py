@@ -463,7 +463,9 @@ def main():
     end_time = datetime.now().astimezone()
 
     frame_count = write_camera_timestamps(streams / "camera_main_timestamps.csv", mp4_path, CAMERA_FPS)
-    extra_streams = collect_depth_streams() if depth_started else None
+    # depth is captured raw and FFV1-encoded after the recording ends — allow
+    # roughly another 1-2x the clip length for that encode before giving up
+    extra_streams = collect_depth_streams(timeout=120 + DURATION_SECONDS * 4) if depth_started else None
     write_metadata(rec_dir, start_time, end_time, frame_count, extra_streams)
     print(f"Done -> {rec_dir}", file=sys.stderr)
 

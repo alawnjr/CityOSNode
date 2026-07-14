@@ -84,20 +84,28 @@ except ImportError as exc:  # pragma: no cover - depends on node state
     rs = None
     RS_IMPORT_ERROR = str(exc)
 
-# Depth and color at the same resolution so the aligned panes map 1:1, tried in
-# order. On USB 2 start at 15fps: the whole USB 2 bus is ~40 MB/s and a single
-# 640x480@30 depth+color pair nearly fills it — 15fps halves the load so two
-# cameras can coexist and frames stop stalling.
-PROFILE_ATTEMPTS_USB3 = (
-    (848, 480, 30),
-    (640, 480, 30),
-    (640, 480, 15),
-    (424, 240, 15),
-)
-PROFILE_ATTEMPTS_USB2 = (
-    (640, 480, 15),
-    (424, 240, 15),
-)
+# Depth and color at the same resolution so the aligned panes map 1:1.
+# Per-model capture profiles (the recording runs at the pipeline rate): the
+# D455 is the primary depth camera (30fps), the D435 the secondary (15fps) —
+# 640x480 keeps two-camera capture + post-encode within the Pi 4's budget.
+# Override per model with e.g. SMARTROOM_DEPTH_PROFILE_D455=848x480@30 in
+# node.env. On USB 2 the low fallbacks apply: the whole USB 2 bus is ~40 MB/s
+# and one 640x480@30 depth+color pair nearly fills it.
+FALLBACK_ATTEMPTS = ((640, 480, 30), (640, 480, 15), (424, 240, 15))
+PROFILE_ATTEMPTS_USB2 = ((640, 480, 15), (424, 240, 15))
+_MODEL_DEFAULTS = {"d455": "640x480@30", "d435": "640x480@15"}
+
+
+def model_profile(model):
+    """(w, h, fps) for a camera model like 'd455', from env or defaults."""
+    spec = os.environ.get(f"SMARTROOM_DEPTH_PROFILE_{model.upper()}",
+                          _MODEL_DEFAULTS.get(model, "640x480@30"))
+    try:
+        size, fps = spec.lower().split("@")
+        width, height = size.split("x")
+        return int(width), int(height), int(fps)
+    except ValueError:
+        return 640, 480, 30
 
 
 class RealSenseStream:
@@ -142,21 +150,24 @@ class RealSenseStream:
                 self.viewers = max(0, self.viewers - 1)
             self.last_active = time.monotonic()
 
-    def _usb_version(self):
+    def _device_info(self, key):
         try:
             for device in _rs_context().devices:
                 if device.get_info(rs.camera_info.serial_number) == self.serial:
-                    return device.get_info(rs.camera_info.usb_type_descriptor)
+                    return device.get_info(key)
         except RuntimeError:
             pass
         return "?"
 
     def _start_pipeline(self):
-        # prefer 15fps only when we positively know we're on USB 2; if the
-        # version is unknown, the full list already falls through to the USB 2
-        # profiles when the higher ones are rejected
-        attempts = (PROFILE_ATTEMPTS_USB2 if self._usb_version().startswith("2")
-                    else PROFILE_ATTEMPTS_USB3)
+        # prefer the model's configured profile; low fallbacks cover USB 2 and
+        # rejected modes (on known USB 2 skip straight to them)
+        if self._device_info(rs.camera_info.usb_type_descriptor).startswith("2"):
+            attempts = PROFILE_ATTEMPTS_USB2
+        else:
+            model = self._device_info(rs.camera_info.name).split()[-1].lower()
+            preferred = model_profile(model)
+            attempts = (preferred,) + tuple(a for a in FALLBACK_ATTEMPTS if a != preferred)
         pipeline = rs.pipeline()
         last_error = None
         for width, height, fps in attempts:
@@ -213,20 +224,11 @@ class RealSenseStream:
             self.last_active = time.monotonic()
 
         try:
-            drop_toggle = False
             while True:
                 with self.cond:
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
                         break
-                    recording = (self.clients - self.viewers) > 0
                 frames = pipeline.wait_for_frames(5000)
-                # While a recorder holds the stream, process every 2nd frame:
-                # align + copies at 30fps starve the recorder's encoder feeds
-                # (the recording targets RECORD_FPS=15 anyway).
-                if recording:
-                    drop_toggle = not drop_toggle
-                    if drop_toggle:
-                        continue
                 frames = align.process(frames)
                 depth = frames.get_depth_frame()
                 color = frames.get_color_frame()
@@ -333,9 +335,12 @@ class RealSenseStream:
 _STREAMS = {}
 _STREAMS_LOCK = threading.Lock()
 
-RECORD_FPS = float(os.environ.get("SMARTROOM_DEPTH_RECORD_FPS", "15"))
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
+# raw depth buffers smaller than this go to /dev/shm (RAM); bigger ones go to
+# the SD card next to the recording (the card sustains ~33 MB/s, enough for
+# both cameras' raw z16 at the configured rates)
+SHM_RAW_LIMIT = 1_200_000_000
 
 
 def _load_depth_extrinsics(serial):
@@ -353,15 +358,20 @@ def _load_depth_extrinsics(serial):
 
 class DepthRecordJob:
     """Records every connected RealSense camera into a recording's streams/
-    folder: color as H.264 mp4, depth as LOSSLESS 16-bit FFV1 mkv (raw z16
-    units — multiply by depth_scale_m for meters), both at RECORD_FPS with a
-    real per-frame timestamps CSV each. Runs on the live streams in-process,
-    so the web preview keeps working while recording. capture.py triggers this
-    via POST /record/start and merges the returned stream metadata."""
+    folder at the camera's full pipeline rate: color as H.264 mp4 (Pi hardware
+    encoder, live) and depth as LOSSLESS 16-bit FFV1 mkv (raw z16 units —
+    multiply by depth_scale_m for meters), each with a real per-frame
+    timestamps CSV. Depth is captured RAW (plain writes keep up where live
+    FFV1 could not) and encoded after the recording ends — /record/status
+    stays running during that encode, roughly another 1-2x the clip length.
+    Both containers are timed to the MEASURED frame rate, so playback duration
+    matches wall-clock. capture.py triggers this via POST /record/start and
+    merges the returned stream metadata."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.running = False
+        self.encoding = 0
         self.pending = 0
         self.streams = {}   # metadata stream entries, filled as cameras finish
         self.errors = {}
@@ -390,7 +400,8 @@ class DepthRecordJob:
 
     def status(self):
         with self.lock:
-            return {"running": self.running, "streams": self.streams, "errors": self.errors}
+            return {"running": self.running, "encoding": self.encoding > 0,
+                    "streams": self.streams, "errors": self.errors}
 
     def _finish_one(self, key, error=None):
         with self.lock:
@@ -404,7 +415,8 @@ class DepthRecordJob:
         key = f"camera_{model}"
         stream = get_stream(serial)
         stream.add_client(viewer=False)  # hold the pipeline open, no viewer encoding
-        color_proc = depth_proc = None
+        color_proc = None
+        raw_path = None
         try:
             if not stream.wait_first_frame(FIRST_FRAME_TIMEOUT):
                 raise RuntimeError(stream.status().get("error") or "camera unavailable")
@@ -413,41 +425,38 @@ class DepthRecordJob:
                 intr = stream.color_intr
                 depth_scale = stream.depth_scale
                 info = dict(stream.info)
+            try:
+                fps_nominal = float(info.get("profile", "@30").rsplit("@", 1)[1])
+            except (IndexError, ValueError):
+                fps_nominal = 30.0
+
+            # Depth goes to a RAW buffer during capture (plain writes always
+            # keep up; live lossless encoding could not) — RAM when it fits,
+            # else the SD card — and is FFV1-encoded after the recording ends.
+            estimated = int(width * height * 2 * fps_nominal * duration * 1.1)
+            shm = Path("/dev/shm")
+            raw_dir = shm if shm.is_dir() and estimated < SHM_RAW_LIMIT else out_dir
+            raw_path = raw_dir / f".{key}_depth_{os.getpid()}.raw"
+            raw_file = raw_path.open("wb", buffering=1 << 20)
 
             color_path = out_dir / f"{key}_color.mp4"
-            depth_path = out_dir / f"{key}_depth.mkv"
             color_proc = subprocess.Popen(
                 ["ffmpeg", "-loglevel", "error", "-y",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-                 "-r", str(RECORD_FPS), "-i", "pipe:0",
-                 # Pi 4 hardware encoder — the CPU is needed for FFV1 depth
+                 "-r", str(fps_nominal), "-i", "pipe:0",
+                 # Pi 4 hardware encoder — near-zero CPU
                  "-c:v", "h264_v4l2m2m", "-b:v", "2M", "-pix_fmt", "yuv420p",
                  str(color_path)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            depth_proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "error", "-y",
-                 "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
-                 "-r", str(RECORD_FPS), "-i", "pipe:0",
-                 # golomb-rice coder + slices: ~2x faster than the default range
-                 # coder on the Pi, still lossless — worth the ~10% larger files
-                 "-c:v", "ffv1", "-level", "3", "-coder", "0", "-context", "0",
-                 "-slices", "4", "-threads", "4",
-                 str(depth_path)],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # 1MB pipes: a whole frame fits, so writes don't block the sampling
-            # loop while the encoders chew (F_SETPIPE_SZ; default is 64KB)
-            for proc in (color_proc, depth_proc):
-                try:
-                    fcntl.fcntl(proc.stdin.fileno(), 1031, 1 << 20)
-                except OSError:
-                    pass
+            try:  # 1MB pipe so a whole frame never blocks the sampling loop
+                fcntl.fcntl(color_proc.stdin.fileno(), 1031, 1 << 20)
+            except OSError:
+                pass
 
             start_time = dt.datetime.now().astimezone()
             mono0 = time.monotonic()
             deadline = mono0 + duration
-            interval = 1.0 / RECORD_FPS
-            last_id, next_due, times = -1, 0.0, []
+            last_id, times = -1, []
             while time.monotonic() < deadline:
                 with stream.cond:
                     if stream.frame_id == last_id:
@@ -457,18 +466,49 @@ class DepthRecordJob:
                     last_id = stream.frame_id
                     bgr, z16 = stream.color_bgr, stream.depth_z16
                 t_rel = time.monotonic() - mono0
-                if t_rel < next_due:
-                    continue  # cap at RECORD_FPS; always the newest frame
                 color_proc.stdin.write(bgr.tobytes())
-                depth_proc.stdin.write(z16.tobytes())
+                raw_file.write(z16.tobytes())
                 times.append(t_rel)
-                next_due = t_rel + interval * 0.9
 
-            for proc in (color_proc, depth_proc):
-                proc.stdin.close()
-                proc.wait(timeout=60)
+            raw_file.close()
+            color_proc.stdin.close()
+            color_proc.wait(timeout=60)
             if not times:
                 raise RuntimeError("no frames captured")
+
+            # Time the containers to the MEASURED rate so playback duration
+            # matches wall clock (exact per-frame times live in the CSVs).
+            fps_actual = ((len(times) - 1) / (times[-1] - times[0])
+                          if len(times) > 1 else fps_nominal)
+            depth_path = out_dir / f"{key}_depth.mkv"
+            with self.lock:
+                self.encoding += 1
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-loglevel", "error", "-y",
+                     "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{width}x{height}",
+                     "-r", f"{fps_actual:.4f}", "-i", str(raw_path),
+                     # golomb-rice coder + slices: ~2x faster than the default
+                     # range coder on the Pi, still lossless
+                     "-c:v", "ffv1", "-level", "3", "-coder", "0", "-context", "0",
+                     "-slices", "4", "-threads", "4", str(depth_path)],
+                    check=True, timeout=duration * 10 + 300,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if abs(fps_actual - fps_nominal) / fps_nominal > 0.02:
+                    # retime the color container to the measured rate (remux, no
+                    # re-encode): itsscale multiplies the CFR input timestamps
+                    fixed = out_dir / f".{key}_color_retimed.mp4"
+                    subprocess.run(
+                        ["ffmpeg", "-loglevel", "error", "-y",
+                         "-itsscale", f"{fps_nominal / fps_actual:.6f}",
+                         "-i", str(color_path), "-c", "copy", str(fixed)],
+                        check=True, timeout=300,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    fixed.replace(color_path)
+            finally:
+                with self.lock:
+                    self.encoding -= 1
+            raw_path.unlink(missing_ok=True)
 
             for suffix in ("color", "depth"):
                 with (out_dir / f"{key}_{suffix}_timestamps.csv").open("w", newline="") as fh:
@@ -485,7 +525,8 @@ class DepthRecordJob:
                                "coeffs": list(intr.coeffs), "source": "realsense_factory"}
             extrinsics = _load_depth_extrinsics(serial)
             common = {"device": f"realsense:{serial}", "camera": info.get("name"),
-                      "resolution": [width, height], "fps": RECORD_FPS,
+                      "resolution": [width, height],
+                      "fps": round(fps_actual, 2), "nominal_fps": fps_nominal,
                       "frame_count": len(times), "start_time": start_time.isoformat()}
             color_entry = {"modality": "video", "path": f"streams/{color_path.name}",
                            "codec": "h264",
@@ -505,12 +546,13 @@ class DepthRecordJob:
                 self.streams[f"{key}_depth"] = depth_entry
             self._finish_one(key)
         except Exception as exc:  # noqa: BLE001 - reported via /record/status
-            for proc in (color_proc, depth_proc):
-                if proc is not None and proc.poll() is None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+            if color_proc is not None and color_proc.poll() is None:
+                try:
+                    color_proc.kill()
+                except Exception:
+                    pass
+            if raw_path is not None:
+                Path(raw_path).unlink(missing_ok=True)
             self._finish_one(key, error=str(exc))
         finally:
             stream.remove_client(viewer=False)

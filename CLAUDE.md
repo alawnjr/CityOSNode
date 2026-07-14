@@ -109,10 +109,16 @@ It's a single blocking `ffmpeg -f v4l2` call for the full duration, then it writ
 the per-frame timestamps and `metadata.json`. **Depth cameras are recorded too**:
 capture.py asks the RealSense page (port 8001, `POST /record/start`) to record
 every connected depth camera into the same `streams/` folder — color as
-`camera_d4xx_color.mp4` (h264, 15fps) and depth as `camera_d4xx_depth.mkv`
-(**lossless FFV1 gray16le, raw z16 units × `depth_scale_m` = meters**, aligned
-to color), each with a real timestamps CSV, merged into `metadata.json`'s
-`streams{}` with factory intrinsics + room-frame extrinsics. If the page is
+`camera_d4xx_color.mp4` (h264, Pi hardware encoder) and depth as
+`camera_d4xx_depth.mkv` (**lossless FFV1 gray16le, raw z16 units ×
+`depth_scale_m` = meters**, aligned to color), each with a real timestamps
+CSV, merged into `metadata.json`'s `streams{}` with factory intrinsics +
+room-frame extrinsics. Recording runs at the camera's pipeline rate
+(**D455 640x480@30, D435 640x480@15** — `SMARTROOM_DEPTH_PROFILE_D4XX` in
+node.env overrides): depth is captured RAW (to /dev/shm, or the SD card for
+long clips) and FFV1-encoded *after* the recording ends (~1-2x the clip
+length; `/record/status` stays running until done), and both containers are
+timed to the measured rate so playback matches wall clock. If the page is
 down or no depth camera is plugged in, recordings are webcam-only as before. **The timestamps CSV is real, not
 synthetic**: after recording, `probe_frame_times()` ffprobes the finished mp4 for
 each frame's actual presentation time (the USB cams are variable-rate, so the
