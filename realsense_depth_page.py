@@ -437,6 +437,13 @@ class CameraWorker:
                 "error": self.error,
                 "info": dict(self.info),
                 "stats": dict(self.stats),
+                # hw-clock health: latest frame's global-time stamp + the host
+                # clock at reply time. host_ms - last_hw_ts should be small
+                # (exposure + USB transfer) and STABLE; a wandering delta means
+                # the sensor→host global-time mapping is off (frames will land
+                # at the wrong place on the sync timeline).
+                "last_hw_ts": self.last_hw_ts,
+                "host_ms": time.time() * 1000.0,
             }
 
     # --------------------------------------------------------- recording ---
