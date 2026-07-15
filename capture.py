@@ -269,7 +269,16 @@ def collect_depth_streams(timeout=30):
         if not body.get("running"):
             for key, error in (body.get("errors") or {}).items():
                 print(f"depth {key}: {error}", file=sys.stderr)
-            return body.get("streams") or {}
+            streams = body.get("streams") or {}
+            for key, entry in streams.items():
+                dropped = int(entry.get("frames_dropped") or 0)
+                total = dropped + int(entry.get("frame_count") or 0)
+                if total and dropped / total > 0.02:
+                    print(f"WARNING: {key} dropped {dropped}/{total} frames "
+                          f"({entry.get('fps')}fps vs {entry.get('nominal_fps')} nominal) — "
+                          "the synced player will hold stale frames in the holes",
+                          file=sys.stderr)
+            return streams
         time.sleep(1)
     print("depth cameras: still recording after timeout — metadata omits them", file=sys.stderr)
     return {}

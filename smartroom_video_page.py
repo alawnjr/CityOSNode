@@ -1295,7 +1295,7 @@ class Handler(BaseHTTPRequestHandler):
         text.textContent = fmt(remaining) + ' left / ' + fmt(elapsed) + ' elapsed';
       }}
 
-      function finish(message) {{
+      function finish(message, reloadDelay) {{
         if (tick) {{ clearInterval(tick); tick = null; }}
         if (poll) {{ clearInterval(poll); poll = null; }}
         if (refresh) {{ clearInterval(refresh); refresh = null; }}
@@ -1303,12 +1303,51 @@ class Handler(BaseHTTPRequestHandler):
         cancelBtn.style.display = 'none';
         allBtn.disabled = false;
         secs.disabled = false;
-        setTimeout(function () {{ location.reload(); }}, 1800);
+        setTimeout(function () {{ location.reload(); }}, reloadDelay || 1800);
+      }}
+
+      // The depth page keeps /record/status "running" until its post-recording
+      // FFV1 encode ends — wait it out, then flag any camera that dropped
+      // frames (holes = the synced player holding stale frames = desync).
+      function checkDepthDrops() {{
+        var base = location.protocol + '//' + location.hostname + ':8001';
+        text.textContent = 'Done - finishing depth encode...';
+        var tries = 0;
+        var dp = setInterval(function () {{
+          tries += 1;
+          fetch(base + '/record/status').then(function (r) {{ return r.json(); }}).then(function (s) {{
+            if (s.running && tries < 200) {{ return; }}
+            clearInterval(dp);
+            var warns = [];
+            var streams = s.streams || {{}};
+            Object.keys(streams).forEach(function (k) {{
+              var e = streams[k];
+              var dropped = e.frames_dropped || 0;
+              var total = dropped + (e.frame_count || 0);
+              if (total && dropped / total > 0.02 && k.indexOf('_color') !== -1) {{
+                warns.push(k.replace('_color', '') + ': dropped ' + dropped + '/' + total +
+                           ' frames (' + e.fps + 'fps)');
+              }}
+            }});
+            if (warns.length) {{
+              allMsg.style.color = '#c0392b';
+              allMsg.textContent = '⚠ ' + warns.join(' · ') +
+                ' - expect visible desync in the holes; consider re-recording';
+              finish('Done - saved (with dropped frames).', 9000);
+            }} else {{
+              finish('Done - saved. Refreshing...');
+            }}
+          }}).catch(function () {{ clearInterval(dp); finish('Done - saved. Refreshing...'); }});
+        }}, 2000);
       }}
 
       function checkStatus() {{
         fetch('/record/status').then(function (r) {{ return r.json(); }}).then(function (s) {{
-          if (!s.running) {{ finish(cancelling ? 'Cancelled.' : 'Done - saved. Refreshing...'); }}
+          if (s.running) {{ return; }}
+          if (poll) {{ clearInterval(poll); poll = null; }}
+          if (tick) {{ clearInterval(tick); tick = null; }}
+          if (cancelling) {{ finish('Cancelled.'); return; }}
+          checkDepthDrops();
         }}).catch(function () {{}});
       }}
 

@@ -281,7 +281,13 @@ class CameraWorker:
         # Waiter/processor split: the waiter only receives framesets and queues
         # them (keep() detaches them from the SDK's recycle pool), so a slow
         # moment in processing costs LATENCY, never a dropped frame.
-        fs_queue = collections.deque(maxlen=8)
+        # ~2s of framesets (~75MB via keep()). Sized for recording COMPLETENESS:
+        # the processor thread intermittently stalls for a few hundred ms under
+        # recording load, and at maxlen=8 (267ms) those stalls overflowed the
+        # deque and silently evicted frames (recordings shipped at ~25fps with
+        # 66-133ms holes). A deep buffer rides the stalls out; the live view
+        # just runs a moment behind until the backlog drains.
+        fs_queue = collections.deque(maxlen=60)
         fs_state = {"stop": False, "error": None}
         fs_cond = threading.Condition()
 
@@ -615,9 +621,20 @@ class CameraWorker:
             except (OSError, ValueError):
                 pass
             hw_offset = float((timing or {}).get("offsets_ms", {}).get(self.serial, 0.0))
+            # Drop accounting: at the nominal rate the hw-timestamp span should
+            # hold span*fps frames — the shortfall is frames the camera captured
+            # but the pipeline lost (each hole = the player holding a stale
+            # frame, i.e. visible desync). gap_count = number of holes.
+            frames_dropped = gap_count = 0
+            if len(hw_times) > 1 and hw_times[-1] > hw_times[0] > 0:
+                span_s = (hw_times[-1] - hw_times[0]) / 1000.0
+                frames_dropped = max(0, round(span_s * fps_nominal) + 1 - len(hw_times))
+                gap_ms = 1.5 * 1000.0 / fps_nominal
+                gap_count = sum(1 for a, b in zip(hw_times, hw_times[1:]) if b - a > gap_ms)
             common = {"device": f"realsense:{self.serial}", "camera": info.get("name"),
                       "resolution": [width, height],
                       "fps": round(fps_actual, 2), "nominal_fps": fps_nominal,
+                      "frames_dropped": frames_dropped, "gap_count": gap_count,
                       "frame_count": len(times), "start_time": start_time.isoformat(),
                       "hw_timestamp_domain": hw_domain,
                       "hw_clock_offset_ms": hw_offset,
