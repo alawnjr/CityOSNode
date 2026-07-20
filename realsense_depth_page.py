@@ -1362,17 +1362,43 @@ PAGE = """<!doctype html>
           ' <span style="color:var(--muted)">&nbsp;&mdash; click either image to measure that point</span></div>';
         section.querySelector('h2').textContent = dev.name + '  (S/N ' + s + ')';
         var q = encodeURIComponent(s);
-        section.querySelector('[data-role="rgb"] img').src = '/rgb.mjpg?s=' + q + '&t=' + Date.now();
-        section.querySelector('[data-role="depth"] img').src = '/depth.mjpg?s=' + q + '&t=' + Date.now();
-
+        var rgbImg = section.querySelector('[data-role="rgb"] img');
+        var depthImg = section.querySelector('[data-role="depth"] img');
         var center = section.querySelector('.readout b');
-        setInterval(function () {
-          fetch('/value?s=' + q + '&x=0.5&y=0.5')
-            .then(function (r) { return r.json(); })
-            .then(function (j) {
-              center.textContent = j.center_m != null ? j.center_m.toFixed(2) + ' m' : 'no depth';
-            }).catch(function () {});
-        }, 600);
+
+        // Each camera's RGB + depth are persistent MJPEG connections, and a
+        // browser only allows ~6 per host. Two cameras' 4 streams plus the
+        // /value + /devices polls exceed that at load, so a camera loaded later
+        // (e.g. the D435, lower on the page) gets its stream requests starved and
+        // never shows. Stream + poll a camera ONLY while its section is on
+        // screen (the sections are ~viewport tall, so usually one at a time),
+        // and drop its connections when scrolled away — keeping well under the cap.
+        var valueTimer = null;
+        section.__live = false;
+        section.__start = function () {
+          if (section.__live) return;
+          section.__live = true;
+          rgbImg.src = '/rgb.mjpg?s=' + q + '&t=' + Date.now();
+          depthImg.src = '/depth.mjpg?s=' + q + '&t=' + Date.now();
+          valueTimer = setInterval(function () {
+            fetch('/value?s=' + q + '&x=0.5&y=0.5')
+              .then(function (r) { return r.json(); })
+              .then(function (j) {
+                center.textContent = j.center_m != null ? j.center_m.toFixed(2) + ' m' : 'no depth';
+              }).catch(function () {});
+          }, 600);
+        };
+        section.__stop = function () {
+          if (!section.__live) return;
+          section.__live = false;
+          rgbImg.src = '';      // aborts the MJPEG load -> frees the connection
+          depthImg.src = '';
+          if (valueTimer) { clearInterval(valueTimer); valueTimer = null; }
+        };
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (e) { e.isIntersecting ? section.__start() : section.__stop(); });
+        }, { rootMargin: '150px 0px' });
+        io.observe(section);
 
         section.querySelectorAll('.stage').forEach(function (stage) {
           stage.addEventListener('click', function (e) {
@@ -1419,12 +1445,14 @@ PAGE = """<!doctype html>
             }
             var st = dev.status || {}, info = st.info || {};
             // stream down while the device is present (USB replug, worker
-            // restart) — restart the <img> streams after a grace period
-            if (!st.running && !st.starting && Date.now() - (bumped[s] || 0) > 8000) {
+            // restart) — restart the streams after a grace period, but only for
+            // an on-screen (live) section so we don't re-open connections for a
+            // camera the visibility gate has intentionally detached.
+            if (!st.running && !st.starting && built[s].__live &&
+                Date.now() - (bumped[s] || 0) > 8000) {
               bumped[s] = Date.now();
-              built[s].querySelectorAll('.stage img').forEach(function (img) {
-                img.src = img.src.split('&t=')[0] + '&t=' + Date.now();
-              });
+              built[s].__stop();
+              built[s].__start();
             }
             var meta = built[s].querySelector('.meta');
             var usb = (dev.usb && dev.usb !== '?') ? dev.usb : (info.usb || '?');
