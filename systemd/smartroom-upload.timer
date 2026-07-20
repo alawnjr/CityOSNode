@@ -1,0 +1,15 @@
+# smartroom-upload.timer — periodically run the uploader.
+# Every minute is plenty: recordings are on-demand (~30s+ each), and the
+# oneshot scan is cheap when nothing is pending. Catches up automatically after
+# server/network downtime since un-uploaded clips carry no .uploaded marker.
+[Unit]
+Description=Periodically upload finished smartroom recordings to the quad server
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+# Coalesce missed runs (e.g. after suspend) into a single catch-up run.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

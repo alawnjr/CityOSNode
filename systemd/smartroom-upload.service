@@ -1,0 +1,25 @@
+# smartroom-upload.service — push finished recordings to the quad server.
+# Oneshot: scan data/ for completed, not-yet-uploaded recordings and rsync them.
+# Driven by smartroom-upload.timer. Deployed on the Pi (smartroom2).
+#
+# Install (on the Pi, after `git pull`):
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/CityOS/systemd/smartroom-upload.service ~/.config/systemd/user/
+#   ln -sf ~/CityOS/systemd/smartroom-upload.timer   ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smartroom-upload.timer
+#   loginctl enable-linger smartroom     # so it runs without an active login
+[Unit]
+Description=Upload finished smartroom recordings to the quad server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/CityOS
+# node.env (gitignored) may pin SMARTROOM_UPLOAD_DEST per node; optional.
+EnvironmentFile=-%h/CityOS/node.env
+ExecStart=%h/CityOS/upload_recording.sh
+# Don't let one bad clip fail the unit; the script's own exit code drives retries
+# via the next timer tick (unmarked dirs are retried).
+SuccessExitStatus=0 1

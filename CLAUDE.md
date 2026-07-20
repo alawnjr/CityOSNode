@@ -275,6 +275,23 @@ YOLO/RTMPose/action-recognition analyses, and serves a read-only LAN API
 layout, `metadata.json` schema, or the `/recordings` listing, check that repo's
 `app/api/save-all/`, `lib/detections.ts`, and `detect/` for the consuming side.
 
+## The analysis server: Rutgers quad server
+
+Heavy analysis (YOLO/RTMPose/action recognition, the depth-localization pass)
+runs on the **Rutgers quad server**, not on a Pi and not on the laptop — the
+laptop only orchestrates (`analyze-on-node.sh` push/analyze/pull) and validates.
+As of 2026-07-20 this replaced the COSMOS testbed nodes (which were
+reservation-gated and got re-imaged).
+
+- **Access**: `ssh intern26@172.16.60.239` (retarget `analyze-on-node.sh` with
+  `SMARTROOM_NODE=intern26@172.16.60.239 SMARTROOM_GW=` — empty `SMARTROOM_GW`
+  disables the COSMOS ProxyJump gateway since this box is directly reachable).
+- **`/mnt/data4/intern26/`** — **data storage ONLY** (recordings, datasets,
+  analysis outputs).
+- **`/home/intern26/`** — **code storage / running code ONLY**.
+- **DO NOT touch anything else on this server.** It is shared — stay within
+  those two directories.
+
 ## Conventions
 
 - `data/` (recordings + `data/photos/` snaps), `calibration/`, `node.env`,
