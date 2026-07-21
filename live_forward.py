@@ -37,14 +37,22 @@ DEPTH_POLL_S = 0.12
 
 
 def mjpeg_frames(resp):
-    """Yield JPEG byte blobs from a multipart/x-mixed-replace response that
-    sends a Content-Length per part (the depth page does)."""
+    """Yield (jpeg_bytes, hw_ts_ms) from a multipart/x-mixed-replace response.
+    hw_ts_ms is the sensor timestamp from the depth page's X-Hw-Timestamp-Ms
+    part header (librealsense global clock) — the cross-camera sync key; 0.0 if
+    the page is an older build that doesn't send it."""
+    hw_ts = 0.0
     while True:
         line = resp.readline()
         if not line:
             return
         low = line.strip().lower()
-        if low.startswith(b"content-length:"):
+        if low.startswith(b"x-hw-timestamp-ms:"):
+            try:
+                hw_ts = float(line.split(b":", 1)[1])
+            except ValueError:
+                hw_ts = 0.0
+        elif low.startswith(b"content-length:"):
             clen = int(line.split(b":", 1)[1])
             # consume up to and including the blank line after the part headers
             while True:
@@ -57,16 +65,19 @@ def mjpeg_frames(resp):
                 if not chunk:
                     return
                 buf += chunk
-            yield buf
+            yield buf, hw_ts
+            hw_ts = 0.0
 
 
-def depth_channel(value_base, serial, server_base):
+def depth_channel(value_base, serial, server_base, cam_key):
     """Depth back-channel (the server can't reach us). Poll the server for the
-    hip pixels it wants ranged, sample our own /value there (D455 depth aligned
-    to color), and POST the metres back. Sparse: only a few points per frame."""
+    hip pixels it wants ranged, sample our own /value there (depth aligned to
+    color), and POST the metres back. Sparse: only a few points per frame.
+    Per-camera: /hips and /depths are keyed by ?cam= so two cameras don't mix."""
+    q = f"?cam={cam_key}"
     while True:
         try:
-            with urllib.request.urlopen(server_base + "/hips", timeout=5) as r:
+            with urllib.request.urlopen(server_base + "/hips" + q, timeout=5) as r:
                 hips = json.load(r).get("hips", [])
             out = []
             for u, v in hips:
@@ -80,7 +91,7 @@ def depth_channel(value_base, serial, server_base):
                     pass
             if out:
                 req = urllib.request.Request(
-                    server_base + "/depths",
+                    server_base + "/depths" + q,
                     data=json.dumps(out).encode(),
                     headers={"Content-Type": "application/json"})
                 urllib.request.urlopen(req, timeout=5).read()
@@ -101,8 +112,9 @@ def run_once(source_url, srv_host, srv_port, cam_key):
     print(f"[fwd] connected to {srv_host}:{srv_port} (cam={cam_key})", flush=True)
     n = 0
     t0 = time.time()
-    for jpeg in mjpeg_frames(resp):
-        sock.sendall(struct.pack(">I", len(jpeg)) + jpeg)
+    for jpeg, hw_ts in mjpeg_frames(resp):
+        # wire frame: [4B len][8B double hw_ts_ms][jpeg]
+        sock.sendall(struct.pack(">Id", len(jpeg), hw_ts) + jpeg)
         n += 1
         if n % 60 == 0:
             fps = n / (time.time() - t0)
@@ -127,7 +139,7 @@ def main():
     value_base = args.source.rsplit("/", 1)[0]
     server_base = f"http://{args.server}"
     threading.Thread(target=depth_channel,
-                     args=(value_base, args.serial, server_base),
+                     args=(value_base, args.serial, server_base, args.cam),
                      daemon=True).start()
 
     while True:

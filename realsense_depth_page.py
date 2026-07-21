@@ -387,6 +387,7 @@ class CameraWorker:
                     return
                 last_id = self.frame_id
                 bgr, z16, scale = self.color_bgr, self.depth_z16, self.depth_scale
+                hw_ts = self.last_hw_ts   # this frame's sensor timestamp (global clock)
             if bgr is None or z16 is None:
                 continue
             t_enc = time.monotonic()
@@ -402,7 +403,8 @@ class CameraWorker:
             ok_depth, depth_buf = cv2.imencode(".jpg", vis, encode_params)
             if ok_rgb and ok_depth:
                 try:
-                    self.view_queue.put_nowait((rgb_buf.tobytes(), depth_buf.tobytes()))
+                    self.view_queue.put_nowait((rgb_buf.tobytes(), depth_buf.tobytes(),
+                                                hw_ts))
                 except Exception:
                     pass  # parent slow — drop, the next frame supersedes
             # rate-limit: sleep only the time LEFT in the frame budget, not a full
@@ -802,11 +804,12 @@ class ViewCache:
         self.cond = threading.Condition()
         self.rgb = None
         self.depth = None
+        self.hw_ts = 0.0          # sensor timestamp of the frame in rgb/depth
         self.view_id = 0
 
-    def put(self, rgb, depth):
+    def put(self, rgb, depth, hw_ts=0.0):
         with self.cond:
-            self.rgb, self.depth = rgb, depth
+            self.rgb, self.depth, self.hw_ts = rgb, depth, hw_ts
             self.view_id += 1
             self.cond.notify_all()
 
@@ -851,12 +854,13 @@ class Worker:
         queue = self.view_queue
         while True:
             try:
-                rgb, depth = queue.get(timeout=2.0)
+                item = queue.get(timeout=2.0)
             except Exception:
                 if queue is not self.view_queue or not self.proc.is_alive():
                     return  # respawned or dead — a new pump owns the new queue
                 continue
-            self.view.put(rgb, depth)
+            rgb, depth, hw_ts = (item if len(item) == 3 else (*item, 0.0))
+            self.view.put(rgb, depth, hw_ts)
 
     def call(self, op, timeout=10.0, **kw):
         """Command round-trip; {'ok': False, 'error': ...} on any failure."""
@@ -1274,12 +1278,16 @@ class Handler(BaseHTTPRequestHandler):
                         view.cond.wait(timeout=2.0)
                     last_sent = view.view_id
                     frame = view.rgb if which == "rgb" else view.depth
+                    hw_ts = view.hw_ts
                 if frame is None:
                     continue
                 t_send = time.monotonic()
                 try:
                     self.wfile.write(b"--" + STREAM_BOUNDARY.encode() + b"\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    # sensor timestamp (librealsense global clock, ms since epoch) —
+                    # the cross-camera sync key; consumed by live_forward.py.
+                    self.wfile.write(b"X-Hw-Timestamp-Ms: " + f"{hw_ts:.3f}".encode() + b"\r\n")
                     self.wfile.write(b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n")
                     self.wfile.write(frame)
                     self.wfile.write(b"\r\n")
