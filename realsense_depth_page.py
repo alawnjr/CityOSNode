@@ -389,6 +389,7 @@ class CameraWorker:
                 bgr, z16, scale = self.color_bgr, self.depth_z16, self.depth_scale
             if bgr is None or z16 is None:
                 continue
+            t_enc = time.monotonic()
             if self.flip:  # flipped camera: rotate at view rate, not capture rate
                 bgr = cv2.rotate(bgr, cv2.ROTATE_180)
                 z16 = cv2.rotate(z16, cv2.ROTATE_180)
@@ -404,7 +405,10 @@ class CameraWorker:
                     self.view_queue.put_nowait((rgb_buf.tobytes(), depth_buf.tobytes()))
                 except Exception:
                     pass  # parent slow — drop, the next frame supersedes
-            time.sleep(interval)
+            # rate-limit: sleep only the time LEFT in the frame budget, not a full
+            # interval on top of the ~work already spent (that capped us well below
+            # VIEW_ENCODE_FPS — e.g. 30fps target + ~19ms work gave only ~19fps).
+            time.sleep(max(0.0, interval - (time.monotonic() - t_enc)))
 
     # ----------------------------------------------------------- queries ---
     def wait_first_frame(self, timeout):
@@ -1272,6 +1276,7 @@ class Handler(BaseHTTPRequestHandler):
                     frame = view.rgb if which == "rgb" else view.depth
                 if frame is None:
                     continue
+                t_send = time.monotonic()
                 try:
                     self.wfile.write(b"--" + STREAM_BOUNDARY.encode() + b"\r\n")
                     self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -1280,7 +1285,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"\r\n")
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
-                time.sleep(interval)
+                time.sleep(max(0.0, interval - (time.monotonic() - t_send)))
         finally:
             worker.remove_viewer()
 
