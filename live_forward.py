@@ -69,6 +69,20 @@ def mjpeg_frames(resp):
             hw_ts = 0.0
 
 
+def detect_serial(source_base, cam_key):
+    """Serial of the camera behind a stream key (camera_d455_color -> the D455s
+    serial), by asking the depth page. Lets a systemd template start one unit
+    per camera without hard-coding serials that change when hardware is swapped."""
+    want = cam_key.replace("camera_", "").replace("_color", "").lower()   # d455
+    with urllib.request.urlopen(source_base + "/devices", timeout=10) as r:
+        devices = json.load(r).get("devices", [])
+    for d in devices:
+        if want in (d.get("name") or "").lower().replace(" ", ""):
+            return d["serial"]
+    raise SystemExit(f"[fwd] no camera matching {want!r}; saw "
+                     + ", ".join(d.get("name", "?") for d in devices))
+
+
 def depth_channel(value_base, serial, server_base, cam_key):
     """Depth back-channel (the server can't reach us). Poll the server for the
     hip pixels it wants ranged, sample our own /value there (depth aligned to
@@ -124,13 +138,17 @@ def run_once(source_url, srv_host, srv_port, cam_key):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--serial", default="243122300173")
+    ap.add_argument("--serial", default=None,
+                    help="camera USB serial; auto-detected from --cam if omitted")
     ap.add_argument("--source", default="http://127.0.0.1:8001/rgb.mjpg")
     ap.add_argument("--server", default="172.16.60.239:8010")
     ap.add_argument("--cam", default="camera_d455_color")
     args = ap.parse_args()
 
-    source_url = f"{args.source}?s={args.serial}&t={int(time.time())}"
+    value_base_early = args.source.rsplit("/", 1)[0]
+    serial = args.serial or detect_serial(value_base_early, args.cam)
+    print(f"[fwd] {args.cam} -> serial {serial}", flush=True)
+    source_url = f"{args.source}?s={serial}&t={int(time.time())}"
     srv_host, srv_port = args.server.split(":")
     srv_port = int(srv_port)
 
@@ -139,7 +157,7 @@ def main():
     value_base = args.source.rsplit("/", 1)[0]
     server_base = f"http://{args.server}"
     threading.Thread(target=depth_channel,
-                     args=(value_base, args.serial, server_base, args.cam),
+                     args=(value_base, serial, server_base, args.cam),
                      daemon=True).start()
 
     while True:

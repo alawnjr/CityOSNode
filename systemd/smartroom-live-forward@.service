@@ -1,0 +1,35 @@
+; Pushes one camera's live RGB to the quad server for live inference.
+; Template: %i is the camera short name, e.g. `d455` / `d435`, so
+;   systemctl --user enable --now smartroom-live-forward@d455
+; starts the D455 stream. The serial is auto-detected from the depth page, so
+; swapping hardware needs no unit change.
+;
+; USER unit (no sudo). Requires lingering so it survives logout / starts at boot:
+;   loginctl enable-linger smartroom
+;
+; Install:
+;   mkdir -p ~/.config/systemd/user
+;   ln -sf ~/CityOS/systemd/smartroom-live-forward@.service ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now smartroom-live-forward@d455 smartroom-live-forward@d435
+
+[Unit]
+Description=smartroom live frame forwarder (%i -> quad server)
+; The depth page owns the cameras and serves the MJPEG we forward.
+After=network-online.target smartroom-depth-page.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/CityOS
+; stdlib only — system python is fine, no venv needed
+ExecStart=/usr/bin/python3 %h/CityOS/live_forward.py --cam camera_%i_color
+; The forwarder already retries internally; this covers hard crashes and the
+; case where the depth page is not up yet at boot.
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/live_forward_%i.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
