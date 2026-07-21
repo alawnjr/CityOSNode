@@ -23,13 +23,17 @@ Usage (on the Pi, system python is fine — stdlib only):
 """
 
 import argparse
+import json
 import socket
 import struct
 import sys
+import threading
 import time
+import urllib.request
 from urllib.request import urlopen
 
 RECONNECT_S = 3.0
+DEPTH_POLL_S = 0.12
 
 
 def mjpeg_frames(resp):
@@ -54,6 +58,35 @@ def mjpeg_frames(resp):
                     return
                 buf += chunk
             yield buf
+
+
+def depth_channel(value_base, serial, server_base):
+    """Depth back-channel (the server can't reach us). Poll the server for the
+    hip pixels it wants ranged, sample our own /value there (D455 depth aligned
+    to color), and POST the metres back. Sparse: only a few points per frame."""
+    while True:
+        try:
+            with urllib.request.urlopen(server_base + "/hips", timeout=5) as r:
+                hips = json.load(r).get("hips", [])
+            out = []
+            for u, v in hips:
+                try:
+                    url = f"{value_base}/value?s={serial}&x={u:.4f}&y={v:.4f}"
+                    with urllib.request.urlopen(url, timeout=3) as r:
+                        d = json.load(r)
+                    if d.get("ok") and d.get("m"):
+                        out.append({"u": u, "v": v, "m": d["m"]})
+                except Exception:  # noqa: BLE001
+                    pass
+            if out:
+                req = urllib.request.Request(
+                    server_base + "/depths",
+                    data=json.dumps(out).encode(),
+                    headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=5).read()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(DEPTH_POLL_S)
 
 
 def run_once(source_url, srv_host, srv_port, cam_key):
@@ -88,6 +121,14 @@ def main():
     source_url = f"{args.source}?s={args.serial}&t={int(time.time())}"
     srv_host, srv_port = args.server.split(":")
     srv_port = int(srv_port)
+
+    # depth back-channel: sample /value on the local depth page for hips the
+    # server asks about. value_base is the depth page (derived from --source).
+    value_base = args.source.rsplit("/", 1)[0]
+    server_base = f"http://{args.server}"
+    threading.Thread(target=depth_channel,
+                     args=(value_base, args.serial, server_base),
+                     daemon=True).start()
 
     while True:
         try:
