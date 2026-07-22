@@ -79,6 +79,9 @@ MIN_TAG_PIXELS = 60.0
 # Depth only breaks the planar-PnP tie when it beats the other branch by this
 # much; a near-tie is noise, not a decision.
 DEPTH_TIEBREAK_MARGIN = 0.75
+# How much closer to the measured vertical one pose branch must be before it is
+# taken as the right one. Measured separation on real frames: 1.3 vs 12.2 deg.
+BRANCH_MARGIN_DEG = 3.0
 
 # Resolved at CALL time, not import time — the web page imports this module
 # before it loads node.env, so import-time reads would freeze the defaults.
@@ -289,6 +292,33 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11),
         cv2.aruco.DetectorParameters())
 
+    # The room's vertical, measured from the depth BEFORE the tag is solved —
+    # it both picks the pose branch below and levels the result afterwards, so
+    # it must not be seeded from the pose it is about to judge. Plain image-up
+    # is seed enough: the mean-shift in find_room_vertical walks it the rest of
+    # the way (measured: 5.7-7.2 degrees) for any roughly upright camera.
+    samples_mm = [depth * 1000.0 for _, depth in samples]
+    level_notes = []
+    vertical = find_room_vertical(samples_mm, intr, [0.0, -1.0, 0.0], level_notes)
+    if vertical is not None and (vertical["normals_used"] < MIN_LEVEL_NORMALS
+                                 or vertical["scatter_deg"] > MAX_LEVEL_SCATTER_DEG):
+        level_notes.append(f"rejected: {vertical['normals_used']} normals at "
+                           f"{vertical['scatter_deg']}° scatter is too little horizontal "
+                           f"surface to level from")
+        vertical = None
+
+    branch_picks = []       # how each detection's branch got chosen (diagnostic)
+
+    def branch_up_error(rvec):
+        """How far this pose branch's idea of 'up' is from the measured vertical.
+
+        Assumes tags hang upright, so the tag frame's -Y is up (aruco returns it
+        rolled 180 about the tag normal). None when nothing was measured."""
+        if vertical is None:
+            return None
+        up_cam = -cv2.Rodrigues(rvec)[0][:, 1]
+        return float(np.degrees(np.arccos(np.clip(up_cam @ vertical["up_cam"], -1.0, 1.0))))
+
     def corner_depth_error(rvec, tvec, img_pts, depth_m):
         """Mean |measured depth - PnP-predicted range| over the tag's corners, mm."""
         if depth_m is None:
@@ -302,13 +332,15 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     def tag_pose(corners_1x4, depth_m=None):
         """(reproj_err, rvec, tvec, img_pts) for one detected tag, or None.
 
-        IPPE returns BOTH solutions of the planar-pose ambiguity; for a tag seen
-        near head-on their reprojection errors are all but identical and the
-        wrong one is several degrees out. The camera's own depth at the corners
-        is an independent measurement, so use it to pick — but only when it
-        actually separates them. A depth reading that prefers one branch by 2%
-        has not chosen anything, and letting noise pick between poses 13 degrees
-        apart is worse than keeping the reprojection order."""
+        IPPE returns BOTH solutions of the planar-pose ambiguity, and at this
+        tag size their reprojection errors are effectively tied — measured, the
+        LOWER one is the wrong branch about half the time, and the two sit
+        13-15 degrees apart in tilt. So do not choose on reprojection. The
+        branches disagree about which way is up, and the depth has already
+        measured that from tens of thousands of surface normals, so choose on
+        agreement with it; only fall back to the corner depths (and then to
+        reprojection) when the vertical isn't available or doesn't separate
+        them."""
         img_pts = corners_1x4.reshape(4, 2).astype(np.float64)
         count, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, img_pts, K, dist,
                                                      flags=cv2.SOLVEPNP_IPPE_SQUARE)
@@ -319,13 +351,19 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
             err = float(np.linalg.norm(proj.reshape(4, 2) - img_pts, axis=1).mean())
             solutions.append((err, corner_depth_error(rvec, tvec, img_pts, depth_m),
-                              rvec, tvec))
+                              branch_up_error(rvec), rvec, tvec))
+
+        by_up = sorted((s for s in solutions if s[2] is not None), key=lambda s: s[2])
         by_depth = sorted((s for s in solutions if s[1] is not None), key=lambda s: s[1])
-        if len(by_depth) > 1 and by_depth[0][1] < DEPTH_TIEBREAK_MARGIN * by_depth[1][1]:
-            best = by_depth[0]
+        if len(by_up) > 1 and by_up[1][2] - by_up[0][2] > BRANCH_MARGIN_DEG:
+            best, how = by_up[0], "vertical"
+        elif len(by_depth) > 1 and by_depth[0][1] < DEPTH_TIEBREAK_MARGIN * by_depth[1][1]:
+            best, how = by_depth[0], "corner depth"
         else:
-            best = min(solutions, key=lambda s: s[0])
-        return best[0], best[2], best[3], img_pts
+            # nothing separated them — either branch is as good as the other
+            best, how = min(solutions, key=lambda s: s[0]), "reprojection"
+        branch_picks.append(how)
+        return best[0], best[3], best[4], img_pts
 
     # Anchor tags: other tags whose room-frame pose was previously measured (by
     # a camera that saw them together with the reference tag) — lets a camera
@@ -436,16 +474,6 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     #
     # An ANCHORED solve arrives already levelled (tags.json holds levelled
     # poses), so step 1 is skipped for it.
-    samples_mm = [depth * 1000.0 for _, depth in samples]
-    plane_notes = []
-    # tag frame's Y is DOWN (aruco returns the tag rolled 180 about its normal)
-    vertical = find_room_vertical(samples_mm, intr, -R[:, 1], plane_notes)
-    if vertical is not None and (vertical["normals_used"] < MIN_LEVEL_NORMALS
-                                 or vertical["scatter_deg"] > MAX_LEVEL_SCATTER_DEG):
-        plane_notes.append(f"rejected: {vertical['normals_used']} normals at "
-                           f"{vertical['scatter_deg']}° scatter is too little horizontal "
-                           f"surface to level from")
-        vertical = None
     stored = _load_room_level(out_dir)
     defines_room = (vertical is not None and anchor_id is None
                     and obliquity_deg >= MIN_TAG_OBLIQUITY_DEG)
@@ -527,7 +555,8 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "levelled": {"source": level_source, "tag_tilt_deg": tilt_deg,
                      "camera_tilt_corrected_deg": residual_deg,
                      "tag_obliquity_deg": obliquity_deg,
-                     "defines_room_vertical": defines_room, "notes": plane_notes,
+                     "defines_room_vertical": defines_room, "notes": level_notes,
+                     "branch_chosen_by": sorted(set(branch_picks)),
                      **({k: v for k, v in vertical.items() if k != "up_cam"}
                         if vertical else {})},
         # present when the pose came via a secondary tag (camera couldn't see
