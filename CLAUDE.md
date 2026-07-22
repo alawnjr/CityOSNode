@@ -236,6 +236,22 @@ camera 5fps).
 camera using its **factory intrinsics** (no checkerboard needed) plus a
 depth-vs-PnP cross-check; same tag (36h11 id 1) and same
 `calibration/<serial>.extrinsics.json` schema as `calibrate_extrinsics.py`.
+**The tag only supplies origin + yaw.** Pitch and roll come from the depth
+instead: `find_room_vertical()` pools the surface normals of every horizontal
+thing in view (floor, ceiling, desks — one shared normal, ~50k samples) and the
+pose is rotated onto it, correcting *separately* (1) the tag hanging off plumb —
+a relabelling of the whole room frame, measured once by a camera that sees the
+tag obliquely enough (`MIN_TAG_OBLIQUITY_DEG`) and shared via
+`calibration/room_level.json` — and (2) this camera's own ill-conditioned PnP
+tilt, orientation-only so the (well-conditioned) PnP position survives. Levelling
+is **skipped, not guessed**, when too little horizontal surface is in view.
+**Yaw stays as good as the tag is big**: at 640x480 the 138mm tag is only ~20-35
+px across and yaw wanders several degrees between runs — the burst's corner noise
+is a static bias, so averaging frames does not help. Calibration warns when the
+tag is under `MIN_TAG_PIXELS` or near the frame edge; fixing it needs a bigger
+tag, a closer/re-aimed camera, or a higher-resolution capture. It also warns when
+depth and PnP disagree on the tag's range by >4% (the D435 is ~7% out — its depth
+wants Intel's on-chip self-calibration).
 Run from the "Calibrate extrinsic" button on either web page (executes
 in-process on live frames) or standalone with the venv python. **Tag
 chaining**: other 36h11 tags seen in the same frame as tag 1 get their

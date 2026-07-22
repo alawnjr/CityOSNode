@@ -129,7 +129,7 @@ def _load_depth_extrinsics(serial):
         return None
     keys = ("camera_id", "frame", "tag", "rvec", "tvec_mm", "rotation_cam_to_room",
             "camera_position_mm", "reprojection_error_px", "depth_agreement_mm",
-            "anchored_by_tag", "calibrated_at")
+            "levelled", "anchored_by_tag", "calibrated_at")
     return {k: ext[k] for k in keys if k in ext}
 
 
@@ -613,11 +613,16 @@ class CameraWorker:
                         writer.writerow([i, f"{t:.6f}", f"{hw:.3f}"])
 
             calibration = None
-            if intr is not None:
-                calibration = {"fx": intr.fx, "fy": intr.fy, "ppx": intr.ppx, "ppy": intr.ppy,
-                               "width": intr.width, "height": intr.height,
-                               "model": getattr(intr.model, "name", str(intr.model)),
-                               "coeffs": list(intr.coeffs), "source": "realsense_factory"}
+            # the flipped camera's frames are stored rotated — so are these
+            frame_intr = self.frame_intrinsics(intr)
+            if frame_intr is not None:
+                calibration = {"fx": frame_intr.fx, "fy": frame_intr.fy,
+                               "ppx": frame_intr.ppx, "ppy": frame_intr.ppy,
+                               "width": frame_intr.width, "height": frame_intr.height,
+                               "model": getattr(frame_intr.model, "name", str(frame_intr.model)),
+                               "coeffs": list(frame_intr.coeffs),
+                               "source": "realsense_factory",
+                               **({"rotated_180": True} if self.flip else {})}
             extrinsics = _load_depth_extrinsics(self.serial)
             # measured inter-camera clock offset (calibration/camera_timing.json):
             # subtract from THIS stream's hw timestamps to align with the reference
@@ -704,6 +709,17 @@ class CameraWorker:
             self.remove_client()
 
     # ------------------------------------------------------- calibration ---
+    def frame_intrinsics(self, intr):
+        """Intrinsics matching the frames we STORE, not the raw sensor.
+
+        A flipped camera's recorded video and calibration frames are rotated
+        180 degrees, so the sensor's principal point is on the wrong side of
+        centre for them — off by twice its offset (~1 degree of pose on the
+        D435). Everything that projects those pixels must use these."""
+        if intr is None or not self.flip:
+            return intr
+        return realsense_extrinsics.rotate180_intrinsics(intr)
+
     def cal_start(self):
         with self.cal_lock:
             if self.cal["running"]:
@@ -739,7 +755,7 @@ class CameraWorker:
             if intr is None:
                 raise RuntimeError("no color intrinsics from the camera")
             ok, message = realsense_extrinsics.calibrate_from_samples(
-                samples, intr, self.serial, camera_name=self.name)
+                samples, self.frame_intrinsics(intr), self.serial, camera_name=self.name)
         except Exception as exc:  # noqa: BLE001 - reported on the page
             ok, message = False, str(exc)
         finally:

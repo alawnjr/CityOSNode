@@ -198,7 +198,7 @@ def load_extrinsics():
     except (OSError, ValueError):
         return None
     keys = ("camera_id", "frame", "tag", "rvec", "tvec_mm", "rotation_cam_to_room",
-            "camera_position_mm", "reprojection_error_px", "calibrated_at")
+            "camera_position_mm", "reprojection_error_px", "levelled", "calibrated_at")
     return {k: ext[k] for k in keys if k in ext}
 
 
@@ -208,7 +208,7 @@ def room_frame_info():
     coordinates to the physical room. The tag center is ~111cm off the ground
     (measured); override with SMARTROOM_TAG_HEIGHT_MM in node.env if it moves."""
     height = float(os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110"))
-    return {
+    info = {
         "reference_tag": {
             "family": "36h11",
             "id": int(os.environ.get("SMARTROOM_TAG_ID", "1")),
@@ -216,9 +216,20 @@ def room_frame_info():
         },
         "definition": "origin=tag center, X=tag right, Y=tag up, Z=out of tag; units mm",
         "tag_center_above_floor_mm": height,
-        # valid when the tag hangs upright (its Y axis vertical)
+        # the frame's Y is gravity-levelled off a measured horizontal plane
+        # (realsense_extrinsics.py), so this holds even if the tag hangs crooked
         "floor_plane": f"y = {-height:.0f} mm",
     }
+    # what the depth cameras actually measured of the room's vertical: the tag's
+    # off-plumb angle, and the floor height they saw vs the configured one
+    try:
+        level = json.loads((CALIBRATION_DIR / "room_level.json").read_text())
+    except (OSError, ValueError):
+        return info
+    info["level"] = {k: level[k] for k in
+                     ("up_in_tag_frame", "tag_tilt_deg", "measured_by",
+                      "measured_floor_mm", "measured_at") if k in level}
+    return info
 
 
 def load_room_tags():
