@@ -245,6 +245,17 @@ tag obliquely enough (`MIN_TAG_OBLIQUITY_DEG`) and shared via
 `calibration/room_level.json` — and (2) this camera's own ill-conditioned PnP
 tilt, orientation-only so the (well-conditioned) PnP position survives. Levelling
 is **skipped, not guessed**, when too little horizontal surface is in view.
+**Joint multi-tag solve**: when a frame shows several tags that are already in
+`calibration/tags.json`, the pose is fitted to all their corners at once, seeded
+from each of the single-tag ambiguity branches and refined with
+`SOLVEPNP_ITERATIVE` (solving the constellation in one shot would discard the
+ambiguity the vertical needs to arbitrate). This is what a camera facing its tag
+head-on needs: on the D435, which sees tags 1+2 1.29m apart, the right branch
+goes from **48% of the time at 0.3px corner noise to 100%**. It needs a
+bootstrap pass — the first calibration maps the second tag, the next one uses
+both — and it only removes SCATTER: the result is only as accurate as
+`tags.json`, so an entry measured with a tape can be written by hand with
+`"source": "measured"` and no solve will overwrite it.
 **Yaw stays as good as the tag is big**: at 640x480 the 138mm tag is only ~20-35
 px across and yaw wanders several degrees between runs — the burst's corner noise
 is a static bias, so averaging frames does not help. Calibration warns when the

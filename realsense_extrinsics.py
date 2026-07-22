@@ -27,6 +27,17 @@ calibration/tags.json (all tags assumed printed at the same size). capture.py
 embeds that map into every recording's metadata.json, so a camera that can only
 see tag 2 can still be placed in the one room frame downstream.
 
+Joint multi-tag solve: when a frame shows several MAPPED tags, the pose is fitted
+to all of their corners at once. One 138mm tag only gives the solver 138mm of
+baseline to read perspective from, which is why a camera facing it square can
+barely tell its two pose branches apart; two tags a metre apart give it a metre.
+Measured on the D435, which sees tags 1 and 2 together: at 0.3px of corner noise
+the right branch goes from 48% of the time (a coin flip) to 100%. The catch is
+that the joint solve is only as ACCURATE as calibration/tags.json — it kills the
+scatter, not a bias baked into the map. A tape measure beats PnP on a 35px tag,
+so an entry may be written by hand with "source": "measured" and no solve will
+overwrite it.
+
 Gravity levelling: the tag defines the room frame's ORIGIN and YAW, but nothing
 else about it deserves to be trusted with the vertical. It is small in the image
 (tens of pixels), so its corners pin the pose's TILT down only weakly, and it is
@@ -362,19 +373,79 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         else:
             # nothing separated them — either branch is as good as the other
             best, how = min(solutions, key=lambda s: s[0]), "reprojection"
-        branch_picks.append(how)
         return best[0], best[3], best[4], img_pts
 
-    # Anchor tags: other tags whose room-frame pose was previously measured (by
-    # a camera that saw them together with the reference tag) — lets a camera
-    # that can't see the reference tag still be placed in the room frame.
-    anchors = _load_room_tags(out_dir)  # {tag id: (Q room<-tag, p room, mm)}
+    # Every tag whose room-frame pose is known: the reference tag by definition,
+    # plus any other tag previously measured against it (tags.json). Each entry
+    # is that tag's four corners in ROOM coordinates, which is all a joint solve
+    # needs — and note a tag's own ORIENTATION barely matters here: getting it
+    # wrong by 5 degrees moves its corners by ~6 mm, nothing against a
+    # metre-scale spread between tags. It is the tag CENTRES that must be right,
+    # and centres come from PnP's translation, the well-conditioned half.
+    known = {tag_id: (np.eye(3), np.zeros(3))}
+    known.update(_load_room_tags(out_dir))       # {id: (R tag->room, centre room mm)}
+    known_corners = {tid: (Q @ obj.T).T + p for tid, (Q, p) in known.items()}
+
+    def solve_frame(obs, depth_m):
+        """Room->camera pose from EVERY known tag in one frame at once.
+
+        One 138 mm tag gives the solver a 138 mm baseline to read perspective
+        from, which is why a camera facing it square can barely tell its two
+        pose branches apart. Two tags a metre apart give it a metre — the same
+        corner noise then buys an order of magnitude less pose error, with no
+        change to the hardware. Returns (reproj_err, rvec, tvec, used_ids)."""
+        # Seed from one tag, which is where BOTH ambiguity branches come from,
+        # then refine each seed over every corner in the frame. Solving the whole
+        # constellation in one shot instead would throw the ambiguity away — the
+        # general solvers return a single answer, and near-coplanar tags are
+        # still genuinely ambiguous, so the vertical would have nothing to choose
+        # between.
+        seed_id, seed_corner = next(((t, c) for t, c in obs if t == tag_id), obs[0])
+        img_pts = seed_corner.reshape(4, 2).astype(np.float64)
+        try:
+            count, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, img_pts, K, dist,
+                                                         flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        except cv2.error:
+            return None
+        if not count:
+            return None
+        obj_all = np.concatenate([known_corners[tid] for tid, _ in obs])
+        img_all = np.concatenate([c.reshape(4, 2).astype(np.float64) for _, c in obs])
+        Q, p = known[seed_id]
+
+        scored = []
+        for rvec_t, tvec_t in zip(rvecs, tvecs):
+            R_cam_room = cv2.Rodrigues(rvec_t)[0] @ Q.T   # cam<-room = cam<-tag . tag<-room
+            rvec = cv2.Rodrigues(R_cam_room)[0]
+            tvec = tvec_t - R_cam_room @ p.reshape(3, 1)
+            if len(obs) > 1:
+                ok, rvec, tvec = cv2.solvePnP(obj_all, img_all, K, dist, rvec.copy(),
+                                              tvec.copy(), useExtrinsicGuess=True,
+                                              flags=cv2.SOLVEPNP_ITERATIVE)
+                if not ok:
+                    continue
+            proj, _ = cv2.projectPoints(obj_all, rvec, tvec, K, dist)
+            err = float(np.linalg.norm(proj.reshape(-1, 2) - img_all, axis=1).mean())
+            scored.append((err, branch_up_error(rvec),
+                           corner_depth_error(rvec_t, tvec_t, img_pts, depth_m), rvec, tvec))
+        if not scored:
+            return None
+
+        by_up = sorted((s for s in scored if s[1] is not None), key=lambda s: s[1])
+        by_depth = sorted((s for s in scored if s[2] is not None), key=lambda s: s[2])
+        if len(by_up) > 1 and by_up[1][1] - by_up[0][1] > BRANCH_MARGIN_DEG:
+            best, how = by_up[0], "vertical"
+        elif len(by_depth) > 1 and by_depth[0][2] < DEPTH_TIEBREAK_MARGIN * by_depth[1][2]:
+            best, how = by_depth[0], "corner depth"
+        else:
+            best, how = min(scored, key=lambda s: s[0]), "reprojection"
+        branch_picks.append(f"{how} ({len(obs)} tag{'s' if len(obs) > 1 else ''})")
+        return best[0], best[3], best[4], [tid for tid, _ in obs]
 
     # results: (err, room_rvec, room_tvec, raw_rvec, raw_tvec, img_pts,
-    #           color_bgr, depth_m, anchor_id)
-    # room_rvec/room_tvec express the ROOM frame in the camera (same convention
-    # as a direct tag-1 solve, so everything downstream is identical); raw_* is
-    # the pose of the tag actually detected — used for the depth cross-check.
+    #           color_bgr, depth_m, used_ids)
+    # room_rvec/room_tvec express the ROOM frame in the camera; raw_* is the
+    # reference tag's own pose, kept for the depth cross-check and the overlay.
     results = []
     other_tags = {}   # other tag id -> list of (err, R_room, pos_room_mm) per frame
     seen_ids = set()
@@ -384,57 +455,46 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             continue
         flat = [int(i) for i in ids.flatten()]
         seen_ids.update(flat)
-        if tag_id in flat:
-            ref = tag_pose(corners[flat.index(tag_id)], depth_m)
-            if ref is None:
-                continue
-            err, rvec, tvec, img_pts = ref
-            results.append((err, rvec, tvec, rvec, tvec, img_pts, color_bgr, depth_m, None))
-            # Tag chaining: every OTHER tag visible in the same frame gets its
-            # pose expressed in the reference tag's (room) frame, so it can
-            # anchor cameras that can't see the reference tag. Assumes the same
-            # printed tag size for all tags.
-            R1, _ = cv2.Rodrigues(rvec)
-            for j, other_id in enumerate(flat):
-                if other_id == tag_id:
-                    continue
-                other = tag_pose(corners[j], depth_m)
-                if other is None:
-                    continue
-                err2, rvec2, tvec2, _pts2 = other
-                R2, _ = cv2.Rodrigues(rvec2)
-                pos_room = (R1.T @ (tvec2 - tvec)).flatten()        # tag center, mm
-                R_room = R1.T @ R2                                   # tag axes in room frame
-                other_tags.setdefault(other_id, []).append((max(err, err2), R_room, pos_room))
+        obs = [(tid, corners[j]) for j, tid in enumerate(flat) if tid in known]
+        solved = solve_frame(obs, depth_m) if obs else None
+        if solved is None:
             continue
-        # Reference tag not in this frame — fall back to a known anchor tag and
-        # compose: T_cam<-room = T_cam<-anchor · T_anchor<-room.
+        err, rvec, tvec, used_ids = solved
+        # the reference tag's own pose, for the depth cross-check and overlay
+        anchor_tid = tag_id if tag_id in used_ids else used_ids[0]
+        own = tag_pose(corners[flat.index(anchor_tid)], depth_m)
+        if own is None:
+            continue
+        _, raw_rvec, raw_tvec, img_pts = own
+        results.append((err, rvec, tvec, raw_rvec, raw_tvec, img_pts,
+                        color_bgr, depth_m, used_ids))
+
+        # Tag chaining: any tag NOT yet in the map gets its pose in the room
+        # frame from this frame's solve, so it can join the map for next time.
+        R_frame, _ = cv2.Rodrigues(rvec)
         for j, other_id in enumerate(flat):
-            if other_id not in anchors:
+            if other_id in known:
                 continue
-            got = tag_pose(corners[j], depth_m)
-            if got is None:
+            other = tag_pose(corners[j], depth_m)
+            if other is None:
                 continue
-            err, rvec_k, tvec_k, img_pts = got
-            Rk, _ = cv2.Rodrigues(rvec_k)
-            Q, p = anchors[other_id]                     # anchor tag in room frame
-            R_cam_room = Rk @ Q.T
-            room_tvec = tvec_k - R_cam_room @ p.reshape(3, 1)
-            room_rvec, _ = cv2.Rodrigues(R_cam_room)
-            results.append((err, room_rvec, room_tvec, rvec_k, tvec_k,
-                            img_pts, color_bgr, depth_m, other_id))
-            break
+            err2, rvec2, tvec2, _pts2 = other
+            pos_room = (R_frame.T @ (tvec2 - tvec)).flatten()      # tag centre, mm
+            R_room = R_frame.T @ cv2.Rodrigues(rvec2)[0]           # tag axes in room frame
+            other_tags.setdefault(other_id, []).append((max(err, err2), R_room, pos_room))
 
     if not results:
-        known = ", ".join(str(k) for k in sorted(anchors)) or "none measured yet"
+        listed = ", ".join(str(k) for k in sorted(known))
         return False, (f"no usable tag seen (36h11 ids detected: {sorted(seen_ids) or 'none'}) — "
-                       f"need tag {tag_id} or a known anchor tag (known: {known})")
+                       f"need one of the mapped tags: {listed}")
 
-    # Direct reference-tag views beat chained anchor views — use them when any exist.
-    direct = [r for r in results if r[-1] is None]
+    # Frames that include the reference tag beat ones anchored only through
+    # other tags, whose errors stack on top of the map's own.
+    direct = [r for r in results if tag_id in r[-1]]
     if direct:
         results = direct
-    anchor_id = results[0][-1]
+    used_ids = sorted({tid for r in results for tid in r[-1]})
+    anchor_id = None if tag_id in used_ids else used_ids[0]
 
     positions = []
     for err, rvec, tvec, *_ in results:
@@ -446,7 +506,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # cross-check) is still the lowest-reprojection one, but the POSE is the
     # average over the burst — see _average_pose.
     (err, _, _, raw_rvec, raw_tvec, img_pts,
-     color_bgr, depth_m, anchor_id) = min(results, key=lambda r: r[0])
+     color_bgr, depth_m, _) = min(results, key=lambda r: r[0])
     rvec, tvec = _average_pose([(r[1], r[2]) for r in results])
     R, _ = cv2.Rodrigues(rvec)
 
@@ -550,6 +610,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "reprojection_error_px": round(err, 3),
         "depth_agreement_mm": depth_agreement_mm,
         "frames_used": len(results),
+        "solved_from_tags": used_ids,
         "position_spread_mm": round(spread, 1),
         # how the frame's vertical was fixed — see find_room_vertical
         "levelled": {"source": level_source, "tag_tilt_deg": tilt_deg,
@@ -595,7 +656,10 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         # than the sensor's spec — one of them (usually the depth) needs a look
         agree += (f" (!! {100 * depth_agreement_mm / range_mm:.1f}% of the {range_mm:.0f} mm "
                   f"range — check this camera's depth calibration or the tag size)")
-    via = f" (anchored via tag {anchor_id})" if anchor_id is not None else ""
+    via = (f" from tag{'s' if len(used_ids) > 1 else ''} "
+           f"{', '.join(str(t) for t in used_ids)}"
+           + (f" (anchored — the reference tag {tag_id} was not in view)"
+              if anchor_id is not None else ""))
     level_note = f"; levelled off {level_source}"
     if tilt_deg is not None:
         level_note += f", tag hangs {tilt_deg}° off plumb"
@@ -713,6 +777,13 @@ def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
     })
     notes = []
     for other_id, observations in sorted(other_tags.items()):
+        # A hand-measured entry ("source": "measured" — tape measure beats PnP on
+        # a 35 px tag, and the joint solve is only ever as accurate as this map)
+        # is never overwritten by a solve.
+        existing = tag_map["tags"].get(str(other_id)) or {}
+        if existing.get("source") == "measured":
+            notes.append(f"tag {other_id} left at its measured pose")
+            continue
         # best (lowest joint reprojection error) observation gives the rotation;
         # the position is the mean, with the spread as the consistency check
         observations.sort(key=lambda o: o[0])
@@ -728,6 +799,7 @@ def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
             "reprojection_error_px": round(best_err, 3),
             "position_spread_mm": round(spread, 1),
             "frames_used": len(observations),
+            "source": "solved",
             "observed_by": serial,
             "measured_at": dt.datetime.now().astimezone().isoformat(),
         }
