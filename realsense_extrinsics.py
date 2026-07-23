@@ -741,18 +741,20 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     M = _minimal_rotation(up_room, [0.0, -1.0, 0.0]) if up_room is not None else np.eye(3)
     tag_notes = _save_room_tags(other_tags, M, serial, tag_id, tag_size_mm, out_dir)
 
-    # How well YAW is pinned down. Levelling takes pitch and roll off the tag
-    # and onto the depth, but yaw still comes from the tag's corners alone, and
-    # corner noise turns into yaw error in proportion to how small the tag is in
-    # the image: a 20 px tag is worth several degrees. Nothing in software fixes
-    # that (the noise is a static bias, so averaging frames does not help) — it
-    # needs a bigger tag, a closer camera, or a higher-resolution capture.
+    # How well YAW is pinned down. When the wall gave us the heading (yaw_deg is
+    # set), the tag's size no longer matters — the wall normal, not the tag
+    # corners, fixes forward. Only when we FELL BACK to the tag's corners does
+    # their pixel count bound the yaw: a 20 px tag is worth several degrees, and
+    # the noise is a static bias so averaging frames cannot help.
     tag_px = float(np.linalg.norm(img_pts - np.roll(img_pts, 1, axis=0), axis=1).max())
     yaw_note = ""
-    if tag_px < MIN_TAG_PIXELS:
-        yaw_note = (f"; !! the tag is only {tag_px:.0f} px across — too small for its corners "
-                    f"to pin down yaw (measured spread between runs: several degrees). Use a "
-                    f"bigger tag, move the camera closer, or calibrate at a higher resolution")
+    if yaw_deg is not None:
+        yaw_note = f"; yaw from the wall ({yaw_source}), tag corners {yaw_deg}° off"
+    elif tag_px < MIN_TAG_PIXELS:
+        yaw_note = (f"; !! no usable wall in view, so yaw fell back to the tag — only "
+                    f"{tag_px:.0f} px across, too small to pin heading (spread between runs: "
+                    f"several degrees). Aim the camera at a flat wall, use a bigger tag, "
+                    f"move closer, or capture at higher resolution")
     edge = min(img_pts[:, 0].min(), img_pts[:, 1].min(),
                w - img_pts[:, 0].max(), h - img_pts[:, 1].max())
     if edge < 0.08 * min(w, h):
