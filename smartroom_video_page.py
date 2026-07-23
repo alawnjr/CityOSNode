@@ -3,6 +3,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -159,6 +160,147 @@ def recording_dir(path):
     except Exception:
         pass
     return None
+
+
+def video_duration_s(path):
+    """Recorded duration of a video, in seconds, from its sibling
+    <stem>_timestamps.csv (columns: frame_index, timestamp_seconds, ...).
+    The USB/depth cams are variable-rate, so the CSV — one row per actual
+    encoded frame — is the real clock. Returns the last frame's presentation
+    time (first frame is ~0), or None when no CSV is present."""
+    csv_path = path.with_name(path.stem + "_timestamps.csv")
+    if not csv_path.is_file():
+        return None
+    try:
+        with csv_path.open("r") as fh:
+            last = None
+            for line in fh:
+                line = line.strip()
+                if line:
+                    last = line
+        if last is None:
+            return None
+        ts = last.split(",")[1]           # timestamp_seconds
+        return round(float(ts), 3)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _md_inline(text):
+    """Inline Markdown → HTML: `code`, **bold**, *italic*, [text](url).
+    HTML-escapes first, then stashes code spans so their contents aren't
+    re-formatted."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    codes = []
+
+    def _stash(m):
+        codes.append(m.group(1))
+        return "\x00%d\x00" % (len(codes) - 1)
+
+    text = re.sub(r"`([^`]+)`", _stash, text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)([^*]+)\*(?!\*)", r"<em>\1</em>", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    return re.sub(r"\x00(\d+)\x00",
+                  lambda m: "<code>" + codes[int(m.group(1))] + "</code>", text)
+
+
+def markdown_to_html(md):
+    """Tiny self-contained Markdown → HTML renderer (no third-party dep, since
+    this page runs on the Pi's system python3). Supports headings, fenced code
+    blocks, GFM pipe tables, blockquotes, unordered/ordered lists, horizontal
+    rules, and paragraphs — enough for the docs we ship."""
+    lines = md.replace("\r\n", "\n").split("\n")
+    out = []
+    i, n = 0, len(lines)
+
+    def is_table_sep(s):
+        return bool(re.match(r"^\s*\|?[\s:\-|]+\|?\s*$", s)) and "-" in s
+
+    while i < n:
+        line = lines[i]
+
+        # Fenced code block
+        if line.lstrip().startswith("```"):
+            i += 1
+            buf = []
+            while i < n and not lines[i].lstrip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            i += 1  # closing fence
+            escaped = "\n".join(buf).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            out.append("<pre><code>%s</code></pre>" % escaped)
+            continue
+
+        # Blank line
+        if not line.strip():
+            i += 1
+            continue
+
+        # Heading
+        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if m:
+            level = len(m.group(1))
+            out.append("<h%d>%s</h%d>" % (level, _md_inline(m.group(2).strip()), level))
+            i += 1
+            continue
+
+        # Horizontal rule
+        if re.match(r"^\s*([-*_])(\s*\1){2,}\s*$", line):
+            out.append("<hr>")
+            i += 1
+            continue
+
+        # Table: a pipe row followed by a separator row
+        if "|" in line and i + 1 < n and is_table_sep(lines[i + 1]):
+            def cells(row):
+                row = row.strip().strip("|")
+                return [c.strip() for c in row.split("|")]
+            header = cells(line)
+            i += 2  # skip header + separator
+            body = []
+            while i < n and "|" in lines[i] and lines[i].strip():
+                body.append(cells(lines[i]))
+                i += 1
+            thead = "".join("<th>%s</th>" % _md_inline(c) for c in header)
+            rows = "".join(
+                "<tr>%s</tr>" % "".join("<td>%s</td>" % _md_inline(c) for c in r)
+                for r in body
+            )
+            out.append("<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
+                       % (thead, rows))
+            continue
+
+        # Blockquote
+        if line.lstrip().startswith(">"):
+            buf = []
+            while i < n and lines[i].lstrip().startswith(">"):
+                buf.append(re.sub(r"^\s*>\s?", "", lines[i]))
+                i += 1
+            out.append("<blockquote>%s</blockquote>" % _md_inline(" ".join(buf)))
+            continue
+
+        # Lists (unordered / ordered)
+        if re.match(r"^\s*([-*+]|\d+\.)\s+", line):
+            ordered = bool(re.match(r"^\s*\d+\.\s+", line))
+            tag = "ol" if ordered else "ul"
+            items = []
+            while i < n and re.match(r"^\s*([-*+]|\d+\.)\s+", lines[i]):
+                item = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", lines[i])
+                items.append("<li>%s</li>" % _md_inline(item.strip()))
+                i += 1
+            out.append("<%s>%s</%s>" % (tag, "".join(items), tag))
+            continue
+
+        # Paragraph — gather consecutive plain lines
+        buf = []
+        while i < n and lines[i].strip() and not re.match(
+                r"^(#{1,6}\s|```|\s*([-*+]|\d+\.)\s|\s*>)", lines[i]):
+            buf.append(lines[i].strip())
+            i += 1
+        out.append("<p>%s</p>" % _md_inline(" ".join(buf)))
+
+    return "\n".join(out)
 
 
 def dataset_token(rec_dir):
@@ -614,6 +756,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self.show_index()
             return
+        if parsed.path == "/docs":
+            self.show_docs()
+            return
         if parsed.path == "/stream.mjpg":
             self.serve_stream()
             return
@@ -758,6 +903,148 @@ class Handler(BaseHTTPRequestHandler):
                     break
         finally:
             CAMERA.remove_client()
+
+    def show_docs(self):
+        """Render API.md (shipped next to this script) into its own styled page."""
+        doc_path = Path(__file__).resolve().parent / "API.md"
+        try:
+            rendered = markdown_to_html(doc_path.read_text(encoding="utf-8"))
+        except OSError:
+            rendered = "<p>Documentation file <code>API.md</code> not found.</p>"
+
+        body = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smartroom API Docs</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #18202a;
+      --muted: #687384;
+      --line: #d9e0e8;
+      --accent: #1267c3;
+      --code-bg: #f2f4f8;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.6;
+    }}
+    header {{
+      padding: 22px clamp(16px, 4vw, 44px);
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }}
+    .nav {{
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+    }}
+    .nav a {{
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 14px;
+      color: var(--muted);
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+    }}
+    .nav a.active {{
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }}
+    header h1 {{ margin: 0; font-size: clamp(24px, 4vw, 36px); }}
+    .doc {{
+      width: min(880px, calc(100% - 32px));
+      margin: 28px auto 64px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: clamp(20px, 4vw, 48px);
+      box-shadow: 0 2px 12px rgba(20, 32, 48, 0.06);
+    }}
+    .doc h1, .doc h2, .doc h3 {{ line-height: 1.25; }}
+    .doc h1 {{ font-size: 30px; margin: 0 0 12px; }}
+    .doc h2 {{
+      font-size: 23px;
+      margin: 34px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .doc h3 {{ font-size: 18px; margin: 24px 0 8px; }}
+    .doc p {{ margin: 12px 0; }}
+    .doc a {{ color: var(--accent); }}
+    .doc hr {{ border: 0; border-top: 1px solid var(--line); margin: 32px 0; }}
+    .doc code {{
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      padding: 2px 5px;
+      border-radius: 4px;
+    }}
+    .doc pre {{
+      background: #10151c;
+      color: #e6edf3;
+      padding: 16px 18px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }}
+    .doc pre code {{
+      background: none;
+      padding: 0;
+      color: inherit;
+      font-size: 0.85em;
+    }}
+    .doc blockquote {{
+      margin: 14px 0;
+      padding: 6px 16px;
+      border-left: 4px solid var(--accent);
+      color: var(--muted);
+      background: var(--code-bg);
+      border-radius: 0 6px 6px 0;
+    }}
+    .doc ul, .doc ol {{ padding-left: 24px; }}
+    .doc li {{ margin: 5px 0; }}
+    .doc table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 0.95em;
+      display: block;
+      overflow-x: auto;
+    }}
+    .doc th, .doc td {{
+      border: 1px solid var(--line);
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .doc th {{ background: var(--code-bg); }}
+  </style>
+</head>
+<body>
+  <header>
+    <nav class="nav">
+      <a href="/">Live</a>
+      <a href="/docs" class="active">API Docs</a>
+    </nav>
+    <h1>API Documentation</h1>
+  </header>
+  <article class="doc">
+    {rendered}
+  </article>
+</body>
+</html>"""
+        self.send_bytes(body.encode("utf-8"))
 
     def show_index(self):
         files = video_files()
@@ -1088,10 +1375,30 @@ class Handler(BaseHTTPRequestHandler):
       padding: 28px;
     }}
     .empty h2 {{ font-size: 22px; margin: 0 0 8px; }}
+    .nav {{ display: flex; gap: 8px; margin-bottom: 14px; }}
+    .nav a {{
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 14px;
+      color: var(--muted);
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+    }}
+    .nav a.active {{
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }}
   </style>
 </head>
 <body>
   <header>
+    <nav class="nav">
+      <a href="/" class="active">Live</a>
+      <a href="/docs">API Docs</a>
+    </nav>
     <h1>Smartroom Live</h1>
     <p>{len(files)} recording{"s" if len(files) != 1 else ""} available below</p>
   </header>
@@ -1570,6 +1877,7 @@ class Handler(BaseHTTPRequestHandler):
                 "label": video_label(path),
                 "size": size,
                 "mtime": round(mtime, 3),
+                "duration_s": video_duration_s(path),
                 "download": "/download/" + urllib.parse.quote(token),
             })
             # Also list the per-frame timestamps CSV(s) sitting next to the video
