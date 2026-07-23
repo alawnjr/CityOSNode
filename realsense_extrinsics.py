@@ -93,6 +93,23 @@ DEPTH_TIEBREAK_MARGIN = 0.75
 # How much closer to the measured vertical one pose branch must be before it is
 # taken as the right one. Measured separation on real frames: 1.3 vs 12.2 deg.
 BRANCH_MARGIN_DEG = 3.0
+# --- yaw from the wall (find_room_wall) --------------------------------------
+# The tag's yaw is its worst axis (a 30 px tag pins heading to a few degrees).
+# The wall the tag hangs on fills thousands of depth pixels, so its normal fixes
+# the room's FORWARD far better — the same trade the vertical already makes for
+# pitch/roll. A surface counts as a wall when its normal sits within this of
+# horizontal (i.e. the surface is within this of vertical).
+WALL_MAX_TILT_DEG = 25.0
+# Enough wall normals, and tight enough, before the depth heading is trusted
+# over the tag's. Walls show fewer pixels than a floor across the whole frame,
+# so this sits below MIN_LEVEL_NORMALS.
+MIN_YAW_NORMALS = 4000
+MAX_YAW_SCATTER_DEG = 7.0
+# The tag heading is only a few degrees off, so the wall the tag is on is near
+# the tag's forward. If the mean-shift walked further than this it locked onto a
+# DIFFERENT wall (a side wall ~90 deg away) — reject rather than yaw the room
+# onto the wrong wall.
+MAX_YAW_CORRECTION_DEG = 20.0
 
 # Resolved at CALL time, not import time — the web page imports this module
 # before it loads node.env, so import-time reads would freeze the defaults.
@@ -267,6 +284,76 @@ def find_room_vertical(samples_mm, intr, up_hint, notes=None):
     return {"up_cam": up, "normals_used": int(len(used)),
             "scatter_deg": round(scatter_deg, 2),
             "floor_below_camera_mm": round(floor_mm, 1) if floor_mm is not None else None}
+
+
+def find_room_wall(samples_mm, intr, fwd_hint_cam, up_cam, notes=None):
+    """The reference wall's outward normal, in CAMERA coordinates, from depth.
+
+    The room's FORWARD is defined by the wall the tag hangs on. That wall fills
+    thousands of depth pixels, so its normal is far better conditioned than the
+    tag's yaw. This mirrors find_room_vertical, with two differences: a room has
+    several walls (unlike its one vertical), so the search is SEEDED with the
+    tag's own forward (`fwd_hint_cam`, a few degrees off at worst) and kept in a
+    window around it — it locks onto the tag's wall, never a side wall — and only
+    normals roughly PERPENDICULAR to the room vertical count, so the floor and
+    ceiling can't win. Returns None when too little wall is in view or the search
+    wandered onto a different wall.
+
+    Measured in camera coordinates on purpose: independent of the tag yaw it is
+    about to replace."""
+    fwd = np.asarray(fwd_hint_cam, dtype=np.float64)
+    fwd /= np.linalg.norm(fwd)
+    up = np.asarray(up_cam, dtype=np.float64)
+    up /= np.linalg.norm(up)
+    clouds, normal_sets = [], []
+    for depth in samples_mm[:4]:
+        points, normals = _surface_normals(depth, intr)
+        if len(points):
+            clouds.append(points)
+            normal_sets.append(normals)
+    if not clouds:
+        return None
+    normals = np.concatenate(normal_sets)
+    # vertical surfaces only: normal within WALL_MAX_TILT_DEG of horizontal
+    wall_like = np.abs(normals @ up) < np.sin(np.radians(WALL_MAX_TILT_DEG))
+    normals = normals[wall_like]
+    if len(normals) < MIN_YAW_NORMALS:
+        if notes is not None:
+            notes.append("too little wall surface for a depth heading")
+        return None
+    normals = np.where((normals @ fwd)[:, None] < 0, -normals, normals)  # toward the tag's forward
+
+    used = None
+    direction = fwd
+    for window_deg in (30.0, 15.0, 8.0, 5.0):
+        near = normals[normals @ direction > np.cos(np.radians(window_deg))]
+        if len(near) < MIN_YAW_NORMALS:
+            break
+        direction = near.mean(axis=0)
+        direction /= np.linalg.norm(direction)
+        used = near
+    if used is None or len(used) < MIN_YAW_NORMALS:
+        if notes is not None:
+            notes.append("too few wall normals near the tag's forward")
+        return None
+    # flatten to pure horizontal (the yaw axis is the room vertical) and reject a
+    # search that walked onto a different wall
+    horiz = direction - (direction @ up) * up
+    if np.linalg.norm(horiz) < 1e-6:
+        return None
+    horiz /= np.linalg.norm(horiz)
+    moved_deg = float(np.degrees(np.arccos(np.clip(horiz @ fwd, -1.0, 1.0))))
+    scatter_deg = float(np.degrees(np.arccos(np.clip(used @ direction, -1.0, 1.0))).mean())
+    if moved_deg > MAX_YAW_CORRECTION_DEG or scatter_deg > MAX_YAW_SCATTER_DEG:
+        if notes is not None:
+            notes.append(f"wall heading rejected (moved {moved_deg:.1f}deg, "
+                         f"scatter {scatter_deg:.1f}deg, n={len(used)})")
+        return None
+    if notes is not None:
+        notes.append(f"wall normals={len(used)} scatter={scatter_deg:.2f}deg "
+                     f"heading_moved={moved_deg:.2f}deg")
+    return {"normal_cam": horiz, "normals_used": int(len(used)),
+            "scatter_deg": round(scatter_deg, 2), "moved_deg": round(moved_deg, 2)}
 
 
 def _depth_at(depth_m, px, py):
@@ -556,6 +643,30 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             (R.T @ vertical["up_cam"]) @ [0.0, -1.0, 0.0], -1.0, 1.0)))), 2)
         R = R @ N.T
         tvec = (-R @ cam_pos).reshape(3, 1)  # keep the camera where PnP put it
+
+    # ---- yaw from the wall -------------------------------------------------
+    # Levelling above took pitch and roll off the tag; yaw is the tag's LAST and
+    # worst axis. Replace it with the normal of the wall the tag hangs on,
+    # measured from the depth (thousands of pixels vs a 30 px tag). Rotate the
+    # frame about the now-correct vertical so that wall normal points along room
+    # +Z, keeping the tag's (well-conditioned) position. Skipped — leaving the
+    # tag's yaw untouched — whenever no trustworthy wall is in view.
+    yaw_deg = None
+    yaw_source = "tag corners (no usable wall in view)"
+    up_cam_meas = vertical["up_cam"] if vertical is not None else (R @ np.array([0.0, -1.0, 0.0]))
+    wall = find_room_wall(samples_mm, intr, R @ np.array([0.0, 0.0, 1.0]),
+                          up_cam_meas, level_notes)
+    if wall is not None:
+        fwd_room = R.T @ wall["normal_cam"]
+        fwd_h = fwd_room - (fwd_room @ [0.0, -1.0, 0.0]) * np.array([0.0, -1.0, 0.0])
+        if np.linalg.norm(fwd_h) > 1e-6:
+            fwd_h /= np.linalg.norm(fwd_h)
+            Y = _minimal_rotation(fwd_h, [0.0, 0.0, 1.0])   # rotation about the vertical
+            yaw_deg = wall["moved_deg"]
+            yaw_source = (f"{wall['normals_used']} wall normals "
+                          f"({wall['scatter_deg']}° scatter)")
+            R = R @ Y.T
+            tvec = (-R @ cam_pos).reshape(3, 1)
     rvec, _ = cv2.Rodrigues(R)
 
     if vertical is None:
@@ -615,6 +726,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         # how the frame's vertical was fixed — see find_room_vertical
         "levelled": {"source": level_source, "tag_tilt_deg": tilt_deg,
                      "camera_tilt_corrected_deg": residual_deg,
+                     "yaw_source": yaw_source, "yaw_from_wall_deg": yaw_deg,
                      "tag_obliquity_deg": obliquity_deg,
                      "defines_room_vertical": defines_room, "notes": level_notes,
                      "branch_chosen_by": sorted(set(branch_picks)),
