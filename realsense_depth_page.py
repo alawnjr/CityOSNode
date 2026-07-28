@@ -173,6 +173,11 @@ class CameraWorker:
         # extrinsic calibration state
         self.cal_lock = threading.Lock()
         self.cal = {"running": False, "ok": None, "message": ""}
+        # Set while calibrating: the pipeline is then running a high-resolution
+        # COLOUR profile instead of the recording one (see _swap_profile).
+        self.calib_profile = False
+        self.restart = False         # asks the capture loop to tear down and let
+        #                              _maybe_start_locked bring the pipeline back
 
     # ---------------------------------------------------------- clients ----
     def add_client(self):
@@ -197,14 +202,21 @@ class CameraWorker:
             self.cond.notify_all()
 
     def _maybe_start_locked(self):
-        if not self.running and not self.starting and rs is not None:
+        # `restart` means a swap is mid-flight: starting here would race the
+        # teardown and come up on the profile the swap is trying to leave.
+        if not self.running and not self.starting and not self.restart and rs is not None:
             self.starting = True
             threading.Thread(target=self._run, daemon=True).start()
 
     # --------------------------------------------------------- pipeline ----
     def _start_pipeline(self):
         model = self.name.split()[-1].lower()
-        if str(self.usb).startswith("2"):
+        if self.calib_profile:
+            # Extrinsics are solved at the best colour mode the camera has, not
+            # at the recording profile — the tag's pixel size is what bounds the
+            # pose accuracy. See CALIB_COLOR_ATTEMPTS.
+            attempts = realsense_extrinsics.CALIB_COLOR_ATTEMPTS
+        elif str(self.usb).startswith("2"):
             attempts = PROFILE_ATTEMPTS_USB2
         else:
             preferred = model_profile(model)
@@ -214,7 +226,11 @@ class CameraWorker:
         for width, height, fps in attempts:
             config = rs.config()
             config.enable_device(self.serial)
-            config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+            # Calibration runs colour high and depth low: no D4xx offers depth
+            # above 1280x720, and align() reprojects depth onto colour anyway.
+            # Depth only feeds the room vertical and the range cross-check.
+            dw, dh = (640, 480) if self.calib_profile else (width, height)
+            config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
             config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
             try:
                 profile = pipeline.start(config)
@@ -314,6 +330,8 @@ class CameraWorker:
         try:
             while True:
                 with self.cond:
+                    if self.restart:   # calibration is swapping the colour profile
+                        break
                     if self.clients == 0 and (time.monotonic() - self.last_active) > IDLE_TIMEOUT:
                         break
                 with fs_cond:
@@ -460,6 +478,12 @@ class CameraWorker:
 
     # --------------------------------------------------------- recording ---
     def record_start(self, out_dir, duration):
+        with self.cal_lock:
+            # Calibration has the pipeline on a high-resolution, low-fps colour
+            # profile — a recording started now would be captured at that
+            # profile instead of the one node.env pins.
+            if self.cal["running"]:
+                return False, "extrinsic calibration is running — retry when it finishes", None
         with self.rec_lock:
             if self.rec["running"]:
                 return False, "recording already in progress", None
@@ -732,11 +756,46 @@ class CameraWorker:
         with self.cal_lock:
             return dict(self.cal)
 
+    def _swap_profile(self, calib):
+        """Restart this camera's pipeline in (or out of) calibration mode.
+
+        The camera is single-access, so capturing calibration frames at a higher
+        resolution than the live/recording profile means tearing the running
+        pipeline down and bringing it back. Blocks until frames flow again."""
+        with self.cond:
+            self.calib_profile = calib
+            self.restart = True
+            self.cond.notify_all()
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:      # let the capture loop finish
+            with self.cond:
+                if not (self.running or self.starting):
+                    break
+            time.sleep(0.1)
+        with self.cond:
+            self.restart = False
+            # Frames and intrinsics belong to the OLD profile — drop them so
+            # nothing mixes resolutions, and so wait_first_frame really waits.
+            self.color_bgr = self.depth_z16 = self.color_intr = None
+            self.frame_id = 0
+            self._maybe_start_locked()
+        if not self.wait_first_frame(FIRST_FRAME_TIMEOUT):
+            raise RuntimeError(self.status().get("error")
+                               or f"camera did not restart ({'calibration' if calib else 'live'} profile)")
+
     def _calibrate(self):
         self.add_client()
+        swapped = False
         try:
+            if self.record_queues:
+                raise RuntimeError("a recording is in progress — calibrate when it finishes")
             if not self.wait_first_frame(FIRST_FRAME_TIMEOUT):
                 raise RuntimeError(self.status().get("error") or "camera unavailable")
+            # Up to the camera's best colour mode for the six frames we solve
+            # from: pose error scales as 1/tag_px, and the recording profile's
+            # 640x480 leaves the 138mm tag only ~26px across.
+            self._swap_profile(True)
+            swapped = True
             samples, last_id = [], -1
             intr = None
             deadline = time.monotonic() + 6.0
@@ -756,9 +815,17 @@ class CameraWorker:
                 raise RuntimeError("no color intrinsics from the camera")
             ok, message = realsense_extrinsics.calibrate_from_samples(
                 samples, self.frame_intrinsics(intr), self.serial, camera_name=self.name)
+            message = f"solved at {intr.width}x{intr.height}: {message}"
         except Exception as exc:  # noqa: BLE001 - reported on the page
             ok, message = False, str(exc)
         finally:
+            if swapped:
+                # Always go back to the recording profile, even on failure — the
+                # live view and any later recording depend on it.
+                try:
+                    self._swap_profile(False)
+                except Exception as exc:  # noqa: BLE001
+                    ok, message = False, f"{message}; !! could not restore the live profile: {exc}"
             self.remove_client()
         with self.cal_lock:
             self.cal = {"running": False, "ok": ok, "message": message}

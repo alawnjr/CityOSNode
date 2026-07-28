@@ -87,6 +87,25 @@ MIN_LEVEL_NORMALS = 15000
 MAX_LEVEL_SCATTER_DEG = 6.0
 # Below this the tag is too few pixels across for its corners to pin down yaw.
 MIN_TAG_PIXELS = 60.0
+# Colour modes to try for a CALIBRATION capture, highest first — extrinsics are
+# solved at the best resolution the camera offers, not at the recording profile.
+#
+# Corner-localisation noise is fixed in PIXELS (~0.3 px), so the pose's angular
+# error scales as 1/tag_px, and tag_px = f*size/range with f proportional to the
+# capture width. The 138.4 mm tag at ~2.5 m is ~26 px across at 640x480 and
+# ~77 px at 1920x1080 — a 3x cut in yaw error for no hardware change.
+#
+# This is safe because a camera's POSE is a property of its body, not of the
+# stream it happens to be delivering: extrinsics solved at high resolution apply
+# unchanged to a 640x480 recording, since each profile carries its own
+# intrinsics and both share one optical centre. 15 fps because calibration wants
+# six still frames, and 1920x1080 BGR8 at 30 fps is 186 MB/s of USB on a bus
+# that a second camera is also using.
+#
+# Not every mode exists on every model (the D435's colour goes to 1920x1080, the
+# D455's sensor is 1MP), so these are ATTEMPTS: the first that starts wins.
+CALIB_COLOR_ATTEMPTS = ((1920, 1080, 15), (1280, 800, 15), (1280, 720, 15),
+                        (960, 540, 15), (848, 480, 15), (640, 480, 30))
 # Depth only breaks the planar-PnP tie when it beats the other branch by this
 # much; a near-tie is noise, not a decision.
 DEPTH_TIEBREAK_MARGIN = 0.75
@@ -704,6 +723,13 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     cv2.drawFrameAxes(overlay, K, dist, raw_rvec, raw_tvec, tag_size_mm * 0.75)
     cv2.imwrite(str(debug_dir / "extrinsic_live.jpg"), overlay)
 
+    # The tag's longest edge in pixels — the single number that bounds how well
+    # this solve could possibly do. Corner-localisation noise is fixed in PIXELS
+    # (~0.3 px), so the angular error of the pose scales as 1/tag_px: the 138 mm
+    # tag is ~26 px across at 640x480 and ~77 px at 1920x1080. Recorded here so
+    # a recalibration can be compared against the one it replaced.
+    tag_px = float(np.linalg.norm(img_pts - np.roll(img_pts, 1, axis=0), axis=1).max())
+
     out_path = out_dir / f"{serial}.extrinsics.json"
     _atomic_write_json(out_path, {
         "schema_version": "1",
@@ -714,6 +740,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "frame": "tag: origin=center, X=right, Y=up, Z=out of tag (gravity-levelled); units mm",
         "tag": {"family": "36h11", "id": tag_id, "size_mm": tag_size_mm},
         "image_size": [w, h],
+        "tag_pixels": round(tag_px, 1),           # longest tag edge; bounds the angular accuracy
         "rvec": rvec.flatten().tolist(),          # room -> camera rotation (Rodrigues)
         "tvec_mm": tvec.flatten().tolist(),       # tag origin in camera frame
         "rotation_cam_to_room": R.T.tolist(),
@@ -745,8 +772,8 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # set), the tag's size no longer matters — the wall normal, not the tag
     # corners, fixes forward. Only when we FELL BACK to the tag's corners does
     # their pixel count bound the yaw: a 20 px tag is worth several degrees, and
-    # the noise is a static bias so averaging frames cannot help.
-    tag_px = float(np.linalg.norm(img_pts - np.roll(img_pts, 1, axis=0), axis=1).max())
+    # the noise is a static bias so averaging frames cannot help. (tag_px is
+    # measured above, next to the record it is written into.)
     yaw_note = ""
     if yaw_deg is not None:
         yaw_note = f"; yaw from the wall ({yaw_source}), tag corners {yaw_deg}° off"
@@ -946,11 +973,23 @@ def main():
     config = rs.config()
     if args.serial:
         config.enable_device(args.serial)
-    config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
-    try:
-        profile = pipeline.start(config)
-    except RuntimeError:
+    # Solve the tag at the camera's HIGHEST colour mode, not the recording
+    # profile — see CALIB_COLOR_ATTEMPTS. Depth stays low (no D4xx does depth
+    # above 1280x720, and align() reprojects it onto colour anyway); it only
+    # feeds the vertical and the range cross-check.
+    profile = None
+    for width, height, fps in CALIB_COLOR_ATTEMPTS:
+        config = rs.config()
+        if args.serial:
+            config.enable_device(args.serial)
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, fps)
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        try:
+            profile = pipeline.start(config)
+            break
+        except RuntimeError:
+            continue
+    if profile is None:
         config = rs.config()
         if args.serial:
             config.enable_device(args.serial)
