@@ -115,14 +115,20 @@ MIN_TAG_PIXELS = 60.0
 # D455's sensor is 1MP), so these are ATTEMPTS: the first that starts wins.
 CALIB_COLOR_ATTEMPTS = ((1920, 1080, 15), (1280, 800, 15), (1280, 720, 15),
                         (960, 540, 15), (848, 480, 15), (640, 480, 30))
-# Depth sizes to try alongside, also highest first. No D4xx does depth above
-# 1280x720, so depth is enabled SEPARATELY from colour rather than matched to it.
-# Worth taking the best available even though depth feeds only the vertical and
-# the range cross-check: align() reprojects depth onto the colour grid, and
-# stretching 640x480 depth over a 1920x1080 frame interpolates the very pixels
-# _depth_at samples at the tag corners (it doubled the D455's depth_agreement_mm
-# from 24.3 to 50.6) and smears the surface normals the vertical is pooled from.
-CALIB_DEPTH_ATTEMPTS = ((1280, 720), (848, 480), (640, 480))
+# Depth sizes to try alongside. Depth is enabled SEPARATELY from colour because
+# no D4xx does depth above 1280x720, so it cannot simply match a 1920x1080 colour
+# stream.
+#
+# 640x480 DELIBERATELY, not the sensor's best: measured on both cameras, raising
+# depth to 1280x720 made every depth-derived quantity worse, because a downsampled
+# depth frame is a DENOISED one. The vertical lost valid normals (the D455 went
+# from 28661 to 15940 640x480-equivalents — the discontinuity test throws out more
+# of a noisier frame), and depth_agreement_mm rose on both cameras (D455 50.6 ->
+# 84.2, D435 151.7 -> 219.2) because _depth_at's fixed 5x5 median window spans
+# less physical area at higher resolution, so it averages less. Stereo depth on a
+# flat low-texture target like a printed tag is exactly where per-pixel noise
+# hurts most. Left as a list so a camera lacking 640x480 still negotiates.
+CALIB_DEPTH_ATTEMPTS = ((640, 480), (848, 480), (1280, 720))
 # Depth only breaks the planar-PnP tie when it beats the other branch by this
 # much; a near-tie is noise, not a decision.
 DEPTH_TIEBREAK_MARGIN = 0.75
