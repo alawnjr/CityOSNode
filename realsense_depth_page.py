@@ -31,6 +31,7 @@ import csv
 import datetime as dt
 import fcntl
 import json
+import math
 import multiprocessing
 import os
 import socket
@@ -95,9 +96,21 @@ except ImportError as exc:  # pragma: no cover - depends on node state
 # Per-model capture profiles (recordings run at the pipeline rate); override
 # with e.g. SMARTROOM_DEPTH_PROFILE_D455=848x480@30 in node.env. On USB 2 the
 # low fallbacks apply (the whole USB 2 bus is ~40 MB/s).
-FALLBACK_ATTEMPTS = ((640, 480, 30), (640, 480, 15), (424, 240, 15))
-PROFILE_ATTEMPTS_USB2 = ((640, 480, 15), (424, 240, 15))
-_MODEL_DEFAULTS = {"d455": "640x480@30", "d435": "640x480@30"}
+#
+# 848x480 rather than 640x480: the 4:3 modes are a horizontal CROP of the sensor
+# at UNCHANGED focal length, so they throw away field of view for nothing. The
+# factory fx of 616 (D435) at 640 wide implies a 54.9 deg horizontal FOV against
+# a 69.4 deg datasheet figure — 14.5 deg discarded. A 16:9 mode of the same
+# height recovers it: 2*atan(424/616) = 69.0 deg, which is the datasheet number.
+# Because fx is identical, nothing shrinks — a tag stays the same pixel size and
+# there is simply more room either side of it. Same for the D455 (79.3 -> ~90 deg).
+# Costs 32% more pixels through the view encoder and the raw depth writer; see
+# SHM_RAW_LIMIT for what that does to the in-RAM clip length.
+FALLBACK_ATTEMPTS = ((848, 480, 30), (640, 480, 30), (640, 480, 15), (424, 240, 15))
+# USB 2 cannot carry 848x480@15 in BGR8 plus depth (~30 MB/s of a ~40 MB/s bus),
+# so the wide option there is 640x360 — still 16:9, just fewer pixels.
+PROFILE_ATTEMPTS_USB2 = ((640, 360, 15), (640, 480, 15), (424, 240, 15))
+_MODEL_DEFAULTS = {"d455": "848x480@30", "d435": "848x480@30"}
 
 
 def model_profile(model):
@@ -117,6 +130,8 @@ DATA_DIR = PROJECT_ROOT / "data"
 # raw depth buffers smaller than this go to /dev/shm (RAM); bigger ones go to
 # the SD card next to the recording. /dev/shm is 1.9GB total and BOTH cameras
 # buffer there at once, so the per-camera cap is just under half.
+# At the 848x480@30 default this covers clips up to ~32s (it was ~42s at
+# 640x480); past that, raw depth streams to the SD card during capture.
 SHM_RAW_LIMIT = 850_000_000
 
 
@@ -284,6 +299,17 @@ class CameraWorker:
                           .as_video_stream_profile().get_intrinsics())
         except RuntimeError:
             color_intr = None
+        if color_intr is not None:
+            # Report the negotiated field of view. Which modes are crops of the
+            # sensor and which use its full width is not documented per-profile
+            # and is invisible in the resolution alone, so surface it rather than
+            # inferring it: a mode that widens the view raises hfov at unchanged
+            # fx, a mode that merely upscales raises fx at unchanged hfov.
+            info["fx"] = round(float(color_intr.fx), 1)
+            info["hfov_deg"] = round(math.degrees(
+                2.0 * math.atan(color_intr.width / 2.0 / color_intr.fx)), 1)
+            info["vfov_deg"] = round(math.degrees(
+                2.0 * math.atan(color_intr.height / 2.0 / color_intr.fy)), 1)
 
         with self.cond:
             self.running = True

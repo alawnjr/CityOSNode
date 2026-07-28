@@ -113,6 +113,13 @@ MIN_TAG_PIXELS = 60.0
 #
 # Not every mode exists on every model (the D435's colour goes to 1920x1080, the
 # D455's sensor is 1MP), so these are ATTEMPTS: the first that starts wins.
+#
+# Ordered by WIDTH first, then height. Width is what matters twice over here: it
+# sets the tag's pixel size, and it sets how much of the room is in frame — and a
+# frame holding several mapped tags is what lets the joint multi-tag solve fix
+# yaw off a metre of baseline instead of one 138mm square. The 4:3 entries sit
+# last because they are horizontal crops at unchanged focal length: they cost
+# field of view without buying any tag pixels.
 CALIB_COLOR_ATTEMPTS = ((1920, 1080, 15), (1280, 800, 15), (1280, 720, 15),
                         (960, 540, 15), (848, 480, 15), (640, 480, 30))
 # Depth sizes to try alongside. Depth is enabled SEPARATELY from colour because
