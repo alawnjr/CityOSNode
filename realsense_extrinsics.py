@@ -85,6 +85,15 @@ MIN_TAG_OBLIQUITY_DEG = 20.0
 # normals off one desk — not enough to overrule anything.
 MIN_LEVEL_NORMALS = 15000
 MAX_LEVEL_SCATTER_DEG = 6.0
+# Every normal-COUNT threshold here was tuned on 640x480 frames, and
+# _surface_normals samples a fixed 1-in-`step` grid — so the raw counts scale
+# with the frame's pixel area, not with how much room is actually in view. Once
+# calibration moved to the cameras' full colour modes that made the gates
+# meaningless: at 1920x1080 the same starved sliver of desk yields 6.75x more
+# normals, which let the D435 level off ~6400 640x480-equivalent normals having
+# correctly refused 5537 the run before. Scale the thresholds by area so a gate
+# means the same thing at any resolution.
+NORMALS_REF_PIXELS = 640 * 480
 # Below this the tag is too few pixels across for its corners to pin down yaw.
 MIN_TAG_PIXELS = 60.0
 # Colour modes to try for a CALIBRATION capture, highest first — extrinsics are
@@ -106,6 +115,14 @@ MIN_TAG_PIXELS = 60.0
 # D455's sensor is 1MP), so these are ATTEMPTS: the first that starts wins.
 CALIB_COLOR_ATTEMPTS = ((1920, 1080, 15), (1280, 800, 15), (1280, 720, 15),
                         (960, 540, 15), (848, 480, 15), (640, 480, 30))
+# Depth sizes to try alongside, also highest first. No D4xx does depth above
+# 1280x720, so depth is enabled SEPARATELY from colour rather than matched to it.
+# Worth taking the best available even though depth feeds only the vertical and
+# the range cross-check: align() reprojects depth onto the colour grid, and
+# stretching 640x480 depth over a 1920x1080 frame interpolates the very pixels
+# _depth_at samples at the tag corners (it doubled the D455's depth_agreement_mm
+# from 24.3 to 50.6) and smears the surface normals the vertical is pooled from.
+CALIB_DEPTH_ATTEMPTS = ((1280, 720), (848, 480), (640, 480))
 # Depth only breaks the planar-PnP tie when it beats the other branch by this
 # much; a near-tie is noise, not a decision.
 DEPTH_TIEBREAK_MARGIN = 0.75
@@ -217,6 +234,15 @@ def _minimal_rotation(a, b):
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
 
 
+def normals_scale(intr):
+    """Multiplier taking a 640x480-tuned normal count to this frame's size.
+
+    _surface_normals walks a fixed 1-in-`step` grid, so its output count is
+    proportional to the frame's pixel area. See NORMALS_REF_PIXELS."""
+    px = float(getattr(intr, "width", 0) or 0) * float(getattr(intr, "height", 0) or 0)
+    return px / NORMALS_REF_PIXELS if px > 0 else 1.0
+
+
 def _surface_normals(depth_mm, intr, step=4):
     """Per-pixel surface normals (unit, camera frame) from one depth image.
 
@@ -257,6 +283,8 @@ def find_room_vertical(samples_mm, intr, up_hint, notes=None):
     independently of the tag pose it is about to correct."""
     up = np.asarray(up_hint, dtype=np.float64)
     up /= np.linalg.norm(up)
+    scale = normals_scale(intr)      # counts below are 640x480-equivalents
+    floor_min = 2000 * scale
     clouds, normal_sets = [], []
     for depth in samples_mm[:4]:
         points, normals = _surface_normals(depth, intr)
@@ -271,13 +299,13 @@ def find_room_vertical(samples_mm, intr, up_hint, notes=None):
     used = None
     for window_deg in (30.0, 15.0, 8.0, 5.0):
         near = normals[normals @ up > np.cos(np.radians(window_deg))]
-        if len(near) < 2000:
+        if len(near) < floor_min:
             break
         # mean of a tight cluster of unit vectors — the dominant surface normal
         up = near.mean(axis=0)
         up /= np.linalg.norm(up)
         used = near
-    if used is None or len(used) < 2000:
+    if used is None or len(used) < floor_min:
         if notes is not None:
             notes.append("too few horizontal-surface normals")
         return None
@@ -288,10 +316,10 @@ def find_room_vertical(samples_mm, intr, up_hint, notes=None):
     heights = points @ up
     horizontal = points[(normals @ up) > np.cos(np.radians(8.0))]
     floor_mm = None
-    if len(horizontal) > 2000:
+    if len(horizontal) > floor_min:
         levels = horizontal @ up
         counts, edges = np.histogram(levels, bins=np.arange(-4000, 4000, 50))
-        big = [i for i, c in enumerate(counts) if c > max(1500, 0.05 * len(horizontal))]
+        big = [i for i, c in enumerate(counts) if c > max(1500 * scale, 0.05 * len(horizontal))]
         if big:
             band = levels[np.abs(levels - (edges[big[0]] + 25)) < 100]
             floor_mm = float(np.median(band))       # signed height above the camera
@@ -301,6 +329,9 @@ def find_room_vertical(samples_mm, intr, up_hint, notes=None):
                      f"span={np.ptp(heights):.0f}mm "
                      f"floor={'%.0f' % floor_mm if floor_mm is not None else 'n/a'}")
     return {"up_cam": up, "normals_used": int(len(used)),
+            # the same count at 640x480, which is what the thresholds are quoted
+            # in — the raw figure is meaningless without the frame size
+            "normals_used_ref": int(len(used) / scale) if scale > 0 else int(len(used)),
             "scatter_deg": round(scatter_deg, 2),
             "floor_below_camera_mm": round(floor_mm, 1) if floor_mm is not None else None}
 
@@ -324,6 +355,7 @@ def find_room_wall(samples_mm, intr, fwd_hint_cam, up_cam, notes=None):
     fwd /= np.linalg.norm(fwd)
     up = np.asarray(up_cam, dtype=np.float64)
     up /= np.linalg.norm(up)
+    min_normals = MIN_YAW_NORMALS * normals_scale(intr)   # 640x480-equivalent
     clouds, normal_sets = [], []
     for depth in samples_mm[:4]:
         points, normals = _surface_normals(depth, intr)
@@ -336,7 +368,7 @@ def find_room_wall(samples_mm, intr, fwd_hint_cam, up_cam, notes=None):
     # vertical surfaces only: normal within WALL_MAX_TILT_DEG of horizontal
     wall_like = np.abs(normals @ up) < np.sin(np.radians(WALL_MAX_TILT_DEG))
     normals = normals[wall_like]
-    if len(normals) < MIN_YAW_NORMALS:
+    if len(normals) < min_normals:
         if notes is not None:
             notes.append("too little wall surface for a depth heading")
         return None
@@ -346,12 +378,12 @@ def find_room_wall(samples_mm, intr, fwd_hint_cam, up_cam, notes=None):
     direction = fwd
     for window_deg in (30.0, 15.0, 8.0, 5.0):
         near = normals[normals @ direction > np.cos(np.radians(window_deg))]
-        if len(near) < MIN_YAW_NORMALS:
+        if len(near) < min_normals:
             break
         direction = near.mean(axis=0)
         direction /= np.linalg.norm(direction)
         used = near
-    if used is None or len(used) < MIN_YAW_NORMALS:
+    if used is None or len(used) < min_normals:
         if notes is not None:
             notes.append("too few wall normals near the tag's forward")
         return None
@@ -417,11 +449,15 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     samples_mm = [depth * 1000.0 for _, depth in samples]
     level_notes = []
     vertical = find_room_vertical(samples_mm, intr, [0.0, -1.0, 0.0], level_notes)
-    if vertical is not None and (vertical["normals_used"] < MIN_LEVEL_NORMALS
+    # Compared in 640x480-equivalents: the raw count scales with the frame area,
+    # so at full colour resolution it would clear a 640x480 threshold off the
+    # same sliver of surface that was rightly rejected at 640x480.
+    if vertical is not None and (vertical["normals_used_ref"] < MIN_LEVEL_NORMALS
                                  or vertical["scatter_deg"] > MAX_LEVEL_SCATTER_DEG):
-        level_notes.append(f"rejected: {vertical['normals_used']} normals at "
-                           f"{vertical['scatter_deg']}° scatter is too little horizontal "
-                           f"surface to level from")
+        level_notes.append(f"rejected: {vertical['normals_used']} normals "
+                           f"({vertical['normals_used_ref']} at 640x480, want "
+                           f"{MIN_LEVEL_NORMALS}) at {vertical['scatter_deg']}° scatter is too "
+                           f"little horizontal surface to level from")
         vertical = None
 
     branch_picks = []       # how each detection's branch got chosen (diagnostic)
@@ -694,7 +730,8 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                         "NOT LEVELLED — no horizontal surface in view")
     else:
         level_source = (f"{vertical['normals_used']} horizontal-surface normals "
-                        f"({vertical['scatter_deg']}° scatter)"
+                        f"({vertical['normals_used_ref']} at 640x480, "
+                        f"{vertical['scatter_deg']}° scatter)"
                         + ("" if defines_room else
                            f", tag seen too head-on ({obliquity_deg}°) to define the room"))
 
@@ -850,9 +887,13 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
         # camera coordinates, and the floor is that far below the camera.
         floor_mm = float(plane["up_cam"] @ tvec.reshape(3) - plane["floor_below_camera_mm"])
     previous = _load_room_level(out_dir) or {}
-    incumbent = (previous.get("measured_by") or {}).get("normals_used", 0)
-    if ((previous.get("measured_by") or {}).get("camera") != serial
-            and incumbent > plane["normals_used"]):
+    # Compared in 640x480-equivalents: the cameras calibrate at DIFFERENT
+    # resolutions (the D455 caps at 1280x800, the D435 reaches 1920x1080), so raw
+    # counts would hand the room's vertical to whichever camera has more pixels
+    # rather than to whichever sees more room.
+    prev_by = previous.get("measured_by") or {}
+    incumbent = prev_by.get("normals_used_ref", prev_by.get("normals_used", 0))
+    if prev_by.get("camera") != serial and incumbent > plane["normals_used_ref"]:
         return previous          # someone else measured it off more surface
     level = {
         "schema_version": "1",
@@ -861,6 +902,7 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
         "up_in_tag_frame": [round(float(v), 6) for v in up_room],
         "tag_tilt_deg": tilt_deg,
         "measured_by": {"camera": serial, "normals_used": plane["normals_used"],
+                        "normals_used_ref": plane["normals_used_ref"],
                         "scatter_deg": plane["scatter_deg"]},
         # informational — SMARTROOM_TAG_HEIGHT_MM remains what capture.py embeds
         "measured_floor_mm": round(floor_mm, 1) if floor_mm is not None else
@@ -979,16 +1021,19 @@ def main():
     # feeds the vertical and the range cross-check.
     profile = None
     for width, height, fps in CALIB_COLOR_ATTEMPTS:
-        config = rs.config()
-        if args.serial:
-            config.enable_device(args.serial)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, fps)
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        try:
-            profile = pipeline.start(config)
+        for dw, dh in CALIB_DEPTH_ATTEMPTS:
+            config = rs.config()
+            if args.serial:
+                config.enable_device(args.serial)
+            config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
+            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+            try:
+                profile = pipeline.start(config)
+                break
+            except RuntimeError:
+                continue
+        if profile is not None:
             break
-        except RuntimeError:
-            continue
     if profile is None:
         config = rs.config()
         if args.serial:

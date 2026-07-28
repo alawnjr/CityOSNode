@@ -224,19 +224,22 @@ class CameraWorker:
         pipeline = rs.pipeline()
         last_error = None
         for width, height, fps in attempts:
-            config = rs.config()
-            config.enable_device(self.serial)
-            # Calibration runs colour high and depth low: no D4xx offers depth
-            # above 1280x720, and align() reprojects depth onto colour anyway.
-            # Depth only feeds the room vertical and the range cross-check.
-            dw, dh = (640, 480) if self.calib_profile else (width, height)
-            config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
-            config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-            try:
-                profile = pipeline.start(config)
-                return pipeline, profile, (width, height, fps)
-            except RuntimeError as exc:
-                last_error = exc
+            # Calibration enables depth SEPARATELY from colour and takes the best
+            # of each: no D4xx does depth above 1280x720, so it cannot simply
+            # match a 1920x1080 colour stream. Live/recording keeps them equal so
+            # the aligned panes map 1:1.
+            depth_sizes = (realsense_extrinsics.CALIB_DEPTH_ATTEMPTS if self.calib_profile
+                           else ((width, height),))
+            for dw, dh in depth_sizes:
+                config = rs.config()
+                config.enable_device(self.serial)
+                config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
+                config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+                try:
+                    profile = pipeline.start(config)
+                    return pipeline, profile, (width, height, fps)
+                except RuntimeError as exc:
+                    last_error = exc
         raise last_error if last_error else RuntimeError("no usable RealSense profile")
 
     def _run(self):
