@@ -75,6 +75,11 @@ PORT = int(os.environ.get("SMARTROOM_DEPTH_PORT", "8001"))
 STREAM_BOUNDARY = "frame"
 IDLE_TIMEOUT = 5.0   # stop a camera pipeline this many seconds after its last client leaves
 FIRST_FRAME_TIMEOUT = 10.0  # pipeline start + first frames can take a few seconds
+# A profile SWAP additionally negotiates: each colour mode the sensor lacks costs a
+# failed pipeline.start() of a second or more before the next is tried, so the swap
+# needs materially longer than a plain start. Too short here does not merely delay
+# the calibration, it aborts it.
+SWAP_FRAME_TIMEOUT = 30.0
 JPEG_QUALITY = 70
 # Browser-bound frame rate cap (newest frame wins, so slow wifi sees lower fps
 # instead of latency), and the colorize/JPEG budget for the live view.
@@ -236,16 +241,27 @@ class CameraWorker:
         else:
             preferred = model_profile(model)
             attempts = (preferred,) + tuple(a for a in FALLBACK_ATTEMPTS if a != preferred)
+        # Calibration enables depth SEPARATELY from colour and takes the best of
+        # each: no D4xx does depth above 1280x720, so it cannot simply match a
+        # 1920x1080 colour stream. Live/recording keeps them equal so the aligned
+        # panes map 1:1.
+        #
+        # DEPTH IS THE OUTER LOOP. Nested the other way, a colour mode the sensor
+        # does not have burns one failed pipeline.start() per depth variant before
+        # moving on — the D455's 1MP sensor cannot do 1920x1080, so it spent three
+        # failed starts (seconds each) getting to 1280x800 and blew the
+        # first-frame timeout, which aborted the calibration. Sweeping all colour
+        # modes at 640x480 depth first costs at most ONE wasted start, because
+        # every D4xx has 640x480 depth. Preferring lower depth over higher colour
+        # is also the right trade here: colour resolution is what sets the tag's
+        # pixel size, and depth is deliberately kept low anyway.
+        depth_sizes = (realsense_extrinsics.CALIB_DEPTH_ATTEMPTS if self.calib_profile
+                       else (None,))
         pipeline = rs.pipeline()
         last_error = None
-        for width, height, fps in attempts:
-            # Calibration enables depth SEPARATELY from colour and takes the best
-            # of each: no D4xx does depth above 1280x720, so it cannot simply
-            # match a 1920x1080 colour stream. Live/recording keeps them equal so
-            # the aligned panes map 1:1.
-            depth_sizes = (realsense_extrinsics.CALIB_DEPTH_ATTEMPTS if self.calib_profile
-                           else ((width, height),))
-            for dw, dh in depth_sizes:
+        for depth_size in depth_sizes:
+            for width, height, fps in attempts:
+                dw, dh = depth_size if depth_size else (width, height)
                 config = rs.config()
                 config.enable_device(self.serial)
                 config.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
@@ -869,13 +885,20 @@ class CameraWorker:
             self.color_bgr = self.depth_z16 = self.color_intr = None
             self.frame_id = 0
             self._maybe_start_locked()
-        if not self.wait_first_frame(FIRST_FRAME_TIMEOUT):
+        if not self.wait_first_frame(SWAP_FRAME_TIMEOUT):
             raise RuntimeError(self.status().get("error")
-                               or f"camera did not restart ({'calibration' if calib else 'live'} profile)")
+                               or f"camera did not restart ({'calibration' if calib else 'live'} profile) "
+                                  f"within {SWAP_FRAME_TIMEOUT:.0f}s")
 
     def _calibrate(self):
         self.add_client()
-        swapped = False
+        # Set BEFORE the swap, not after it returns. _swap_profile assigns
+        # calib_profile as its first act, so a failure part-way through still
+        # leaves the camera committed to the calibration profile — and with this
+        # flag set afterwards, the restore in `finally` was skipped and the D455
+        # sat on 1280x800@15 indefinitely, which is also what any recording
+        # started next would have been captured at.
+        swapped = True
         try:
             if self.record_queues:
                 raise RuntimeError("a recording is in progress — calibrate when it finishes")
@@ -885,7 +908,6 @@ class CameraWorker:
             # from: pose error scales as 1/tag_px, and the recording profile's
             # 640x480 leaves the 138mm tag only ~26px across.
             self._swap_profile(True)
-            swapped = True
             samples, last_id = [], -1
             intr = None
             deadline = time.monotonic() + 6.0
