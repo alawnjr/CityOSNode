@@ -1020,6 +1020,15 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     tag_notes = _save_room_tags(other_tags, M, serial, tag_id, tag_size_mm, out_dir,
                                 size_of, tag_sizes)
 
+    # Cross-check the map against the tape. The reference tag is the origin by
+    # definition; everything else comes from the map just written.
+    poses = {int(tag_id): (np.eye(3), np.zeros(3))}
+    for tid, (Q, pos, _sz) in _load_room_tags(out_dir).items():
+        poses[int(tid)] = (Q, pos)
+    measured_notes = check_measured_geometry(poses, _env_tag_heights())
+    if measured_notes:
+        tag_notes += "; vs tape — " + "; ".join(measured_notes)
+
     # How well YAW is pinned down. When the wall gave us the heading (yaw_deg is
     # set), the tag's size no longer matters — the wall normal, not the tag
     # corners, fixes forward. Only when we FELL BACK to the tag's corners does
@@ -1149,6 +1158,61 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
     _atomic_write_json(out_dir / LEVEL_FILENAME, level)
     level["up"] = np.asarray(up_room, dtype=np.float64)
     return level
+
+
+def _env_measured_pair():
+    """(distance_mm, wall_offset_mm) tape-measured between tags 3 and 4, or Nones.
+
+    SMARTROOM_TAG34_DISTANCE_MM   centre-to-centre, 3D
+    SMARTROOM_TAG4_WALL_OFFSET_MM tag 4's perpendicular distance from tag 3's wall
+    """
+    def read(key):
+        try:
+            return float(os.environ[key])
+        except (KeyError, ValueError):
+            return None
+    return read("SMARTROOM_TAG34_DISTANCE_MM"), read("SMARTROOM_TAG4_WALL_OFFSET_MM")
+
+
+def check_measured_geometry(poses, heights=None):
+    """Compare the SOLVED tag map against what a tape measure says, in mm.
+
+    A solved map has no way to know it is wrong — the joint solve removes scatter,
+    not bias, so a whole constellation can sit self-consistently in the wrong
+    place. These are the only independent facts available, so spend them:
+
+      * |tag3 - tag4|            vs SMARTROOM_TAG34_DISTANCE_MM
+      * tag4 off tag3's wall     vs SMARTROOM_TAG4_WALL_OFFSET_MM
+        (tag 3's own +Z is the wall normal, so this is that component)
+      * their height difference  vs SMARTROOM_TAG_HEIGHTS
+        (the levelled frame's up is -Y, hence the sign)
+
+    `poses` is {id: (R_tag_to_room, position_mm)}. Returns a list of notes, each
+    prefixed '!!' when it exceeds tolerance — 50 mm or 5%, whichever is larger,
+    which is well outside a tape's error and well inside the 200-330 mm scatter
+    these solves have actually produced."""
+    notes = []
+    if 3 not in poses or 4 not in poses:
+        return notes
+    (R3, p3), (_, p4) = poses[3], poses[4]
+    want_d, want_perp = _env_measured_pair()
+    heights = heights or {}
+
+    def verdict(label, got, want, unit="mm"):
+        tol = max(50.0, 0.05 * abs(want))
+        off = got - want
+        flag = "!! " if abs(off) > tol else ""
+        notes.append(f"{flag}{label}: solved {got:.0f} {unit}, measured {want:.0f} "
+                     f"{unit} ({off:+.0f})")
+
+    if want_d is not None:
+        verdict("tag3-tag4 separation", float(np.linalg.norm(p3 - p4)), want_d)
+    if want_perp is not None:
+        # tag 3's normal in room coordinates is the wall's normal
+        verdict("tag4 off tag3's wall", abs(float((p4 - p3) @ R3[:, 2])), want_perp)
+    if 3 in heights and 4 in heights:
+        verdict("tag3 above tag4", -float(p3[1] - p4[1]), heights[3] - heights[4])
+    return notes
 
 
 def _load_room_tags(out_dir):
