@@ -629,7 +629,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             return None
         obj_all = np.concatenate([known_corners[tid] for tid, _ in obs])
         img_all = np.concatenate([c.reshape(4, 2).astype(np.float64) for _, c in obs])
-        Q, p = known[seed_id]
+        Q, p, _seed_size = known[seed_id]
 
         scored = []
         for rvec_t, tvec_t in zip(rvecs, tvecs):
