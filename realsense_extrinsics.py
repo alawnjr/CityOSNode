@@ -916,9 +916,11 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         level_note += f", camera tilt corrected by {residual_deg}°"
     floor_note = ""
     if level and level.get("measured_floor_mm") is not None:
+        configured = _env_tag_height_mm(tag_id)
+        against = (f"(configured {configured:.0f} for tag {tag_id})" if configured is not None
+                   else f"(no height configured for tag {tag_id} — set SMARTROOM_TAG_HEIGHTS)")
         floor_note = (f"; lowest broad horizontal surface is {level['measured_floor_mm']:.0f} mm "
-                      f"below the tag — the floor, unless it is a desk "
-                      f"(configured {_env_tag_height_mm(tag_id):.0f} for tag {tag_id})")
+                      f"below the tag — the floor, unless it is a desk {against}")
     return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in room frame"
                   f"{via} ({dist_m:.2f} m from origin), reproj {err:.2f} px over {len(results)} frame(s)"
                   f"{agree}{level_note}{floor_note}{yaw_note}{tag_notes} — saved {out_path.name}")

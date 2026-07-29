@@ -187,24 +187,28 @@ def load_extrinsics():
 
 
 def room_frame_info():
-    """Static facts about the room coordinate frame (defined by AprilTag 1),
-    embedded in every recording so downstream analysis can relate tag-frame
-    coordinates to the physical room. Set SMARTROOM_TAG3_HEIGHT_MM in node.env to
-    the reference tag's measured centre height above the floor (tag 3 is 1330mm);
-    SMARTROOM_TAG_HEIGHT_MM is the old name for it and still works."""
-    height = float(os.environ.get("SMARTROOM_TAG3_HEIGHT_MM",
-                                  os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110")))
+    """Static facts about the room coordinate frame, embedded in every recording
+    so downstream analysis can relate tag-frame coordinates to the physical room.
+
+    Settings come from calibration_config (SMARTROOM_TAG_HEIGHTS gives the
+    reference tag's centre height above the floor, per tag). When no height is
+    configured, tag_center_above_floor_mm and floor_plane are NULL rather than a
+    default: the floor plane is what downstream stands people on, and a
+    fabricated one is indistinguishable from a measured one."""
+    ref_id = calibration_config.tag_id()
+    height = calibration_config.tag_height_mm(ref_id)
     info = {
         "reference_tag": {
-            "family": "36h11",
-            "id": int(os.environ.get("SMARTROOM_TAG_ID", "1")),
-            "size_mm": float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173")),
+            "family": calibration_config.TAG_FAMILY,
+            "id": ref_id,
+            "size_mm": calibration_config.tag_sizes().get(
+                ref_id, calibration_config.tag_size_mm()),
         },
         "definition": "origin=tag center, X=tag right, Y=tag up, Z=out of tag; units mm",
         "tag_center_above_floor_mm": height,
         # the frame's Y is gravity-levelled off a measured horizontal plane
         # (realsense_extrinsics.py), so this holds even if the tag hangs crooked
-        "floor_plane": f"y = {-height:.0f} mm",
+        "floor_plane": (f"y = {-height:.0f} mm" if height is not None else None),
     }
     # what the depth cameras actually measured of the room's vertical: the tag's
     # off-plumb angle, and the floor height they saw vs the configured one
