@@ -210,6 +210,17 @@ def _env_tag_sizes():
     return sizes
 
 
+def _env_tag_min_pixels():
+    """Ignore tag detections smaller than this many pixels across (0 = off).
+
+    Small tags do not just contribute little to a solve, they pull it: the D455
+    anchoring on an 18px tag at 5m mapped its two good tags with 200-330mm of
+    position scatter, while a 74px tag sat 2m away in the same frame. Default 0
+    so nothing changes for a node whose tags are all small; raise it in node.env
+    once there are big tags to prefer."""
+    return float(os.environ.get("SMARTROOM_TAG_MIN_PIXELS", "0"))
+
+
 def corner_model(size_mm):
     """Tag corner model for SOLVEPNP_IPPE_SQUARE (aruco order TL,TR,BR,BL),
     tag-centred, Z out of the tag — identical to calibrate_extrinsics.py."""
@@ -480,7 +491,7 @@ def _depth_at(depth_m, px, py):
 
 def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                            tag_id=None, tag_size_mm=None,
-                           out_dir=DEFAULT_OUT):
+                           out_dir=DEFAULT_OUT, min_tag_px=None):
     """samples: list of (color_bgr, depth_m) with depth ALIGNED to color.
     Returns (ok, message); writes calibration/<serial>.extrinsics.json and a
     debug overlay on success."""
@@ -490,6 +501,8 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         tag_id = _env_tag_id()
     if tag_size_mm is None:
         tag_size_mm = _env_tag_size_mm()
+    if min_tag_px is None:
+        min_tag_px = _env_tag_min_pixels()
     K, dist = intrinsics_to_cv(intr)
 
     # Per-tag edge lengths. The room mixes sizes on purpose — a camera that needs
@@ -667,12 +680,30 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     results = []
     other_tags = {}   # other tag id -> list of (err, R_room, pos_room_mm) per frame
     seen_ids = set()
+    skipped_px = {}   # tag id -> its size in px, for tags dropped as too small
     for color_bgr, depth_m in samples:
         corners, ids, _ = detector.detectMarkers(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY))
         if ids is None:
             continue
         flat = [int(i) for i in ids.flatten()]
         seen_ids.update(flat)
+        # Drop detections too few pixels across to be worth solving from. A small
+        # tag does not merely add little, it actively drags the pose: anchoring
+        # the D455 on an 18px tag at 5m mapped its two good tags with 200-330mm
+        # of scatter, where the 74px tag 2m away was sitting in the same frame.
+        # Off by default (min_tag_px 0) so a node with only small tags still
+        # calibrates; set SMARTROOM_TAG_MIN_PIXELS once bigger tags are up.
+        if min_tag_px > 0:
+            keep = []
+            for j, tid in enumerate(flat):
+                p = corners[j].reshape(4, 2)
+                px = float(np.linalg.norm(p - np.roll(p, 1, axis=0), axis=1).max())
+                if px >= min_tag_px:
+                    keep.append(j)
+                else:
+                    skipped_px[tid] = round(min(px, skipped_px.get(tid, 1e9)), 1)
+            corners = [corners[j] for j in keep]
+            flat = [flat[j] for j in keep]
         obs = [(tid, corners[j]) for j, tid in enumerate(flat) if tid in known]
         solved = solve_frame(obs, depth_m) if obs else None
         if solved is None:
@@ -706,8 +737,12 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
 
     if not results:
         listed = ", ".join(str(k) for k in sorted(known))
+        dropped = ("; " + ", ".join(f"tag {t} was ignored at {px:.0f} px"
+                                    for t, px in sorted(skipped_px.items()))
+                   + f" (SMARTROOM_TAG_MIN_PIXELS={min_tag_px:g}) — lower it or "
+                     f"use a bigger tag" if skipped_px else "")
         return False, (f"no usable tag seen (36h11 ids detected: {sorted(seen_ids) or 'none'}) — "
-                       f"need one of the mapped tags: {listed}")
+                       f"need one of the mapped tags: {listed}{dropped}")
 
     # Frames that include the reference tag beat ones anchored only through
     # other tags, whose errors stack on top of the map's own.
@@ -903,6 +938,10 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                     f"{tag_px:.0f} px across, too small to pin heading (spread between runs: "
                     f"several degrees). Aim the camera at a flat wall, use a bigger tag, "
                     f"move closer, or capture at higher resolution")
+    if skipped_px:
+        yaw_note += ("; ignored " + ", ".join(
+            f"tag {t} ({px:.0f} px)" for t, px in sorted(skipped_px.items()))
+            + f" as under SMARTROOM_TAG_MIN_PIXELS={min_tag_px:g}")
     edge = min(img_pts[:, 0].min(), img_pts[:, 1].min(),
                w - img_pts[:, 0].max(), h - img_pts[:, 1].max())
     if edge < 0.08 * min(w, h):
