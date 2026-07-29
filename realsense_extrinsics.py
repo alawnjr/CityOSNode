@@ -77,6 +77,7 @@ when the tag is too small or too near the frame edge to pin it down.
 import argparse
 import datetime as dt
 import json
+import re
 import os
 import socket
 import sys
@@ -1314,7 +1315,10 @@ def main():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip())
+                # trailing comment after the value — see load_node_env in
+                # capture.py; without this "4  # floor tag" reaches int()
+                value = re.split(r"\s+#", value.strip(), maxsplit=1)[0].strip()
+                os.environ.setdefault(key.strip(), value)
     except OSError:
         pass
 

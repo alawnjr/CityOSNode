@@ -27,6 +27,7 @@ Run on the Pi:  python capture.py            # 30s (default)
 import argparse
 import csv
 import json
+import re
 import os
 import socket
 import subprocess
@@ -63,6 +64,11 @@ def load_node_env():
             continue
         key, _, value = line.partition("=")
         key, value = key.strip(), value.strip()
+        # Trailing comment after the value. Without this,
+        #     SMARTROOM_TAG_ID=4   # the floor tag
+        # yields "4   # the floor tag" and the first int() of it dies. Only " #"
+        # (preceded by whitespace) counts, so a value containing # survives.
+        value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
         if key and key not in os.environ:
             os.environ[key] = value
 
