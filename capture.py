@@ -204,7 +204,7 @@ def room_frame_info():
             "size_mm": calibration_config.tag_sizes().get(
                 ref_id, calibration_config.tag_size_mm()),
         },
-        "definition": "origin=tag center, X=tag right, Y=tag up, Z=out of tag; units mm",
+        "definition": "origin=tag center, X=tag right, Y=DOWN (up is -Y), Z=out of tag; units mm",
         "tag_center_above_floor_mm": height,
         # the frame's Y is gravity-levelled off a measured horizontal plane
         # (realsense_extrinsics.py), so this holds even if the tag hangs crooked

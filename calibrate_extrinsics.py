@@ -162,7 +162,7 @@ def main():
         "schema_version": "1",
         "camera_id": cam_id,
         "node": socket.gethostname(),
-        "frame": "tag: origin=center, X=right, Y=up, Z=out of tag; units mm",
+        "frame": "tag: origin=center, X=right, Y=DOWN (up is -Y), Z=out of tag; units mm",
         "tag": {"family": "36h11", "id": args.tag_id, "size_mm": args.tag_size_mm},
         "image_size": list(image_size),
         "rvec": rvec.flatten().tolist(),          # tag -> camera rotation (Rodrigues)

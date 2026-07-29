@@ -817,7 +817,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "camera": camera_name,
         "source": "realsense_native",  # factory intrinsics + depth cross-check
         "node": socket.gethostname(),
-        "frame": "tag: origin=center, X=right, Y=up, Z=out of tag (gravity-levelled); units mm",
+        "frame": "tag: origin=center, X=right, Y=DOWN (gravity-levelled: up is -Y), Z=out of tag; units mm",
         "tag": {"family": "36h11", "id": tag_id, "size_mm": tag_size_mm},
         "image_size": [w, h],
         "tag_pixels": round(tag_px, 1),           # longest tag edge; bounds the angular accuracy
@@ -1088,7 +1088,7 @@ def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
     except (OSError, ValueError):
         tag_map = {"schema_version": "1", "tags": {}}
     tag_map.update({
-        "frame": f"tag {ref_tag_id}: origin=center, X=right, Y=up (gravity-levelled), "
+        "frame": f"tag {ref_tag_id}: origin=center, X=right, Y=DOWN (gravity-levelled: up is -Y), "
                  f"Z=out of tag; units mm",
         "levelled": True,
         "reference_tag": {"family": "36h11", "id": ref_tag_id, "size_mm": tag_size_mm},
