@@ -1719,9 +1719,29 @@ class Handler(BaseHTTPRequestHandler):
       var BASE = location.protocol + '//' + location.hostname + ':8001';
       var section = document.getElementById('depth-section');
       var host = document.getElementById('depth-cams');
+      // Re-point an MJPEG <img> at its stream, ABORTING the previous one first.
+      //
+      // Assigning .src on an image already streaming multipart/x-mixed-replace
+      // does not reliably tear the old connection down, so each retry leaked a
+      // socket. Chrome allows 6 per origin and this page wants 4 (two cameras,
+      // colour + depth), so a few leaked retries exhausted the pool — after
+      // which new requests QUEUE rather than fail, the second camera's panes
+      // stayed blank forever, and the blank-pane retry leaked another. Measured
+      // on the live page: 10 open connections where 4 were needed.
+      //
+      // Clearing src to a 1x1 blank first cancels the in-flight load, so the
+      // connection count stays at 4 no matter how many retries happen.
+      var BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      function restream(img) {{
+        if (!img._kind) return;
+        img.src = BLANK;                       // abort whatever is in flight
+        var url = BASE + '/' + img._kind + '.mjpg?s=' + img._serial + '&t=' + Date.now();
+        setTimeout(function () {{ img.src = url; }}, 50);
+      }}
       var built = {{}};
       var bumped = {{}};
-      var wasRunning = {{}};   // to spot a camera coming back and re-request its stream
+      var wasRunning = {{}};  // to spot a camera coming back and re-request its stream
+      var tries = {{}};      // consecutive failed restream attempts, for backoff
 
       function buildCard(dev) {{
         var s = dev.serial, q = encodeURIComponent(s);
@@ -1748,13 +1768,9 @@ class Handler(BaseHTTPRequestHandler):
             'line-height:1.5;overflow-x:auto;"></div></div>';
         card.querySelectorAll('.live-stage img').forEach(function (img) {{
           var kind = img.parentElement.getAttribute('data-kind');
-          // a stream that errors gets one prompt retry; refresh() handles the rest
-          img.addEventListener('error', function () {{
-            setTimeout(function () {{
-              img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
-            }}, 2000);
-          }});
-          img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
+          img._kind = kind;
+          img._serial = q;
+          restream(img);
         }});
         card.querySelectorAll('.live-stage').forEach(function (stage) {{
           stage.addEventListener('click', function (e) {{
@@ -1909,11 +1925,16 @@ class Handler(BaseHTTPRequestHandler):
             var blank = false;
             imgs.forEach(function (img) {{ if (!img.naturalWidth) blank = true; }});
             var stale = (!st.running && !st.starting) || cameBack || (st.running && blank);
-            if (stale && Date.now() - (bumped[s] || 0) > 8000) {{
+            // exponential backoff, capped: a pane that cannot come back must not
+            // keep opening connections at a fixed rate
+            tries[s] = tries[s] || 0;
+            var wait = Math.min(8000 * Math.pow(2, tries[s]), 120000);
+            if (stale && Date.now() - (bumped[s] || 0) > wait) {{
               bumped[s] = Date.now();
-              imgs.forEach(function (img) {{
-                img.src = img.src.split('&t=')[0] + '&t=' + Date.now();
-              }});
+              tries[s] += 1;
+              imgs.forEach(restream);
+            }} else if (!stale) {{
+              tries[s] = 0;
             }}
             wasRunning[s] = !!st.running;
             var usb = (dev.usb && dev.usb !== '?') ? dev.usb : (info.usb || '?');
