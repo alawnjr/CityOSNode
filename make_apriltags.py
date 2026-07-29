@@ -132,14 +132,20 @@ def page_content(size_mm, page_mm, modules, label_lines, quiet_modules=1,
     ops = []
     # the tag itself
     ops.append(f"q {size_mm * MM:.4f} 0 0 {size_mm * MM:.4f} {x * MM:.4f} {y * MM:.4f} cm /Im1 Do Q")
-    # tick marks aligned to each edge, placed OUTSIDE the quiet zone so they
-    # cannot be mistaken for tag structure — measure between opposite pairs
+    # Tick marks aligned to the tag's edges, placed OUTSIDE the quiet zone so
+    # they cannot be mistaken for tag structure. Measure between a pair to check
+    # the printed size. The side pair needs a margin the sheet may not have — a
+    # 235mm tag on A3 leaves 31mm, less than the quiet zone plus tick length —
+    # so draw it only when it fits rather than off the edge of the page.
     tick, gap = 8.0, quiet_mm + 3.0
     ops.append("0.5 w 0 G")
-    for ex in (x, x + size_mm):                       # vertical edges
+    for ex in (x, x + size_mm):                       # marks the WIDTH
         ops.append(f"{ex * MM:.4f} {(y - gap) * MM:.4f} m {ex * MM:.4f} {(y - gap - tick) * MM:.4f} l S")
-    for ey in (y, y + size_mm):                       # horizontal edges
-        ops.append(f"{(x - gap) * MM:.4f} {ey * MM:.4f} m {(x - gap - tick) * MM:.4f} {ey * MM:.4f} l S")
+    side_ticks = x - gap - tick >= 2.0
+    if side_ticks:                                    # marks the HEIGHT
+        for ey in (y, y + size_mm):
+            ops.append(f"{(x - gap) * MM:.4f} {ey * MM:.4f} m "
+                       f"{(x - gap - tick) * MM:.4f} {ey * MM:.4f} l S")
     # print-scale reference bar with end caps
     by = y - gap - tick - 12.0
     bx = (pw - ref_mm) / 2.0
@@ -147,6 +153,12 @@ def page_content(size_mm, page_mm, modules, label_lines, quiet_modules=1,
     for e in (bx, bx + ref_mm):
         ops.append(f"{e * MM:.4f} {(by - 2.5) * MM:.4f} m {e * MM:.4f} {(by + 2.5) * MM:.4f} l S")
     # labels
+    label_lines = list(label_lines) + [
+        ("Ticks mark the black square's four edges." if side_ticks else
+         "Ticks below mark the black square's left and right edges (it is square, "
+         "so that is its height too)."),
+        "Keep the white margin around the tag clean - the detector needs it.",
+    ]
     ty = by - 12.0
     for i, line in enumerate(label_lines):
         size = 11 if i == 0 else 8
@@ -195,7 +207,6 @@ def build(tag_ids, size_mm, paper, module_px, out_path, quiet_modules=1):
             "PRINT AT 100% / ACTUAL SIZE - do NOT use Fit to Page.",
             f"Then measure the bar above: it must be exactly {REF_BAR_MM:g} mm. If it is not,",
             "the printer rescaled the page and this tag is the wrong size.",
-            "Ticks align with the black square's four edges. Keep the white margin clean.",
         ]
         content = pdf.stream("", page_content(size_mm, (pw, ph), modules, labels,
                                               quiet_modules))
