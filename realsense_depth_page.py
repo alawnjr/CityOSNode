@@ -34,6 +34,7 @@ import json
 import math
 import multiprocessing
 import re
+import calibration_config
 import os
 import socket
 import subprocess
@@ -56,23 +57,8 @@ sys.setswitchinterval(0.001)
 # Per-node overrides from ~/CityOS/node.env (gitignored, machine-local), same
 # loader as capture.py / smartroom_video_page.py.
 def _load_node_env():
-    try:
-        lines = (Path.home() / "CityOS" / "node.env").read_text().splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        # Trailing comment after the value. Without this,
-        #     SMARTROOM_TAG_ID=4   # the floor tag
-        # yields "4   # the floor tag" and the first int() of it dies. Only " #"
-        # (preceded by whitespace) counts, so a value containing # survives.
-        value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
+    """Per-node overrides from ~/CityOS/node.env. See calibration_config."""
+    return calibration_config.load_node_env()
 
 
 _load_node_env()

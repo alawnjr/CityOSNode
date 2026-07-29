@@ -2,6 +2,7 @@
 import html
 import json
 import mimetypes
+import calibration_config
 import os
 import re
 import signal
@@ -20,23 +21,8 @@ from pathlib import Path
 # loader as capture.py — so e.g. SMARTROOM_CAMERA_SIZE pins apply to both the
 # page and the recordings it launches. Real environment wins over the file.
 def _load_node_env():
-    try:
-        lines = (Path.home() / "CityOS" / "node.env").read_text().splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        # Trailing comment after the value. Without this,
-        #     SMARTROOM_TAG_ID=4   # the floor tag
-        # yields "4   # the floor tag" and the first int() of it dies. Only " #"
-        # (preceded by whitespace) counts, so a value containing # survives.
-        value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
+    """Per-node overrides from ~/CityOS/node.env. See calibration_config."""
+    return calibration_config.load_node_env()
 
 
 _load_node_env()

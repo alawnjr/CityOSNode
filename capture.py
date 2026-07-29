@@ -28,6 +28,7 @@ import argparse
 import csv
 import json
 import re
+import calibration_config
 import os
 import socket
 import subprocess
@@ -46,31 +47,8 @@ TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
 def load_node_env():
-    """Apply per-node overrides from <repo>/node.env (KEY=VALUE lines, # comments).
-
-    node.env is gitignored — it's machine-local config, like calibration/ — so a
-    node can pin e.g. SMARTROOM_CAMERA_SIZE=800x600 (a camera that only sustains
-    30fps below full resolution) without diverging the shared code. The real
-    environment always wins over the file.
-    """
-    path = Path(__file__).resolve().parent / "node.env"
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        # Trailing comment after the value. Without this,
-        #     SMARTROOM_TAG_ID=4   # the floor tag
-        # yields "4   # the floor tag" and the first int() of it dies. Only " #"
-        # (preceded by whitespace) counts, so a value containing # survives.
-        value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
-        if key and key not in os.environ:
-            os.environ[key] = value
+    """Per-node overrides from <repo>/node.env. See calibration_config."""
+    return calibration_config.load_node_env()
 
 
 load_node_env()  # before the module-level auto-detection below reads the env

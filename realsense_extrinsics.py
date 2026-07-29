@@ -88,138 +88,35 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = PROJECT_ROOT / "calibration"
-
-# How obliquely a camera must see the tag before its solve is trusted to define
-# the room's vertical. Below this the planar-PnP tilt is not observable enough.
-MIN_TAG_OBLIQUITY_DEG = 20.0
-# How much horizontal surface the depth must show before its measured vertical
-# is trusted over the tag's. A camera staring at a wall sees a few thousand
-# normals off one desk — not enough to overrule anything.
-MIN_LEVEL_NORMALS = 15000
-MAX_LEVEL_SCATTER_DEG = 6.0
-# Every normal-COUNT threshold here was tuned on 640x480 frames, and
-# _surface_normals samples a fixed 1-in-`step` grid — so the raw counts scale
-# with the frame's pixel area, not with how much room is actually in view. Once
-# calibration moved to the cameras' full colour modes that made the gates
-# meaningless: at 1920x1080 the same starved sliver of desk yields 6.75x more
-# normals, which let the D435 level off ~6400 640x480-equivalent normals having
-# correctly refused 5537 the run before. Scale the thresholds by area so a gate
-# means the same thing at any resolution.
-NORMALS_REF_PIXELS = 640 * 480
-# Below this the tag is too few pixels across for its corners to pin down yaw.
-MIN_TAG_PIXELS = 60.0
-# Colour modes to try for a CALIBRATION capture, highest first — extrinsics are
-# solved at the best resolution the camera offers, not at the recording profile.
-#
-# Corner-localisation noise is fixed in PIXELS (~0.3 px), so the pose's angular
-# error scales as 1/tag_px, and tag_px = f*size/range with f proportional to the
-# capture width. The 138.4 mm tag at ~2.5 m is ~26 px across at 640x480 and
-# ~77 px at 1920x1080 — a 3x cut in yaw error for no hardware change.
-#
-# This is safe because a camera's POSE is a property of its body, not of the
-# stream it happens to be delivering: extrinsics solved at high resolution apply
-# unchanged to a 640x480 recording, since each profile carries its own
-# intrinsics and both share one optical centre. 15 fps because calibration wants
-# six still frames, and 1920x1080 BGR8 at 30 fps is 186 MB/s of USB on a bus
-# that a second camera is also using.
-#
-# Not every mode exists on every model (the D435's colour goes to 1920x1080, the
-# D455's sensor is 1MP), so these are ATTEMPTS: the first that starts wins.
-#
-# Ordered by WIDTH first, then height. Width is what matters twice over here: it
-# sets the tag's pixel size, and it sets how much of the room is in frame — and a
-# frame holding several mapped tags is what lets the joint multi-tag solve fix
-# yaw off a metre of baseline instead of one 138mm square. The 4:3 entries sit
-# last because they are horizontal crops at unchanged focal length: they cost
-# field of view without buying any tag pixels.
-CALIB_COLOR_ATTEMPTS = ((1920, 1080, 15), (1280, 800, 15), (1280, 720, 15),
-                        (960, 540, 15), (848, 480, 15), (640, 480, 30))
-# Depth sizes to try alongside. Depth is enabled SEPARATELY from colour because
-# no D4xx does depth above 1280x720, so it cannot simply match a 1920x1080 colour
-# stream.
-#
-# 640x480 DELIBERATELY, not the sensor's best: measured on both cameras, raising
-# depth to 1280x720 made every depth-derived quantity worse, because a downsampled
-# depth frame is a DENOISED one. The vertical lost valid normals (the D455 went
-# from 28661 to 15940 640x480-equivalents — the discontinuity test throws out more
-# of a noisier frame), and depth_agreement_mm rose on both cameras (D455 50.6 ->
-# 84.2, D435 151.7 -> 219.2) because _depth_at's fixed 5x5 median window spans
-# less physical area at higher resolution, so it averages less. Stereo depth on a
-# flat low-texture target like a printed tag is exactly where per-pixel noise
-# hurts most. Left as a list so a camera lacking 640x480 still negotiates.
-CALIB_DEPTH_ATTEMPTS = ((640, 480), (848, 480), (1280, 720))
-# Depth only breaks the planar-PnP tie when it beats the other branch by this
-# much; a near-tie is noise, not a decision.
-DEPTH_TIEBREAK_MARGIN = 0.75
-# How much closer to the measured vertical one pose branch must be before it is
-# taken as the right one. Measured separation on real frames: 1.3 vs 12.2 deg.
-BRANCH_MARGIN_DEG = 3.0
-# --- yaw from the wall (find_room_wall) --------------------------------------
-# The tag's yaw is its worst axis (a 30 px tag pins heading to a few degrees).
-# The wall the tag hangs on fills thousands of depth pixels, so its normal fixes
-# the room's FORWARD far better — the same trade the vertical already makes for
-# pitch/roll. A surface counts as a wall when its normal sits within this of
-# horizontal (i.e. the surface is within this of vertical).
-WALL_MAX_TILT_DEG = 25.0
-# Enough wall normals, and tight enough, before the depth heading is trusted
-# over the tag's. Walls show fewer pixels than a floor across the whole frame,
-# so this sits below MIN_LEVEL_NORMALS.
-MIN_YAW_NORMALS = 4000
-MAX_YAW_SCATTER_DEG = 7.0
-# The tag heading is only a few degrees off, so the wall the tag is on is near
-# the tag's forward. If the mean-shift walked further than this it locked onto a
-# DIFFERENT wall (a side wall ~90 deg away) — reject rather than yaw the room
-# onto the wrong wall.
-MAX_YAW_CORRECTION_DEG = 20.0
+import calibration_config as cfg
+from calibration_config import (  # noqa: F401 - re-exported so existing callers keep working
+    BRANCH_MARGIN_DEG, CALIB_COLOR_ATTEMPTS, CALIB_DEPTH_ATTEMPTS, DEFAULT_OUT,
+    DEPTH_TIEBREAK_MARGIN, LEVEL_FILENAME, MAX_LEVEL_SCATTER_DEG,
+    MAX_YAW_CORRECTION_DEG, MAX_YAW_SCATTER_DEG, MIN_LEVEL_NORMALS,
+    MIN_TAG_OBLIQUITY_DEG, MIN_TAG_PIXELS, MIN_YAW_NORMALS, NORMALS_REF_PIXELS,
+    PROJECT_ROOT, TAGS_FILENAME, WALL_MAX_TILT_DEG, normals_scale,
+)
 
 # Resolved at CALL time, not import time — the web page imports this module
 # before it loads node.env, so import-time reads would freeze the defaults.
 def _env_tag_id():
-    return int(os.environ.get("SMARTROOM_TAG_ID", "1"))
+    """Thin wrapper; see calibration_config."""
+    return cfg.tag_id()
 
 
 def _env_tag_size_mm():
-    return float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173"))
+    """Thin wrapper; see calibration_config."""
+    return cfg.tag_size_mm()
 
 
 def _env_tag_sizes():
-    """{tag id: size_mm} for tags that are NOT the default size.
-
-    The room does not have to be one size of tag, and after this was assumed it
-    silently wrecked a calibration: a 235mm tag solved with a 138.4mm corner
-    model was mapped at 59% of its true range (PnP translation is linear in the
-    assumed size), and the only outward sign was depth disagreeing with the pose
-    by 20.7%. Bigger tags are worth having where a camera needs the pixels, so
-    the size has to be per-tag.
-
-        SMARTROOM_TAG_SIZES=3:235,4:335        # in node.env, mm, black square
-
-    Anything unlisted falls back to SMARTROOM_TAG_SIZE_MM."""
-    sizes = {}
-    for part in os.environ.get("SMARTROOM_TAG_SIZES", "").replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        key, _, value = part.partition(":")
-        try:
-            sizes[int(key.strip())] = float(value.strip())
-        except ValueError:
-            print(f"ignoring unparseable SMARTROOM_TAG_SIZES entry {part!r} "
-                  f"(want id:mm, e.g. 3:235)", file=sys.stderr)
-    return sizes
+    """Thin wrapper; see calibration_config."""
+    return cfg.tag_sizes()
 
 
 def _env_tag_min_pixels():
-    """Ignore tag detections smaller than this many pixels across (0 = off).
-
-    Small tags do not just contribute little to a solve, they pull it: the D455
-    anchoring on an 18px tag at 5m mapped its two good tags with 200-330mm of
-    position scatter, while a 74px tag sat 2m away in the same frame. Default 0
-    so nothing changes for a node whose tags are all small; raise it in node.env
-    once there are big tags to prefer."""
-    return float(os.environ.get("SMARTROOM_TAG_MIN_PIXELS", "0"))
+    """Thin wrapper; see calibration_config."""
+    return cfg.tag_min_pixels()
 
 
 def corner_model(size_mm):
@@ -230,74 +127,18 @@ def corner_model(size_mm):
 
 
 def _env_tag_heights():
-    """{tag id: centre height above the floor, mm}.
-
-    Per tag, because which tag is the reference is a choice and the floor plane
-    depends on the REFERENCE tag's height: point SMARTROOM_TAG_ID at a tag lying
-    on the floor and that height is 0, point it at a wall tag and it is not. One
-    global height silently described whichever tag it was measured on.
-
-        SMARTROOM_TAG_HEIGHTS=3:1330,4:0
-    """
-    heights = {}
-    for part in os.environ.get("SMARTROOM_TAG_HEIGHTS", "").replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        key, _, value = part.partition(":")
-        try:
-            heights[int(key.strip())] = float(value.strip())
-        except ValueError:
-            print(f"ignoring unparseable SMARTROOM_TAG_HEIGHTS entry {part!r} "
-                  f"(want id:mm)", file=sys.stderr)
-    return heights
+    """Thin wrapper; see calibration_config."""
+    return cfg.tag_heights()
 
 
 def _env_floor_tags():
-    """Ids of tags lying FLAT on the floor rather than hanging on a wall.
-
-    The pose-ambiguity arbitration compares a candidate branch's idea of 'up'
-    against the depth-measured vertical, and for an upright tag 'up' is the tag
-    frame's -Y. A tag on the floor has its -Y lying in the horizontal plane, so
-    that test is ~90 degrees out for BOTH branches and cannot separate them —
-    for those tags 'up' is the tag's own normal (+Z) instead.
-
-        SMARTROOM_TAG_FLOOR=4
-    """
-    out = set()
-    for part in os.environ.get("SMARTROOM_TAG_FLOOR", "").replace(";", ",").split(","):
-        part = part.strip()
-        if part:
-            try:
-                out.add(int(part))
-            except ValueError:
-                print(f"ignoring unparseable SMARTROOM_TAG_FLOOR entry {part!r}",
-                      file=sys.stderr)
-    return out
+    """Thin wrapper; see calibration_config."""
+    return cfg.floor_tags()
 
 
 def _env_tag_height_mm(tag_id=None):
-    """Height of the REFERENCE tag's centre above the floor, mm.
-
-    Named for tag 3 because that is the tag it was measured on, and the old
-    SMARTROOM_TAG_HEIGHT_MM said nothing about which tag it meant — which
-    mattered once tag 2 was taken down and its 1590 was left behind describing
-    a tag that no longer existed. The old name is still honoured so a node that
-    has not been updated keeps working.
-
-    This is what fixes the FLOOR: the room frame's origin is the reference tag's
-    centre and its vertical is gravity-levelled, so the floor is the plane
-    y = +height (the levelled frame's up is -Y). It is only the origin's height
-    when the reference tag IS tag 3 — otherwise the origin sits wherever
-    SMARTROOM_TAG_ID is, and this number has to be propagated there through
-    tags.json."""
-    heights = _env_tag_heights()
-    if tag_id is not None and int(tag_id) in heights:
-        return heights[int(tag_id)]
-    for key in ("SMARTROOM_TAG3_HEIGHT_MM", "SMARTROOM_TAG_HEIGHT_MM"):
-        if key in os.environ:
-            return float(os.environ[key])
-    return 1110.0
+    """Thin wrapper; see calibration_config.tag_height_mm."""
+    return cfg.tag_height_mm(tag_id)
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -373,13 +214,6 @@ def _minimal_rotation(a, b):
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
 
 
-def normals_scale(intr):
-    """Multiplier taking a 640x480-tuned normal count to this frame's size.
-
-    _surface_normals walks a fixed 1-in-`step` grid, so its output count is
-    proportional to the frame's pixel area. See NORMALS_REF_PIXELS."""
-    px = float(getattr(intr, "width", 0) or 0) * float(getattr(intr, "height", 0) or 0)
-    return px / NORMALS_REF_PIXELS if px > 0 else 1.0
 
 
 def _surface_normals(depth_mm, intr, step=4):
@@ -1090,7 +924,6 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                   f"{agree}{level_note}{floor_note}{yaw_note}{tag_notes} — saved {out_path.name}")
 
 
-LEVEL_FILENAME = "room_level.json"
 
 
 def _load_room_level(out_dir, tag_id=None):
@@ -1165,17 +998,8 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
 
 
 def _env_measured_pair():
-    """(distance_mm, wall_offset_mm) tape-measured between tags 3 and 4, or Nones.
-
-    SMARTROOM_TAG34_DISTANCE_MM   centre-to-centre, 3D
-    SMARTROOM_TAG4_WALL_OFFSET_MM tag 4's perpendicular distance from tag 3's wall
-    """
-    def read(key):
-        try:
-            return float(os.environ[key])
-        except (KeyError, ValueError):
-            return None
-    return read("SMARTROOM_TAG34_DISTANCE_MM"), read("SMARTROOM_TAG4_WALL_OFFSET_MM")
+    """Thin wrapper; see calibration_config."""
+    return cfg.measured_pair()
 
 
 def check_measured_geometry(poses, heights=None):
@@ -1313,17 +1137,7 @@ def main():
     import pyrealsense2 as rs  # standalone mode only; the page imports us without it
 
     # standalone runs need node.env too (the page loads it for the in-process path)
-    try:
-        for line in (PROJECT_ROOT / "node.env").read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                # trailing comment after the value — see load_node_env in
-                # capture.py; without this "4  # floor tag" reaches int()
-                value = re.split(r"\s+#", value.strip(), maxsplit=1)[0].strip()
-                os.environ.setdefault(key.strip(), value)
-    except OSError:
-        pass
+    cfg.load_node_env()
 
     ap = argparse.ArgumentParser(description="AprilTag extrinsic calibration for a RealSense camera.")
     ap.add_argument("--serial", default=None, help="camera USB serial (default: first device)")
