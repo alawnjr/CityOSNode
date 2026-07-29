@@ -228,7 +228,54 @@ def corner_model(size_mm):
     return np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]], dtype=np.float64)
 
 
-def _env_tag_height_mm():
+def _env_tag_heights():
+    """{tag id: centre height above the floor, mm}.
+
+    Per tag, because which tag is the reference is a choice and the floor plane
+    depends on the REFERENCE tag's height: point SMARTROOM_TAG_ID at a tag lying
+    on the floor and that height is 0, point it at a wall tag and it is not. One
+    global height silently described whichever tag it was measured on.
+
+        SMARTROOM_TAG_HEIGHTS=3:1330,4:0
+    """
+    heights = {}
+    for part in os.environ.get("SMARTROOM_TAG_HEIGHTS", "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, _, value = part.partition(":")
+        try:
+            heights[int(key.strip())] = float(value.strip())
+        except ValueError:
+            print(f"ignoring unparseable SMARTROOM_TAG_HEIGHTS entry {part!r} "
+                  f"(want id:mm)", file=sys.stderr)
+    return heights
+
+
+def _env_floor_tags():
+    """Ids of tags lying FLAT on the floor rather than hanging on a wall.
+
+    The pose-ambiguity arbitration compares a candidate branch's idea of 'up'
+    against the depth-measured vertical, and for an upright tag 'up' is the tag
+    frame's -Y. A tag on the floor has its -Y lying in the horizontal plane, so
+    that test is ~90 degrees out for BOTH branches and cannot separate them —
+    for those tags 'up' is the tag's own normal (+Z) instead.
+
+        SMARTROOM_TAG_FLOOR=4
+    """
+    out = set()
+    for part in os.environ.get("SMARTROOM_TAG_FLOOR", "").replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.add(int(part))
+            except ValueError:
+                print(f"ignoring unparseable SMARTROOM_TAG_FLOOR entry {part!r}",
+                      file=sys.stderr)
+    return out
+
+
+def _env_tag_height_mm(tag_id=None):
     """Height of the REFERENCE tag's centre above the floor, mm.
 
     Named for tag 3 because that is the tag it was measured on, and the old
@@ -243,6 +290,9 @@ def _env_tag_height_mm():
     when the reference tag IS tag 3 — otherwise the origin sits wherever
     SMARTROOM_TAG_ID is, and this number has to be propagated there through
     tags.json."""
+    heights = _env_tag_heights()
+    if tag_id is not None and int(tag_id) in heights:
+        return heights[int(tag_id)]
     for key in ("SMARTROOM_TAG3_HEIGHT_MM", "SMARTROOM_TAG_HEIGHT_MM"):
         if key in os.environ:
             return float(os.environ[key])
@@ -528,6 +578,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # falls back to tag_size_mm; a MAPPED tag's size comes from tags.json, which
     # records what it was measured with.
     tag_sizes = _env_tag_sizes()
+    floor_tags = _env_floor_tags()
 
     def size_of(tid):
         return float(tag_sizes.get(int(tid), tag_size_mm))
@@ -562,14 +613,18 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
 
     branch_picks = []       # how each detection's branch got chosen (diagnostic)
 
-    def branch_up_error(rvec):
+    def branch_up_error(rvec, tid=None):
         """How far this pose branch's idea of 'up' is from the measured vertical.
 
-        Assumes tags hang upright, so the tag frame's -Y is up (aruco returns it
-        rolled 180 about the tag normal). None when nothing was measured."""
+        For a tag hanging on a wall, up is the tag frame's -Y (aruco returns it
+        rolled 180 about the tag normal). For a tag lying FLAT on the floor, -Y
+        lies in the horizontal plane — so that comparison is ~90 degrees out for
+        both branches and separates nothing — and up is the tag's own normal, +Z.
+        Declare those with SMARTROOM_TAG_FLOOR. None when nothing was measured."""
         if vertical is None:
             return None
-        up_cam = -cv2.Rodrigues(rvec)[0][:, 1]
+        R_t = cv2.Rodrigues(rvec)[0]
+        up_cam = R_t[:, 2] if (tid is not None and int(tid) in floor_tags) else -R_t[:, 1]
         return float(np.degrees(np.arccos(np.clip(up_cam @ vertical["up_cam"], -1.0, 1.0))))
 
     def corner_depth_error(rvec, tvec, img_pts, depth_m, model=None):
@@ -609,7 +664,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             proj, _ = cv2.projectPoints(model, rvec, tvec, K, dist)
             err = float(np.linalg.norm(proj.reshape(4, 2) - img_pts, axis=1).mean())
             solutions.append((err, corner_depth_error(rvec, tvec, img_pts, depth_m, model),
-                              branch_up_error(rvec), rvec, tvec))
+                              branch_up_error(rvec, tid), rvec, tvec))
 
         by_up = sorted((s for s in solutions if s[2] is not None), key=lambda s: s[2])
         by_depth = sorted((s for s in solutions if s[1] is not None), key=lambda s: s[1])
@@ -686,7 +741,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                     continue
             proj, _ = cv2.projectPoints(obj_all, rvec, tvec, K, dist)
             err = float(np.linalg.norm(proj.reshape(-1, 2) - img_all, axis=1).mean())
-            scored.append((err, branch_up_error(rvec),
+            scored.append((err, branch_up_error(rvec, seed_id),
                            corner_depth_error(rvec_t, tvec_t, img_pts, depth_m), rvec, tvec))
         if not scored:
             return None
@@ -1004,7 +1059,15 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
               if anchor_id is not None else ""))
     level_note = f"; levelled off {level_source}"
     if tilt_deg is not None:
-        level_note += f", tag hangs {tilt_deg}° off plumb"
+        # tilt_deg is the angle between the measured vertical and the frame's up
+        # axis (-Y). A wall tag should read ~0; a tag lying flat on the floor reads
+        # ~90 BY CONSTRUCTION, since its up is its normal — so report how far off
+        # LEVEL it is instead of claiming it hangs 90 degrees out of plumb. Only
+        # the wording differs: the levelling rotation itself is the same either way.
+        if int(tag_id) in floor_tags:
+            level_note += f", tag lies {abs(90.0 - tilt_deg):.2f}° off level"
+        else:
+            level_note += f", tag hangs {tilt_deg}° off plumb"
     if residual_deg:
         level_note += f", camera tilt corrected by {residual_deg}°"
     floor_note = ""
