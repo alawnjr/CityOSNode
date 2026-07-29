@@ -816,10 +816,20 @@ class CameraWorker:
         agree = e.get("depth_agreement_mm")
         warnings = []
         reproj = e.get("reprojection_error_px")
-        if reproj is not None and reproj > MAX_REPROJ_PX:
-            warnings.append(f"reprojection error {reproj:.1f} px is far above the {MAX_REPROJ_PX:.0f} px "
-                            f"a consistent solve gives — the mapped tags disagree with each other, "
-                            f"so at least one anchor in tags.json is wrong")
+        # A SINGLE-tag solve fits 4 corners to 6 degrees of freedom, so IPPE
+        # matches them almost exactly and the residual says nothing about
+        # quality. Only a multi-tag solve is overdetermined enough for this
+        # number to mean anything — say so rather than let 0.2 px look like
+        # proof.
+        if len(used) < 2 and reproj is not None:
+            warnings.append(f"reproj {reproj:.2f} px is from a SINGLE tag, which is "
+                            f"underdetermined (4 corners, 6 DOF) — it is not evidence the pose "
+                            f"is good; a second mapped tag in view is what would test it")
+        elif reproj is not None and reproj > MAX_REPROJ_PX:
+            warnings.append(f"reprojection error {reproj:.1f} px is above the {MAX_REPROJ_PX:.0f} px "
+                            f"a clean multi-tag solve gives — either an anchor in tags.json is "
+                            f"wrong, or a tag is so foreshortened that its short edges cannot be "
+                            f"localised (check the per-tag pixel sizes above)")
         if agree is not None and rng and agree > 0.04 * rng:
             warnings.append(f"depth and the pose disagree on the tag's range by "
                             f"{100 * agree / rng:.1f}% ({agree:.0f} mm of {rng:.0f} mm)")
