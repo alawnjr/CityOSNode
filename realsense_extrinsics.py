@@ -21,11 +21,24 @@ venv python (the camera must be free — stop the depth page first):
 Tag: 36h11, id 1, black-square edge 173mm by default — override with
 --tag-id / --tag-size-mm or SMARTROOM_TAG_ID / SMARTROOM_TAG_SIZE_MM (node.env).
 
+MIXED TAG SIZES. Tags need not all be the same size — a camera that needs more
+pixels on a tag gets a bigger print (a 90-degree-FOV D455 needs ~310mm at 2m
+where a D435 manages on ~145mm). Sizes that differ from the default go in
+node.env:
+
+    SMARTROOM_TAG_SIZES=3:235,4:335        # id:mm, black square
+
+This is not optional bookkeeping. PnP translation is linear in the assumed edge
+length, so solving a 235mm tag with a 138.4mm model maps it at 59% of its true
+range — and the only outward symptom is the depth cross-check disagreeing with
+the pose (measured: 20.7%). A tag's size, once solved, is recorded in its
+tags.json entry and reused from there, so a mapped anchor carries its own size.
+
 Tag chaining: any OTHER 36h11 tag (tag 2, ...) visible in the same frame as the
 reference tag gets its pose computed in the room frame and merged into
-calibration/tags.json (all tags assumed printed at the same size). capture.py
-embeds that map into every recording's metadata.json, so a camera that can only
-see tag 2 can still be placed in the one room frame downstream.
+calibration/tags.json, each with the size it was solved at. capture.py embeds
+that map into every recording's metadata.json, so a camera that can only see
+tag 2 can still be placed in the one room frame downstream.
 
 Joint multi-tag solve: when a frame shows several MAPPED tags, the pose is fitted
 to all of their corners at once. One 138mm tag only gives the solver 138mm of
@@ -168,6 +181,40 @@ def _env_tag_id():
 
 def _env_tag_size_mm():
     return float(os.environ.get("SMARTROOM_TAG_SIZE_MM", "173"))
+
+
+def _env_tag_sizes():
+    """{tag id: size_mm} for tags that are NOT the default size.
+
+    The room does not have to be one size of tag, and after this was assumed it
+    silently wrecked a calibration: a 235mm tag solved with a 138.4mm corner
+    model was mapped at 59% of its true range (PnP translation is linear in the
+    assumed size), and the only outward sign was depth disagreeing with the pose
+    by 20.7%. Bigger tags are worth having where a camera needs the pixels, so
+    the size has to be per-tag.
+
+        SMARTROOM_TAG_SIZES=3:235,4:335        # in node.env, mm, black square
+
+    Anything unlisted falls back to SMARTROOM_TAG_SIZE_MM."""
+    sizes = {}
+    for part in os.environ.get("SMARTROOM_TAG_SIZES", "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, _, value = part.partition(":")
+        try:
+            sizes[int(key.strip())] = float(value.strip())
+        except ValueError:
+            print(f"ignoring unparseable SMARTROOM_TAG_SIZES entry {part!r} "
+                  f"(want id:mm, e.g. 3:235)", file=sys.stderr)
+    return sizes
+
+
+def corner_model(size_mm):
+    """Tag corner model for SOLVEPNP_IPPE_SQUARE (aruco order TL,TR,BR,BL),
+    tag-centred, Z out of the tag — identical to calibrate_extrinsics.py."""
+    s = size_mm / 2.0
+    return np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]], dtype=np.float64)
 
 
 def _env_tag_height_mm():
@@ -445,10 +492,20 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         tag_size_mm = _env_tag_size_mm()
     K, dist = intrinsics_to_cv(intr)
 
-    # Tag corner model for SOLVEPNP_IPPE_SQUARE (aruco corner order TL,TR,BR,BL),
-    # tag-centered, Z out of the tag — identical to calibrate_extrinsics.py.
-    s = tag_size_mm / 2.0
-    obj = np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]], dtype=np.float64)
+    # Per-tag edge lengths. The room mixes sizes on purpose — a camera that needs
+    # more pixels on a tag gets a bigger print — so every corner model below is
+    # built for the tag it belongs to, never from one global size. An unlisted tag
+    # falls back to tag_size_mm; a MAPPED tag's size comes from tags.json, which
+    # records what it was measured with.
+    tag_sizes = _env_tag_sizes()
+
+    def size_of(tid):
+        return float(tag_sizes.get(int(tid), tag_size_mm))
+
+    def obj_of(tid):
+        return corner_model(size_of(tid))
+
+    obj = obj_of(tag_id)          # the reference tag's model
 
     detector = cv2.aruco.ArucoDetector(
         cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11),
@@ -485,17 +542,21 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         up_cam = -cv2.Rodrigues(rvec)[0][:, 1]
         return float(np.degrees(np.arccos(np.clip(up_cam @ vertical["up_cam"], -1.0, 1.0))))
 
-    def corner_depth_error(rvec, tvec, img_pts, depth_m):
-        """Mean |measured depth - PnP-predicted range| over the tag's corners, mm."""
+    def corner_depth_error(rvec, tvec, img_pts, depth_m, model=None):
+        """Mean |measured depth - PnP-predicted range| over the tag's corners, mm.
+
+        `model` is the corner model of the tag this pose belongs to — with the
+        wrong edge length the predicted corner ranges are wrong and this stops
+        being a check on anything."""
         if depth_m is None:
             return None
-        predicted = (cv2.Rodrigues(rvec)[0] @ obj.T + tvec).T
+        predicted = (cv2.Rodrigues(rvec)[0] @ (obj if model is None else model).T + tvec).T
         diffs = [abs(z * 1000.0 - float(np.linalg.norm(point)))
                  for (px, py), point in zip(img_pts, predicted)
                  if (z := _depth_at(depth_m, px, py)) is not None]
         return float(np.mean(diffs)) if diffs else None
 
-    def tag_pose(corners_1x4, depth_m=None):
+    def tag_pose(corners_1x4, depth_m=None, tid=None):
         """(reproj_err, rvec, tvec, img_pts) for one detected tag, or None.
 
         IPPE returns BOTH solutions of the planar-pose ambiguity, and at this
@@ -508,15 +569,16 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         reprojection) when the vertical isn't available or doesn't separate
         them."""
         img_pts = corners_1x4.reshape(4, 2).astype(np.float64)
-        count, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, img_pts, K, dist,
+        model = obj if tid is None else obj_of(tid)
+        count, rvecs, tvecs, _ = cv2.solvePnPGeneric(model, img_pts, K, dist,
                                                      flags=cv2.SOLVEPNP_IPPE_SQUARE)
         if not count:
             return None
         solutions = []
         for rvec, tvec in zip(rvecs, tvecs):
-            proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+            proj, _ = cv2.projectPoints(model, rvec, tvec, K, dist)
             err = float(np.linalg.norm(proj.reshape(4, 2) - img_pts, axis=1).mean())
-            solutions.append((err, corner_depth_error(rvec, tvec, img_pts, depth_m),
+            solutions.append((err, corner_depth_error(rvec, tvec, img_pts, depth_m, model),
                               branch_up_error(rvec), rvec, tvec))
 
         by_up = sorted((s for s in solutions if s[2] is not None), key=lambda s: s[2])
@@ -537,9 +599,10 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # wrong by 5 degrees moves its corners by ~6 mm, nothing against a
     # metre-scale spread between tags. It is the tag CENTRES that must be right,
     # and centres come from PnP's translation, the well-conditioned half.
-    known = {tag_id: (np.eye(3), np.zeros(3))}
-    known.update(_load_room_tags(out_dir))       # {id: (R tag->room, centre room mm)}
-    known_corners = {tid: (Q @ obj.T).T + p for tid, (Q, p) in known.items()}
+    known = {tag_id: (np.eye(3), np.zeros(3), size_of(tag_id))}
+    known.update(_load_room_tags(out_dir))   # {id: (R tag->room, centre mm, size mm)}
+    known_corners = {tid: (Q @ corner_model(sz).T).T + p
+                     for tid, (Q, p, sz) in known.items()}
 
     def solve_frame(obs, depth_m):
         """Room->camera pose from EVERY known tag in one frame at once.
@@ -558,7 +621,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         seed_id, seed_corner = next(((t, c) for t, c in obs if t == tag_id), obs[0])
         img_pts = seed_corner.reshape(4, 2).astype(np.float64)
         try:
-            count, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj, img_pts, K, dist,
+            count, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj_of(seed_id), img_pts, K, dist,
                                                          flags=cv2.SOLVEPNP_IPPE_SQUARE)
         except cv2.error:
             return None
@@ -617,7 +680,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         err, rvec, tvec, used_ids = solved
         # the reference tag's own pose, for the depth cross-check and overlay
         anchor_tid = tag_id if tag_id in used_ids else used_ids[0]
-        own = tag_pose(corners[flat.index(anchor_tid)], depth_m)
+        own = tag_pose(corners[flat.index(anchor_tid)], depth_m, anchor_tid)
         if own is None:
             continue
         _, raw_rvec, raw_tvec, img_pts = own
@@ -630,7 +693,10 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         for j, other_id in enumerate(flat):
             if other_id in known:
                 continue
-            other = tag_pose(corners[j], depth_m)
+            # its OWN size: solving a 235mm tag with the reference tag's 138.4mm
+            # model mapped it at 59% of its true range, and wrote that into
+            # tags.json where every later joint solve would have trusted it
+            other = tag_pose(corners[j], depth_m, other_id)
             if other is None:
                 continue
             err2, rvec2, tvec2, _pts2 = other
@@ -661,7 +727,11 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # cross-check) is still the lowest-reprojection one, but the POSE is the
     # average over the burst — see _average_pose.
     (err, _, _, raw_rvec, raw_tvec, img_pts,
-     color_bgr, depth_m, _) = min(results, key=lambda r: r[0])
+     color_bgr, depth_m, best_ids) = min(results, key=lambda r: r[0])
+    # which tag that raw pose belongs to — same rule as anchor_tid above. The
+    # depth cross-check and the overlay below need ITS corner model, not the
+    # reference tag's, when the reference tag was not the one in view.
+    raw_tid = tag_id if tag_id in best_ids else best_ids[0]
     rvec, tvec = _average_pose([(r[1], r[2]) for r in results])
     R, _ = cv2.Rodrigues(rvec)
 
@@ -753,7 +823,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # small disagreement means both the pose and the printed tag size are right.
     # Uses the DETECTED tag's raw pose (obj is that tag's corner model).
     R_raw, _ = cv2.Rodrigues(raw_rvec)
-    pnp_corners_cam = (R_raw @ obj.T + raw_tvec).T  # 4x3, mm, camera frame
+    pnp_corners_cam = (R_raw @ obj_of(raw_tid).T + raw_tvec).T  # 4x3, mm, camera frame
     diffs = []
     for (px, py), pnp_pt in zip(img_pts, pnp_corners_cam):
         z = _depth_at(depth_m, px, py)
@@ -770,7 +840,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     debug_dir.mkdir(parents=True, exist_ok=True)
     overlay = color_bgr.copy()
     cv2.aruco.drawDetectedMarkers(overlay, [img_pts.reshape(1, 4, 2).astype(np.float32)])
-    cv2.drawFrameAxes(overlay, K, dist, raw_rvec, raw_tvec, tag_size_mm * 0.75)
+    cv2.drawFrameAxes(overlay, K, dist, raw_rvec, raw_tvec, size_of(raw_tid) * 0.75)
     cv2.imwrite(str(debug_dir / "extrinsic_live.jpg"), overlay)
 
     # The tag's longest edge in pixels — the single number that bounds how well
@@ -816,7 +886,8 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     })
 
     M = _minimal_rotation(up_room, [0.0, -1.0, 0.0]) if up_room is not None else np.eye(3)
-    tag_notes = _save_room_tags(other_tags, M, serial, tag_id, tag_size_mm, out_dir)
+    tag_notes = _save_room_tags(other_tags, M, serial, tag_id, tag_size_mm, out_dir,
+                                size_of, tag_sizes)
 
     # How well YAW is pinned down. When the wall gave us the heading (yaw_deg is
     # set), the tag's size no longer matters — the wall normal, not the tag
@@ -929,8 +1000,11 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
 
 
 def _load_room_tags(out_dir):
-    """tags.json -> {tag id: (Q rotation tag->room, p position mm)} for use as
-    calibration anchors. Empty when never measured."""
+    """tags.json -> {tag id: (Q rotation tag->room, p position mm, size_mm)}.
+
+    The recorded size travels with each anchor: the joint solve reconstructs
+    every known tag's corners in the room, and doing that with the wrong edge
+    length misplaces them regardless of how good the centre is."""
     try:
         data = json.loads((out_dir / "tags.json").read_text())
     except (OSError, ValueError):
@@ -943,6 +1017,7 @@ def _load_room_tags(out_dir):
             anchors[int(key)] = (
                 np.array(entry["rotation_tag_to_room"], dtype=np.float64),
                 np.array(entry["position_mm"], dtype=np.float64),
+                float(entry["size_mm"]),
             )
         except (KeyError, ValueError, TypeError):
             continue
@@ -950,7 +1025,7 @@ def _load_room_tags(out_dir):
 
 
 def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
-                    out_dir):
+                    out_dir, size_of=None, explicit=None):
     """Merge every chained tag's room-frame pose into calibration/tags.json —
     the shared room tag map that capture.py embeds into each recording's
     metadata. `level_rotation` re-levels the poses the same way the camera's own
@@ -991,7 +1066,10 @@ def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
         tag_map["tags"][str(other_id)] = {
             "position_mm": [round(float(v), 1) for v in pos],
             "rotation_tag_to_room": R_room.tolist(),
-            "size_mm": tag_size_mm,
+            # the size this tag was actually SOLVED with, not the reference
+            # tag's — a wrong value here silently rescales every future joint
+            # solve that uses this anchor
+            "size_mm": (size_of(other_id) if size_of else tag_size_mm),
             "reprojection_error_px": round(best_err, 3),
             "position_spread_mm": round(spread, 1),
             "frames_used": len(observations),
@@ -999,7 +1077,14 @@ def _save_room_tags(other_tags, level_rotation, serial, ref_tag_id, tag_size_mm,
             "observed_by": serial,
             "measured_at": dt.datetime.now().astimezone().isoformat(),
         }
-        notes.append(f"tag {other_id} at [{pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}] mm")
+        # State the size each new tag was solved at. It is the one input nothing
+        # downstream can sanity-check on its own, and getting it wrong scales the
+        # tag's whole position — say it out loud, and flag when it was ASSUMED
+        # rather than configured.
+        used_size = tag_map["tags"][str(other_id)]["size_mm"]
+        assumed = "" if (explicit and other_id in explicit) else " ASSUMED - set SMARTROOM_TAG_SIZES"
+        notes.append(f"tag {other_id} at [{pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f}] mm "
+                     f"({used_size:g} mm{assumed})")
     _atomic_write_json(path, tag_map)
     return "; " + ", ".join(notes) + " (room frame, saved to tags.json)"
 
