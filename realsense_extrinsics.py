@@ -681,6 +681,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     other_tags = {}   # other tag id -> list of (err, R_room, pos_room_mm) per frame
     seen_ids = set()
     skipped_px = {}   # tag id -> its size in px, for tags dropped as too small
+    tag_px_by_id = {}  # every detected tag -> its largest observed size in px
     for color_bgr, depth_m in samples:
         corners, ids, _ = detector.detectMarkers(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY))
         if ids is None:
@@ -704,6 +705,10 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
                     skipped_px[tid] = round(min(px, skipped_px.get(tid, 1e9)), 1)
             corners = [corners[j] for j in keep]
             flat = [flat[j] for j in keep]
+        for j, tid in enumerate(flat):     # per-tag pixel size, for the UI/report
+            p = corners[j].reshape(4, 2)
+            px = float(np.linalg.norm(p - np.roll(p, 1, axis=0), axis=1).max())
+            tag_px_by_id[tid] = round(max(px, tag_px_by_id.get(tid, 0.0)), 1)
         obs = [(tid, corners[j]) for j, tid in enumerate(flat) if tid in known]
         solved = solve_frame(obs, depth_m) if obs else None
         if solved is None:
@@ -896,6 +901,13 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "tag": {"family": "36h11", "id": tag_id, "size_mm": tag_size_mm},
         "image_size": [w, h],
         "tag_pixels": round(tag_px, 1),           # longest tag edge; bounds the angular accuracy
+        # Per-tag detail, so a report can say WHY a solve came out as it did
+        # without re-deriving it: what each tag measured, how big it was believed
+        # to be, and which were dropped for being too small to help.
+        "tag_pixels_by_id": {str(k): v for k, v in sorted(tag_px_by_id.items())},
+        "tag_sizes_mm_by_id": {str(k): size_of(k) for k in sorted(tag_px_by_id)},
+        "tags_ignored_px": {str(k): v for k, v in sorted(skipped_px.items())},
+        "min_tag_pixels": min_tag_px,
         "rvec": rvec.flatten().tolist(),          # room -> camera rotation (Rodrigues)
         "tvec_mm": tvec.flatten().tolist(),       # tag origin in camera frame
         "rotation_cam_to_room": R.T.tolist(),

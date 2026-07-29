@@ -1741,7 +1741,10 @@ class Handler(BaseHTTPRequestHandler):
             ' <button type="button" class="depth-cal" style="margin-left:14px;cursor:pointer;"' +
             ' title="Camera pose from the AprilTag using the RealSense factory intrinsics + depth cross-check">' +
             '&#128205; Calibrate extrinsic (AprilTag)</button>' +
-            ' <span class="depth-cal-msg" style="font-size:0.85em;"></span></div>';
+            ' <span class="depth-cal-msg" style="font-size:0.85em;"></span>' +
+            '<div class="depth-cal-out" style="display:none;margin-top:8px;padding:8px 10px;' +
+            'border-radius:6px;background:rgba(127,127,127,.10);font-size:0.85em;' +
+            'line-height:1.5;overflow-x:auto;"></div></div>';
         card.querySelectorAll('.live-stage img').forEach(function (img) {{
           var kind = img.parentElement.getAttribute('data-kind');
           img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
@@ -1761,9 +1764,84 @@ class Handler(BaseHTTPRequestHandler):
         }});
         var calBtn = card.querySelector('.depth-cal');
         var calMsg = card.querySelector('.depth-cal-msg');
+        var calOut = card.querySelector('.depth-cal-out');
+
+        // Render the solve's numbers rather than dumping its prose. The status
+        // message is a paragraph written for a human; the fields that decide
+        // whether to TRUST a calibration — how many pixels each tag was, which
+        // were ignored, whether levelling ran — are buried in the middle of it.
+        function renderCal(st) {{
+          var s = st.summary;
+          if (!s) {{ calOut.style.display = 'none'; return; }}
+          function esc(t) {{
+            return String(t == null ? '' : t).replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          }}
+          function row(k, v) {{
+            return '<div><span style="display:inline-block;min-width:9em;opacity:.65">' +
+              esc(k) + '</span>' + v + '</div>';
+          }}
+          var h = '';
+          if (s.position_mm) {{
+            h += row('camera', '<b>[' + s.position_mm.map(function (n) {{
+              return Math.round(n); }}).join(', ') + '] mm</b>' +
+              (s.range_mm ? ' <span style="opacity:.6">' +
+                (s.range_mm / 1000).toFixed(2) + ' m from origin</span>' : ''));
+          }}
+          if (s.resolution) h += row('solved at', s.resolution.join('x'));
+          if (s.used && s.used.length) {{
+            h += row('from tags', s.used.map(function (t) {{
+              // px is the number that bounds the accuracy, so lead with it
+              var warn = t.px != null && t.px < 60;
+              return '<b>' + esc(t.id) + '</b> (' +
+                '<span' + (warn ? ' style="color:#c62828"' : '') + '>' +
+                (t.px != null ? t.px + ' px' : '? px') + '</span>' +
+                (t.size_mm ? ', ' + t.size_mm + ' mm' : '') + ')';
+            }}).join(' + '));
+          }}
+          if (s.ignored && s.ignored.length) {{
+            h += row('ignored', '<span style="opacity:.75">' + s.ignored.map(function (t) {{
+              return 'tag ' + esc(t.id) + ' (' + t.px + ' px)';
+            }}).join(', ') + ' &lt; ' + esc(s.min_tag_pixels) + ' px</span>');
+          }}
+          if (s.anchored_by_tag != null) {{
+            h += row('anchored via', 'tag ' + esc(s.anchored_by_tag) +
+              ' <span style="opacity:.6">(reference tag not in view — two solves stack)</span>');
+          }}
+          var q = [];
+          if (s.reproj_px != null) q.push('reproj ' + s.reproj_px + ' px');
+          if (s.depth_agreement_pct != null) {{
+            q.push('depth ' + (s.depth_agreement_pct > 4 ? '<span style="color:#c62828">' : '<span>') +
+              'off ' + s.depth_agreement_pct + '%</span>');
+          }}
+          if (q.length) h += row('quality', q.join(' &nbsp; '));
+          var lv = s.levelled || {{}};
+          h += row('levelling', lv.tilt_corrected_deg != null
+            ? 'ran, tilt corrected ' + lv.tilt_corrected_deg + '&deg;' +
+              (lv.normals_ref ? ' <span style="opacity:.6">(' + lv.normals_ref +
+                ' normals)</span>' : '')
+            : '<span style="color:#c62828">skipped</span>');
+          if (s.floor_mm != null) {{
+            h += row('floor', Math.round(s.floor_mm) + ' mm below the tag' +
+              (s.configured_floor_mm != null
+                ? ' <span style="opacity:.6">(node.env says ' +
+                  Math.round(s.configured_floor_mm) + ')</span>' : ''));
+          }}
+          (s.warnings || []).forEach(function (w) {{
+            h += '<div style="margin-top:5px;color:#c62828">&#9888; ' + esc(w) + '</div>';
+          }});
+          // the full prose stays available, just folded away
+          h += '<details style="margin-top:6px"><summary style="cursor:pointer;opacity:.6">' +
+            'full message</summary><div style="white-space:pre-wrap;margin-top:4px;opacity:.8">' +
+            esc(st.message || '') + '</div></details>';
+          calOut.innerHTML = h;
+          calOut.style.display = '';
+        }}
+
         calBtn.addEventListener('click', function () {{
           calBtn.disabled = true;
           calMsg.textContent = 'Calibrating…';
+          calOut.style.display = 'none';
           fetch(BASE + '/calibrate/extrinsic?s=' + q, {{ method: 'POST' }})
             .then(function (r) {{ return r.json(); }})
             .then(function (j) {{
@@ -1772,10 +1850,22 @@ class Handler(BaseHTTPRequestHandler):
                 fetch(BASE + '/calibrate/extrinsic/status?s=' + q)
                   .then(function (r) {{ return r.json(); }})
                   .then(function (st) {{
+                    // Ignore anything that is not a calibration status. The
+                    // worker pipe used to hand this poll the watchdog's device
+                    // status, which has no 'running' key — read as finished, it
+                    // reported an empty result over a run still in progress.
+                    if (!st || typeof st.running === 'undefined') return;
                     if (st.running) {{ calMsg.textContent = st.message || 'running…'; return; }}
                     clearInterval(poll);
                     calBtn.disabled = false;
-                    calMsg.textContent = (st.ok ? '✅ ' : '❌ ') + (st.message || '');
+                    calMsg.textContent = st.ok ? '✅ done' : '❌ failed';
+                    if (st.ok) {{ renderCal(st); }}
+                    else {{
+                      calOut.innerHTML = '<div style="color:#c62828">&#9888; ' +
+                        String(st.message || 'calibration failed')
+                          .replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</div>';
+                      calOut.style.display = '';
+                    }}
                   }}).catch(function () {{}});
               }}, 1000);
             }}).catch(function () {{ calMsg.textContent = 'request failed'; calBtn.disabled = false; }});

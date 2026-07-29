@@ -785,6 +785,62 @@ class CameraWorker:
         with self.cal_lock:
             return dict(self.cal)
 
+    def cal_summary(self):
+        """The last calibration's numbers, structured, for the UI to render.
+
+        Read back from the file the solve just wrote rather than parsed out of the
+        status message: the message is prose meant for a human, and scraping it in
+        JavaScript would break every time its wording changed."""
+        try:
+            e = json.loads((PROJECT_ROOT / "calibration" /
+                            f"{self.serial}.extrinsics.json").read_text())
+        except (OSError, ValueError):
+            return None
+        lev = e.get("levelled") or {}
+        try:
+            room = json.loads((PROJECT_ROOT / "calibration" / "room_level.json").read_text())
+        except (OSError, ValueError):
+            room = {}
+        px, sizes = e.get("tag_pixels_by_id") or {}, e.get("tag_sizes_mm_by_id") or {}
+        used = [str(t) for t in (e.get("solved_from_tags") or [])]
+        rng = e.get("tvec_mm") and float(np.linalg.norm(e["tvec_mm"]))
+        agree = e.get("depth_agreement_mm")
+        warnings = []
+        if agree is not None and rng and agree > 0.04 * rng:
+            warnings.append(f"depth and the pose disagree on the tag's range by "
+                            f"{100 * agree / rng:.1f}% ({agree:.0f} mm of {rng:.0f} mm)")
+        if lev.get("camera_tilt_corrected_deg") is None:
+            warnings.append("levelling was SKIPPED — too little horizontal surface in view, "
+                            "so pitch and roll came from the tag's ill-conditioned solve")
+        m_floor, c_floor = room.get("measured_floor_mm"), room.get("configured_floor_mm")
+        if m_floor and c_floor and abs(m_floor - c_floor) > 100:
+            warnings.append(f"floor measures {m_floor:.0f} mm below the tag but node.env says "
+                            f"{c_floor:.0f} mm — a {abs(m_floor - c_floor):.0f} mm contradiction")
+        small = [t for t in used if float(px.get(t, 0)) < realsense_extrinsics.MIN_TAG_PIXELS]
+        if small:
+            warnings.append("solved from tags under "
+                            f"{realsense_extrinsics.MIN_TAG_PIXELS:.0f} px: "
+                            + ", ".join(f"tag {t} ({px.get(t)} px)" for t in small))
+        return {
+            "resolution": e.get("image_size"),
+            "position_mm": e.get("camera_position_mm"),
+            "range_mm": round(rng) if rng else None,
+            "reproj_px": e.get("reprojection_error_px"),
+            "depth_agreement_mm": agree,
+            "depth_agreement_pct": round(100 * agree / rng, 1) if (agree is not None and rng) else None,
+            "used": [{"id": t, "px": px.get(t), "size_mm": sizes.get(t)} for t in used],
+            "ignored": [{"id": t, "px": v} for t, v in (e.get("tags_ignored_px") or {}).items()],
+            "min_tag_pixels": e.get("min_tag_pixels"),
+            "anchored_by_tag": e.get("anchored_by_tag"),
+            "levelled": {"tilt_corrected_deg": lev.get("camera_tilt_corrected_deg"),
+                         "defines_room_vertical": lev.get("defines_room_vertical"),
+                         "normals_ref": lev.get("normals_used_ref"),
+                         "yaw_source": lev.get("yaw_source")},
+            "floor_mm": m_floor, "configured_floor_mm": c_floor,
+            "calibrated_at": e.get("calibrated_at"),
+            "warnings": warnings,
+        }
+
     def _swap_profile(self, calib):
         """Restart this camera's pipeline in (or out of) calibration mode.
 
@@ -893,12 +949,17 @@ def worker_main(serial, name, usb, conn, view_queue):
                 reply = {"ok": ok, "message": message}
             elif op == "cal_status":
                 reply = worker.cal_status()
+                if not reply.get("running") and reply.get("ok"):
+                    reply["summary"] = worker.cal_summary()
             elif op == "motion":
                 reply = {"ok": True, "series": worker.motion_series(float(msg["duration"]))}
             else:
                 reply = {"ok": False, "error": f"unknown op {op}"}
         except Exception as exc:  # noqa: BLE001 - never kill the cmd loop
             reply = {"ok": False, "error": str(exc)}
+        # echo the request id so the parent can tell our reply from a stale one
+        if isinstance(reply, dict) and msg.get("_rid") is not None:
+            reply = {**reply, "_rid": msg["_rid"]}
         try:
             conn.send(reply)
         except (BrokenPipeError, OSError):
@@ -932,6 +993,7 @@ class Worker:
     def __init__(self, dev):
         self.dev = dev
         self.lock = threading.Lock()      # serializes command round-trips
+        self.seq = 0                      # request id, so a late reply is not mistaken for ours
         self.view = ViewCache()
         self.viewer_lock = threading.Lock()
         self.viewer_count = 0
@@ -975,17 +1037,33 @@ class Worker:
             self.view.put(rgb, depth, hw_ts)
 
     def call(self, op, timeout=10.0, **kw):
-        """Command round-trip; {'ok': False, 'error': ...} on any failure."""
+        """Command round-trip; {'ok': False, 'error': ...} on any failure.
+
+        Replies carry the request id they answer. Draining whatever has already
+        arrived is not enough on its own: a call that timed out leaves its reply
+        still in flight, and the next call would then receive THAT as its own —
+        observed in the wild as a calibration status poll being handed the
+        watchdog's device status, which has no 'running' key, so the UI read the
+        run as finished and reported nonsense."""
         with self.lock:
             if not self.proc.is_alive():
                 return {"ok": False, "error": "worker not running"}
+            self.seq += 1
+            rid = self.seq
             try:
-                while self.conn.poll(0):  # drain a stale reply from a past timeout
+                while self.conn.poll(0):  # discard replies to earlier calls
                     self.conn.recv()
-                self.conn.send({"op": op, **kw})
-                if self.conn.poll(timeout):
-                    return self.conn.recv()
-                return {"ok": False, "error": f"worker timeout on {op}"}
+                self.conn.send({"op": op, "_rid": rid, **kw})
+                deadline = time.monotonic() + timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not self.conn.poll(remaining):
+                        return {"ok": False, "error": f"worker timeout on {op}"}
+                    reply = self.conn.recv()
+                    # a late reply to a previous call: keep waiting for ours
+                    if isinstance(reply, dict) and reply.get("_rid") not in (None, rid):
+                        continue
+                    return reply
             except (BrokenPipeError, EOFError, OSError) as exc:
                 return {"ok": False, "error": str(exc)}
 
