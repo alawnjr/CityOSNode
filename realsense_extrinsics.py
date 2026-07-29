@@ -229,7 +229,24 @@ def corner_model(size_mm):
 
 
 def _env_tag_height_mm():
-    return float(os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110"))
+    """Height of the REFERENCE tag's centre above the floor, mm.
+
+    Named for tag 3 because that is the tag it was measured on, and the old
+    SMARTROOM_TAG_HEIGHT_MM said nothing about which tag it meant — which
+    mattered once tag 2 was taken down and its 1590 was left behind describing
+    a tag that no longer existed. The old name is still honoured so a node that
+    has not been updated keeps working.
+
+    This is what fixes the FLOOR: the room frame's origin is the reference tag's
+    centre and its vertical is gravity-levelled, so the floor is the plane
+    y = +height (the levelled frame's up is -Y). It is only the origin's height
+    when the reference tag IS tag 3 — otherwise the origin sits wherever
+    SMARTROOM_TAG_ID is, and this number has to be propagated there through
+    tags.json."""
+    for key in ("SMARTROOM_TAG3_HEIGHT_MM", "SMARTROOM_TAG_HEIGHT_MM"):
+        if key in os.environ:
+            return float(os.environ[key])
+    return 1110.0
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -982,7 +999,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     if level and level.get("measured_floor_mm") is not None:
         floor_note = (f"; lowest broad horizontal surface is {level['measured_floor_mm']:.0f} mm "
                       f"below the tag — the floor, unless it is a desk "
-                      f"(node.env says {_env_tag_height_mm():.0f})")
+                      f"(SMARTROOM_TAG3_HEIGHT_MM says {_env_tag_height_mm():.0f})")
     return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in room frame"
                   f"{via} ({dist_m:.2f} m from origin), reproj {err:.2f} px over {len(results)} frame(s)"
                   f"{agree}{level_note}{floor_note}{yaw_note}{tag_notes} — saved {out_path.name}")
@@ -1013,7 +1030,7 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
 
     The floor height is REPORTED, never auto-applied: the lowest broad
     horizontal surface can just as well be a platform, and
-    SMARTROOM_TAG_HEIGHT_MM stays the authority until a human confirms."""
+    SMARTROOM_TAG3_HEIGHT_MM stays the authority until a human confirms."""
     if plane is None or up_room is None:
         return _load_room_level(out_dir)
     floor_mm = None
@@ -1039,7 +1056,7 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
         "measured_by": {"camera": serial, "normals_used": plane["normals_used"],
                         "normals_used_ref": plane["normals_used_ref"],
                         "scatter_deg": plane["scatter_deg"]},
-        # informational — SMARTROOM_TAG_HEIGHT_MM remains what capture.py embeds
+        # informational — SMARTROOM_TAG3_HEIGHT_MM remains what capture.py embeds
         "measured_floor_mm": round(floor_mm, 1) if floor_mm is not None else
                              previous.get("measured_floor_mm"),
         "configured_floor_mm": _env_tag_height_mm(),

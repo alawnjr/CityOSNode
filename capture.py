@@ -205,9 +205,11 @@ def load_extrinsics():
 def room_frame_info():
     """Static facts about the room coordinate frame (defined by AprilTag 1),
     embedded in every recording so downstream analysis can relate tag-frame
-    coordinates to the physical room. The tag center is ~111cm off the ground
-    (measured); override with SMARTROOM_TAG_HEIGHT_MM in node.env if it moves."""
-    height = float(os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110"))
+    coordinates to the physical room. Set SMARTROOM_TAG3_HEIGHT_MM in node.env to
+    the reference tag's measured centre height above the floor (tag 3 is 1330mm);
+    SMARTROOM_TAG_HEIGHT_MM is the old name for it and still works."""
+    height = float(os.environ.get("SMARTROOM_TAG3_HEIGHT_MM",
+                                  os.environ.get("SMARTROOM_TAG_HEIGHT_MM", "1110")))
     info = {
         "reference_tag": {
             "family": "36h11",
