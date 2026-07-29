@@ -1084,7 +1084,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     if level and level.get("measured_floor_mm") is not None:
         floor_note = (f"; lowest broad horizontal surface is {level['measured_floor_mm']:.0f} mm "
                       f"below the tag — the floor, unless it is a desk "
-                      f"(SMARTROOM_TAG3_HEIGHT_MM says {_env_tag_height_mm():.0f})")
+                      f"(configured {_env_tag_height_mm(tag_id):.0f} for tag {tag_id})")
     return True, (f"camera at [{cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f}] mm in room frame"
                   f"{via} ({dist_m:.2f} m from origin), reproj {err:.2f} px over {len(results)} frame(s)"
                   f"{agree}{level_note}{floor_note}{yaw_note}{tag_notes} — saved {out_path.name}")
@@ -1153,7 +1153,10 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
         # informational — SMARTROOM_TAG3_HEIGHT_MM remains what capture.py embeds
         "measured_floor_mm": round(floor_mm, 1) if floor_mm is not None else
                              previous.get("measured_floor_mm"),
-        "configured_floor_mm": _env_tag_height_mm(),
+        # for THIS reference tag: called without it, the per-tag map was skipped
+        # and the 1110 fallback stood in, inventing a 1099mm 'contradiction'
+        # against a floor tag whose configured height is 0
+        "configured_floor_mm": _env_tag_height_mm(tag_id),
         "measured_at": dt.datetime.now().astimezone().isoformat(),
     }
     _atomic_write_json(out_dir / LEVEL_FILENAME, level)
