@@ -629,8 +629,20 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # wrong by 5 degrees moves its corners by ~6 mm, nothing against a
     # metre-scale spread between tags. It is the tag CENTRES that must be right,
     # and centres come from PnP's translation, the well-conditioned half.
+    anchors = _load_room_tags(out_dir)       # {id: (R tag->room, centre mm, size mm)}
+    # The reference tag sits at the origin BY DEFINITION, so a tags.json entry for
+    # it must never win: that file records where each tag is relative to whatever
+    # the reference WAS, so after re-pointing SMARTROOM_TAG_ID at a tag already in
+    # the map, the update would have displaced the new origin to its old
+    # coordinates and shifted every pose by that offset, silently.
+    stale_ref = anchors.pop(tag_id, None)
+    if stale_ref is not None:
+        level_notes.append(
+            f"tags.json still placed the reference tag {tag_id} at "
+            f"[{stale_ref[1][0]:.0f}, {stale_ref[1][1]:.0f}, {stale_ref[1][2]:.0f}] mm — "
+            f"ignored, it is the origin now; clear tags.json to re-map the room around it")
     known = {tag_id: (np.eye(3), np.zeros(3), size_of(tag_id))}
-    known.update(_load_room_tags(out_dir))   # {id: (R tag->room, centre mm, size mm)}
+    known.update(anchors)
     known_corners = {tid: (Q @ corner_model(sz).T).T + p
                      for tid, (Q, p, sz) in known.items()}
 
@@ -816,7 +828,7 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     #
     # An ANCHORED solve arrives already levelled (tags.json holds levelled
     # poses), so step 1 is skipped for it.
-    stored = _load_room_level(out_dir)
+    stored = _load_room_level(out_dir, tag_id)
     defines_room = (vertical is not None and anchor_id is None
                     and obliquity_deg >= MIN_TAG_OBLIQUITY_DEG)
 
@@ -1008,14 +1020,23 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
 LEVEL_FILENAME = "room_level.json"
 
 
-def _load_room_level(out_dir):
+def _load_room_level(out_dir, tag_id=None):
     """room_level.json -> {"up": measured vertical in the RAW tag frame, ...},
-    or None. Shared by every camera: one tag, one room, one vertical."""
+    or None. Shared by every camera: one tag, one room, one vertical.
+
+    `up_in_tag_frame` is expressed in the REFERENCE TAG's own axes, so a file
+    measured against a different tag is not merely stale, it is in the wrong
+    basis: reusing it would tilt the room frame by however differently the two
+    tags happen to be mounted. Pass tag_id to reject that."""
     try:
         data = json.loads((out_dir / LEVEL_FILENAME).read_text())
         up = np.array(data["up_in_tag_frame"], dtype=np.float64)
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    if tag_id is not None:
+        stored_id = (data.get("reference_tag") or {}).get("id")
+        if stored_id is not None and int(stored_id) != int(tag_id):
+            return None
     if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) < 1e-6:
         return None
     data["up"] = up / np.linalg.norm(up)
@@ -1032,13 +1053,13 @@ def _save_room_level(plane, up_room, tilt_deg, tvec, serial, tag_id, tag_size_mm
     horizontal surface can just as well be a platform, and
     SMARTROOM_TAG3_HEIGHT_MM stays the authority until a human confirms."""
     if plane is None or up_room is None:
-        return _load_room_level(out_dir)
+        return _load_room_level(out_dir, tag_id)
     floor_mm = None
     if plane["floor_below_camera_mm"] is not None:
         # tag centre's height above the floor: the tag origin sits at tvec in
         # camera coordinates, and the floor is that far below the camera.
         floor_mm = float(plane["up_cam"] @ tvec.reshape(3) - plane["floor_below_camera_mm"])
-    previous = _load_room_level(out_dir) or {}
+    previous = _load_room_level(out_dir, tag_id) or {}
     # Compared in 640x480-equivalents: the cameras calibrate at DIFFERENT
     # resolutions (the D455 caps at 1280x800, the D435 reaches 1920x1080), so raw
     # counts would hand the room's vertical to whichever camera has more pixels
