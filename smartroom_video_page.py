@@ -1721,6 +1721,7 @@ class Handler(BaseHTTPRequestHandler):
       var host = document.getElementById('depth-cams');
       var built = {{}};
       var bumped = {{}};
+      var wasRunning = {{}};   // to spot a camera coming back and re-request its stream
 
       function buildCard(dev) {{
         var s = dev.serial, q = encodeURIComponent(s);
@@ -1747,6 +1748,12 @@ class Handler(BaseHTTPRequestHandler):
             'line-height:1.5;overflow-x:auto;"></div></div>';
         card.querySelectorAll('.live-stage img').forEach(function (img) {{
           var kind = img.parentElement.getAttribute('data-kind');
+          // a stream that errors gets one prompt retry; refresh() handles the rest
+          img.addEventListener('error', function () {{
+            setTimeout(function () {{
+              img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
+            }}, 2000);
+          }});
           img.src = BASE + '/' + kind + '.mjpg?s=' + q + '&t=' + Date.now();
         }});
         card.querySelectorAll('.live-stage').forEach(function (stage) {{
@@ -1885,12 +1892,30 @@ class Handler(BaseHTTPRequestHandler):
               bumped[s] = Date.now();
             }}
             var st = dev.status || {{}}, info = st.info || {{}};
-            if (!st.running && !st.starting && Date.now() - (bumped[s] || 0) > 8000) {{
+            // Re-request a dead <img>. The old condition only fired while the
+            // camera was NOT running, which is the wrong way round: the common
+            // failure is the camera being perfectly healthy while the stream
+            // connection died under it — restart the depth page with this page
+            // open and the card keeps updating its profile line from /devices
+            // while both panes stay black forever, because once the camera is
+            // running again the not-running test can never become true.
+            //
+            // An MJPEG <img> gives no per-frame load event to use as a
+            // heartbeat, so trigger on what IS observable: the camera coming
+            // back up (edge, catches every restart), and a running camera whose
+            // image has still decoded nothing (naturalWidth 0).
+            var imgs = built[s].querySelectorAll('.live-stage img');
+            var cameBack = st.running && wasRunning[s] === false;
+            var blank = false;
+            imgs.forEach(function (img) {{ if (!img.naturalWidth) blank = true; }});
+            var stale = (!st.running && !st.starting) || cameBack || (st.running && blank);
+            if (stale && Date.now() - (bumped[s] || 0) > 8000) {{
               bumped[s] = Date.now();
-              built[s].querySelectorAll('.live-stage img').forEach(function (img) {{
+              imgs.forEach(function (img) {{
                 img.src = img.src.split('&t=')[0] + '&t=' + Date.now();
               }});
             }}
+            wasRunning[s] = !!st.running;
             var usb = (dev.usb && dev.usb !== '?') ? dev.usb : (info.usb || '?');
             var bits = [];
             if (st.running && info.profile) bits.push(info.profile);
