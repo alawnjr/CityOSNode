@@ -816,7 +816,12 @@ class CameraWorker:
         if m_floor and c_floor and abs(m_floor - c_floor) > 100:
             warnings.append(f"floor measures {m_floor:.0f} mm below the tag but node.env says "
                             f"{c_floor:.0f} mm — a {abs(m_floor - c_floor):.0f} mm contradiction")
-        small = [t for t in used if float(px.get(t, 0)) < realsense_extrinsics.MIN_TAG_PIXELS]
+        # unknown != small: a file written before tag_pixels_by_id existed has no
+        # pixel counts, and treating those as 0 warned about tags it knew nothing
+        # about
+        small = [t for t in used
+                 if px.get(t) is not None
+                 and float(px[t]) < realsense_extrinsics.MIN_TAG_PIXELS]
         if small:
             warnings.append("solved from tags under "
                             f"{realsense_extrinsics.MIN_TAG_PIXELS:.0f} px: "
