@@ -48,6 +48,7 @@ from pathlib import Path
 import numpy as np
 
 import realsense_extrinsics
+from calibration_config import MAX_REPROJ_PX
 
 # Frame threads block on the GIL behind other threads for multiples of the
 # switch interval; the default 5ms costs a 33ms frame budget fast.
@@ -814,12 +815,43 @@ class CameraWorker:
         rng = e.get("tvec_mm") and float(np.linalg.norm(e["tvec_mm"]))
         agree = e.get("depth_agreement_mm")
         warnings = []
+        reproj = e.get("reprojection_error_px")
+        if reproj is not None and reproj > MAX_REPROJ_PX:
+            warnings.append(f"reprojection error {reproj:.1f} px is far above the {MAX_REPROJ_PX:.0f} px "
+                            f"a consistent solve gives — the mapped tags disagree with each other, "
+                            f"so at least one anchor in tags.json is wrong")
         if agree is not None and rng and agree > 0.04 * rng:
             warnings.append(f"depth and the pose disagree on the tag's range by "
                             f"{100 * agree / rng:.1f}% ({agree:.0f} mm of {rng:.0f} mm)")
-        if lev.get("camera_tilt_corrected_deg") is None:
-            warnings.append("levelling was SKIPPED — too little horizontal surface in view, "
-                            "so pitch and roll came from the tag's ill-conditioned solve")
+        # Only the SOURCE says whether a vertical was applied. tilt_corrected is
+        # set solely when a camera measures its OWN, so testing it called a camera
+        # that correctly fell back to the shared room_level.json "SKIPPED" and
+        # claimed its pitch came from the tag — it did not.
+        lev_src = str(lev.get("source") or "")
+        if "NOT LEVELLED" in lev_src:
+            warnings.append("levelling was SKIPPED — no horizontal surface in view and no shared "
+                            "room_level.json, so pitch and roll came from the tag's "
+                            "ill-conditioned solve")
+        # An anchor below the floor cannot be real, and it poisons every later
+        # joint solve — this is what produced a 150px reprojection. Y is down in
+        # the levelled frame, so height above the floor is -Y relative to a
+        # reference tag whose own height is known.
+        ref_h = e.get("reference_tag_height_mm")
+        if ref_h is None:
+            ref_h = (realsense_extrinsics.tag_heights() or {}).get(
+                int((e.get("tag") or {}).get("id", -1)), None)
+        if ref_h is not None:
+            try:
+                tags = json.loads((PROJECT_ROOT / "calibration" /
+                                   realsense_extrinsics.TAGS_FILENAME).read_text())
+                for tid, ent in sorted((tags.get("tags") or {}).items()):
+                    h = ref_h - float(ent["position_mm"][1])
+                    if h < -50.0:
+                        warnings.append(f"tag {tid} is mapped {abs(h):.0f} mm BELOW the floor, "
+                                        f"which is impossible — remove it from tags.json and "
+                                        f"re-map it")
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         m_floor, c_floor = room.get("measured_floor_mm"), room.get("configured_floor_mm")
         if m_floor and c_floor and abs(m_floor - c_floor) > 100:
             warnings.append(f"floor measures {m_floor:.0f} mm below the tag but node.env says "

@@ -273,6 +273,10 @@ INTRINSIC_FRAMES = 15
 INTRINSIC_MIN_MOVE_PX = 40.0
 # RMS reprojection error above this means the intrinsic solve is not usable.
 MAX_INTRINSIC_RMS_PX = 1.0
+# Above this, a joint solve has not reconciled its tags: the corners of two
+# mapped anchors cannot both be where the map says. Consistent solves here run
+# 0.2-3 px; a wrong anchor produced 150.
+MAX_REPROJ_PX = 8.0
 
 
 def normals_scale(intr):

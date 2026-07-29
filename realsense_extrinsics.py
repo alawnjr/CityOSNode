@@ -94,8 +94,9 @@ from calibration_config import (  # noqa: F401 - re-exported so existing callers
     DEPTH_TIEBREAK_MARGIN, LEVEL_FILENAME, MAX_LEVEL_SCATTER_DEG,
     MAX_YAW_CORRECTION_DEG, MAX_YAW_SCATTER_DEG, MIN_LEVEL_NORMALS,
     MIN_TAG_OBLIQUITY_DEG, MIN_TAG_PIXELS, MIN_YAW_NORMALS, NORMALS_REF_PIXELS,
-    PROJECT_ROOT, TAGS_FILENAME, WALL_MAX_TILT_DEG, normals_scale,
+    MAX_REPROJ_PX, PROJECT_ROOT, TAGS_FILENAME, WALL_MAX_TILT_DEG, normals_scale,
 )
+tag_heights = cfg.tag_heights   # re-exported for the page's summary
 
 # Resolved at CALL time, not import time — the web page imports this module
 # before it loads node.env, so import-time reads would freeze the defaults.
