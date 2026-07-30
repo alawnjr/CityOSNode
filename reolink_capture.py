@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+Record the Reolink NVR's cameras into the smartroom recording layout.
+
+capture.py records the camera attached to the Pi it runs on. This records the
+four Reolink cameras, which are not attached to anything: they live on an NVR
+and are reached over RTSP. That difference drives every choice here.
+
+WHERE THIS RUNS. Not on the quad server -- it cannot reach the NVR (no route
+from 172.16.60.0/24 to the camera network; ping and TCP/554 both fail). The
+host that can see the NVR runs this, and --upload pushes finished recordings to
+the analysis volume. Measured on the lab laptop: RTSP/554 open, 1-4ms away.
+
+LAYOUT. capture.py writes one camera into rec/streams/ and lets
+upload_recording.sh fold it into rec/streams/<node>/ on the way up. Four cameras
+do not fit that shape, so this writes the FINAL layout directly -- one directory
+per camera, each with its own metadata.json:
+
+    data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_HHMMSS/streams/reolink1/
+        camera_main.mp4
+        camera_main_timestamps.csv
+        metadata.json
+
+The stem is `camera_main` and each camera gets its OWN directory, on purpose:
+the mirror only discovers a fixed set of clip stems (lib/manifest.ts CLIP_STEMS
+is camera_main / camera_d455_color / camera_d435_color, and its sensor suffix
+regex only matches /^camera_(d\\d+)_color$/). A stream called camera_reolink1
+would be silently invisible. One camera per directory falls through to the
+mirror's default mapping (<cam> dir -> camera_main) and needs no change there.
+It is also the honest shape: these four cameras have four different poses, so
+they are four clips, not one clip with four streams.
+
+Recording ids are timestamps (rec_YYYYMMDD_HHMMSS) rather than capture.py's
+per-day counter. The counter is only unique among recordings made by the same
+node, and these clips are uploaded into a tree the Pi is also writing into --
+two nodes independently picking rec_..._001 would merge two unrelated sessions
+into one recording directory.
+
+TIMEBASE. The CSV is (frame_index, timestamp_seconds), matching what capture.py
+writes for camera_main. There is no hw_timestamp_ms column: that is a real
+hardware clock the RealSense sensors provide, and RTSP does not. Inventing one
+from the wall clock would produce a column that downstream trusts for
+cross-camera alignment and that is wrong by the network's jitter.
+
+Config (environment / node.env, loaded via calibration_config):
+    SMARTROOM_REOLINK_HOST      NVR address
+    SMARTROOM_REOLINK_USER      NVR username
+    SMARTROOM_REOLINK_PASS      NVR password
+    SMARTROOM_REOLINK_CHANNELS  channels to record (default "1,2,3,4")
+    SMARTROOM_REOLINK_STREAM    "main" (default) or "sub"
+    SMARTROOM_REOLINK_PATH      URL path template (default Reolink's own)
+    SMARTROOM_UPLOAD_DEST       user@host:/abs/recordings/root for --upload
+
+The password is read from the environment and never printed; URLs are redacted
+in every log line. It does still reach ffmpeg's argv, which is visible in the
+process list on a shared machine -- run this somewhere you trust.
+
+    python reolink_capture.py --probe                # auth + stream check only
+    python reolink_capture.py --duration 30
+    python reolink_capture.py --duration 30 --upload
+"""
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+import calibration_config as cfg
+
+PROJECT_ROOT = cfg.PROJECT_ROOT
+DATA_DIR = PROJECT_ROOT / "data"
+CALIBRATION_DIR = cfg.DEFAULT_OUT
+
+DEFAULT_PATH_TEMPLATE = "h264Preview_ch{ch:02d}_{stream}"
+DEFAULT_CHANNELS = "1,2,3,4"
+DEFAULT_DEST = "intern26@172.16.60.239:/mnt/data4/intern26/recordings"
+
+
+def redact(url: str) -> str:
+    """rtsp://user:pass@host/... -> rtsp://user:***@host/... for logging."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        if p.password is None:
+            return url
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit(
+            (p.scheme, f"{p.username}:***@{host}", p.path, p.query, p.fragment))
+    except ValueError:
+        return "<unparseable url>"
+
+
+def rtsp_url(channel: int, stream: str) -> str:
+    host = os.environ.get("SMARTROOM_REOLINK_HOST", "").strip()
+    user = os.environ.get("SMARTROOM_REOLINK_USER", "").strip()
+    password = os.environ.get("SMARTROOM_REOLINK_PASS", "")
+    if not host or not user:
+        raise SystemExit(
+            "ERROR: set SMARTROOM_REOLINK_HOST and SMARTROOM_REOLINK_USER (node.env or the "
+            "environment). The password goes in SMARTROOM_REOLINK_PASS; node.env is gitignored.")
+    template = os.environ.get("SMARTROOM_REOLINK_PATH", DEFAULT_PATH_TEMPLATE)
+    path = template.format(ch=channel, stream=stream)
+    # Credentials are quoted: a password with @ or / silently corrupts the URL.
+    cred = f"{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}"
+    return f"rtsp://{cred}@{host}:554/{path}"
+
+
+def channels_from_env(explicit=None):
+    raw = explicit or os.environ.get("SMARTROOM_REOLINK_CHANNELS", DEFAULT_CHANNELS)
+    out = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
+
+
+def camera_id(channel: int) -> str:
+    """Calibration key for a channel: reolink_calibrate.py's --id-prefix + folder."""
+    return f"reolink-camera{channel}"
+
+
+def stream_dir_name(channel: int) -> str:
+    """The <cam> directory, which is how the archive and API address this clip."""
+    return f"reolink{channel}"
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def load_calibration(channel: int):
+    """Intrinsics for embedding, mirroring capture.py's shape (no bookkeeping keys)."""
+    cal = load_json(CALIBRATION_DIR / f"{camera_id(channel)}.json")
+    if not cal:
+        return None
+    keys = ("camera_matrix", "dist_coeffs", "image_size", "rms", "pattern", "calibrated_at")
+    return {k: cal[k] for k in keys if k in cal}
+
+
+def load_extrinsics(channel: int):
+    ext = load_json(CALIBRATION_DIR / f"{camera_id(channel)}.extrinsics.json")
+    if not ext:
+        return None
+    keys = ("camera_id", "frame", "tag", "rotation_cam_to_room", "camera_position_mm",
+            "reprojection_error_px", "levelled", "calibrated_at")
+    return {k: ext[k] for k in keys if k in ext}
+
+
+def room_frame_info():
+    """Same room-frame facts capture.py embeds, from the shared config."""
+    ref_id = cfg.tag_id()
+    height = cfg.tag_height_mm(ref_id)
+    return {
+        "reference_tag": {
+            "family": cfg.TAG_FAMILY,
+            "id": ref_id,
+            "size_mm": cfg.tag_sizes().get(ref_id, cfg.tag_size_mm()),
+        },
+        "definition": "origin=tag center, X=tag right, Y=DOWN (up is -Y), Z=out of tag; units mm",
+        "tag_center_above_floor_mm": height,
+        "floor_plane": (f"y = {-height:.0f} mm" if height is not None else None),
+    }
+
+
+def make_recording_dir(now: dt.datetime) -> Path:
+    """day_NN_YYYY-MM-DD/rec_YYYYMMDD_HHMMSS — see the docstring on why it is a
+    timestamp and not capture.py's per-day counter."""
+    date = now.strftime("%Y-%m-%d")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    existing_days = sorted(DATA_DIR.glob("day_*"))
+    day_dir = next((d for d in existing_days if d.name.endswith(date)), None)
+    if day_dir is None:
+        day_dir = DATA_DIR / f"day_{len(existing_days) + 1:02d}_{date}"
+    rec_dir = day_dir / f"rec_{now.strftime('%Y%m%d_%H%M%S')}"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    return rec_dir
+
+
+def ffprobe_frame_times(mp4_path: Path):
+    """Each encoded frame's real presentation time, from the finished file.
+
+    RTSP delivers what the network delivers, so a nominal-fps grid would be
+    fiction; this reads what actually landed (same approach as capture.py)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "frame=best_effort_timestamp_time", "-of", "csv=p=0", str(mp4_path)],
+            capture_output=True, text=True, timeout=300).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    times = []
+    for line in out.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line == "N/A":
+            continue
+        try:
+            times.append(float(line))
+        except ValueError:
+            continue
+    return times
+
+
+def write_timestamps(csv_path: Path, times) -> int:
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["frame_index", "timestamp_seconds"])
+        for i, t in enumerate(times):
+            writer.writerow([i, f"{t:.6f}"])
+    return len(times)
+
+
+def probe_stream(channel: int, stream: str, timeout_s: int = 20):
+    """(ok, note) — does this channel authenticate and carry video?"""
+    url = rtsp_url(channel, stream)
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+             "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name,width,height,avg_frame_rate",
+             "-of", "default=nw=1:nk=1", "-i", url],
+            capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except OSError as exc:
+        return False, f"ffprobe not runnable: {exc}"
+    if proc.returncode != 0:
+        first = (proc.stderr or "").strip().splitlines()
+        return False, (first[-1] if first else f"exit {proc.returncode}")
+    return True, " ".join((proc.stdout or "").split())
+
+
+def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp"):
+    """Start one ffmpeg per channel, run them concurrently, wait for all.
+
+    Stream-copy, not re-encode: the NVR already sends h264 and four 4K decodes
+    would not keep up on a laptop.
+    """
+    procs = {}
+    for ch in channels:
+        cam_dir = rec_dir / "streams" / stream_dir_name(ch)
+        cam_dir.mkdir(parents=True, exist_ok=True)
+        out = cam_dir / "camera_main.mp4"
+        url = rtsp_url(ch, stream)
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+               "-rtsp_transport", transport, "-i", url,
+               "-t", str(duration), "-c", "copy", "-movflags", "+faststart", str(out)]
+        print(f"  ch{ch:02d} -> {out.relative_to(rec_dir)}  ({redact(url)})", file=sys.stderr)
+        procs[ch] = (subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE), out)
+
+    results = {}
+    for ch, (proc, out) in procs.items():
+        # Generous margin over -t: ffmpeg still has to flush and finalise the mp4.
+        try:
+            _, err = proc.communicate(timeout=duration + 120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+            results[ch] = (out, False, "ffmpeg overran its deadline")
+            continue
+        ok = proc.returncode == 0 and out.exists() and out.stat().st_size > 0
+        note = "" if ok else ((err or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
+        results[ch] = (out, ok, note)
+    return results
+
+
+def upload(rec_dir: Path, dest: str):
+    """Copy the finished recording up. The layout is already final, so this is a
+    straight copy of the rec dir into <dest>/<day>/ -- no restructuring like
+    upload_recording.sh does (that script folds ONE camera into a node dir).
+
+    scp, not rsync: the host that can reach the NVR is a Windows laptop and rsync
+    is not there.
+    """
+    if ":" not in dest:
+        print(f"ERROR: --upload dest wants user@host:/path, got {dest!r}", file=sys.stderr)
+        return False
+    host, root = dest.split(":", 1)
+    day = rec_dir.parent.name
+    if not shutil.which("scp"):
+        print("ERROR: scp not on PATH", file=sys.stderr)
+        return False
+    mk = subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"mkdir -p '{root}/{day}'"],
+                        capture_output=True, text=True)
+    if mk.returncode != 0:
+        print(f"ERROR: could not create {root}/{day}: {mk.stderr.strip()}", file=sys.stderr)
+        return False
+    cp = subprocess.run(["scp", "-o", "BatchMode=yes", "-r", str(rec_dir),
+                         f"{host}:{root}/{day}/"], capture_output=True, text=True)
+    if cp.returncode != 0:
+        print(f"ERROR: upload failed: {cp.stderr.strip()}", file=sys.stderr)
+        return False
+    print(f"uploaded -> {host}:{root}/{day}/{rec_dir.name}", file=sys.stderr)
+    return True
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-d", "--duration", type=int, default=30, help="seconds to record (default 30)")
+    ap.add_argument("--channels", default=None, help="NVR channels, e.g. '1,2,3,4'")
+    ap.add_argument("--stream", default=None, choices=["main", "sub"], help="NVR stream")
+    ap.add_argument("--transport", default="tcp", choices=["tcp", "udp"], help="RTSP transport")
+    ap.add_argument("--probe", action="store_true", help="check auth/streams and exit")
+    ap.add_argument("--upload", action="store_true", help="copy the recording to the analysis volume")
+    ap.add_argument("--dest", default=None, help=f"upload target (default {DEFAULT_DEST})")
+    args = ap.parse_args(argv)
+
+    cfg.load_node_env()
+    channels = channels_from_env(args.channels)
+    stream = args.stream or os.environ.get("SMARTROOM_REOLINK_STREAM", "main")
+    if not channels:
+        print("ERROR: no channels selected", file=sys.stderr)
+        return 1
+
+    if args.probe:
+        bad = 0
+        for ch in channels:
+            ok, note = probe_stream(ch, stream)
+            print(f"ch{ch:02d} [{camera_id(ch)}]: {'OK  ' + note if ok else 'FAIL ' + note}",
+                  file=sys.stderr)
+            bad += 0 if ok else 1
+        missing = [c for c in channels if load_calibration(c) is None]
+        if missing:
+            print(f"NOTE: no calibration for channel(s) {missing} — run reolink_calibrate.py, "
+                  f"or those clips upload uncalibrated and the mirror cannot place them.",
+                  file=sys.stderr)
+        return 1 if bad else 0
+
+    start = dt.datetime.now().astimezone()
+    rec_dir = make_recording_dir(start)
+    print(f"Recording {args.duration}s from {len(channels)} camera(s) -> {rec_dir}", file=sys.stderr)
+    results = record_channels(channels, stream, args.duration, rec_dir, args.transport)
+    end = dt.datetime.now().astimezone()
+
+    written = 0
+    for ch in channels:
+        out, ok, note = results[ch]
+        cam_dir = out.parent
+        if not ok:
+            print(f"  ch{ch:02d}: FAILED — {note}", file=sys.stderr)
+            continue
+        times = ffprobe_frame_times(out)
+        frame_count = write_timestamps(cam_dir / "camera_main_timestamps.csv", times)
+        fps = (frame_count / args.duration) if args.duration else 0.0
+
+        entry = {
+            "modality": "video",
+            "path": "camera_main.mp4",
+            "codec": "h264",
+            "device": f"reolink-nvr:ch{ch:02d}:{stream}",
+            "fps": round(fps, 2),
+            "frame_count": frame_count,
+            "timestamps_path": "camera_main_timestamps.csv",
+            # No hardware clock over RTSP — see the docstring.
+            "hw_timestamp_domain": None,
+        }
+        cal = load_calibration(ch)
+        if cal:
+            entry["calibration"] = cal
+            if cal.get("image_size"):
+                entry["resolution"] = cal["image_size"]
+        ext = load_extrinsics(ch)
+        if ext:
+            entry["extrinsics"] = ext
+
+        metadata = {
+            "recording_id": rec_dir.name,
+            "node": socket.gethostname(),
+            "space": "smart_room_1",
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+            "duration_seconds": args.duration,
+            "schema_version": "0.1",
+            "streams": {"camera_main": entry},
+            "room_frame": room_frame_info(),
+        }
+        tags = load_json(CALIBRATION_DIR / cfg.TAGS_FILENAME)
+        if tags is not None:
+            metadata["room_tags"] = tags
+        # metadata.json LAST: upload_recording.sh treats its presence as "finished".
+        (cam_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        written += 1
+        flag = "" if cal and ext else "  (UNCALIBRATED — mirror cannot place it)"
+        print(f"  ch{ch:02d}: {frame_count} frames, {fps:.1f} fps{flag}", file=sys.stderr)
+
+    if not written:
+        print("no camera recorded successfully", file=sys.stderr)
+        return 1
+    print(f"wrote {written}/{len(channels)} camera(s) -> {rec_dir}", file=sys.stderr)
+
+    if args.upload:
+        dest = args.dest or os.environ.get("SMARTROOM_UPLOAD_DEST", DEFAULT_DEST)
+        if not upload(rec_dir, dest):
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
