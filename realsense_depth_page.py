@@ -172,6 +172,16 @@ class CameraWorker:
         self.frame_id = 0
         self.clients = 0
         self.viewers = 0
+        # Which view streams anyone is actually watching. The encoder used to
+        # colorize the depth and encode BOTH JPEGs on every frame regardless, so
+        # a node whose only subscriber is live_forward.py — which reads rgb.mjpg
+        # and samples depth through /value, never depth.mjpg — paid for a full
+        # depth colorize + JPEG encode per frame, per camera, forever. On a 4-core
+        # Pi running two 30fps cameras that waste is not free: it is what starved
+        # the capture loop. Default True so behaviour is unchanged until the
+        # parent says otherwise.
+        self.want_rgb = True
+        self.want_depth = True
         self.running = False
         self.starting = False
         self.last_active = 0.0
@@ -204,10 +214,16 @@ class CameraWorker:
             self.clients = max(0, self.clients - 1)
             self.last_active = time.monotonic()
 
-    def set_viewers(self, n):
+    def set_viewers(self, n, rgb=None, depth=None):
         with self.cond:
             delta = n - self.viewers
             self.viewers = n
+            # Absent counts (an older parent, or a call that predates this) leave
+            # the flags alone rather than muting a stream someone is watching.
+            if rgb is not None:
+                self.want_rgb = rgb > 0
+            if depth is not None:
+                self.want_depth = depth > 0
             self.clients = max(0, self.clients + delta)
             self.last_active = time.monotonic()
             if n > 0:
@@ -447,20 +463,32 @@ class CameraWorker:
             if bgr is None or z16 is None:
                 continue
             t_enc = time.monotonic()
-            if self.flip:  # flipped camera: rotate at view rate, not capture rate
-                bgr = cv2.rotate(bgr, cv2.ROTATE_180)
-                z16 = cv2.rotate(z16, cv2.ROTATE_180)
-            # colorized depth from the raw z16, fixed 0-6m range. All-OpenCV
-            # ops (they release the GIL); near=red, far=blue.
-            d8 = cv2.convertScaleAbs(z16, alpha=255.0 * (scale or 0.001) / 6.0)
-            vis = cv2.applyColorMap(cv2.subtract(255, d8), cv2.COLORMAP_JET)
-            vis[z16 == 0] = 0
-            ok_rgb, rgb_buf = cv2.imencode(".jpg", bgr, encode_params)
-            ok_depth, depth_buf = cv2.imencode(".jpg", vis, encode_params)
-            if ok_rgb and ok_depth:
+            with self.cond:
+                want_rgb, want_depth = self.want_rgb, self.want_depth
+            rgb_out = depth_out = None
+            if want_rgb:
+                if self.flip:  # flipped camera: rotate at view rate, not capture rate
+                    bgr = cv2.rotate(bgr, cv2.ROTATE_180)
+                ok_rgb, rgb_buf = cv2.imencode(".jpg", bgr, encode_params)
+                if ok_rgb:
+                    rgb_out = rgb_buf.tobytes()
+            if want_depth:
+                if self.flip:
+                    z16 = cv2.rotate(z16, cv2.ROTATE_180)
+                # colorized depth from the raw z16, fixed 0-6m range. All-OpenCV
+                # ops (they release the GIL); near=red, far=blue.
+                d8 = cv2.convertScaleAbs(z16, alpha=255.0 * (scale or 0.001) / 6.0)
+                vis = cv2.applyColorMap(cv2.subtract(255, d8), cv2.COLORMAP_JET)
+                vis[z16 == 0] = 0
+                ok_depth, depth_buf = cv2.imencode(".jpg", vis, encode_params)
+                if ok_depth:
+                    depth_out = depth_buf.tobytes()
+            # A frame is worth sending if EITHER stream came out; the parent keeps
+            # the previous buffer for whichever is None, so an unsubscribed stream
+            # goes stale instead of going blank.
+            if rgb_out is not None or depth_out is not None:
                 try:
-                    self.view_queue.put_nowait((rgb_buf.tobytes(), depth_buf.tobytes(),
-                                                hw_ts))
+                    self.view_queue.put_nowait((rgb_out, depth_out, hw_ts))
                 except Exception:
                     pass  # parent slow — drop, the next frame supersedes
             # rate-limit: sleep only the time LEFT in the frame budget, not a full
@@ -991,7 +1019,7 @@ def worker_main(serial, name, usb, conn, view_queue):
             if op == "status":
                 reply = worker.status()
             elif op == "viewers":
-                worker.set_viewers(int(msg["n"]))
+                worker.set_viewers(int(msg["n"]), msg.get("rgb"), msg.get("depth"))
                 reply = {"ok": True}
             elif op == "value":
                 meters, px, py = worker.depth_at(msg["x"], msg["y"])
@@ -1043,7 +1071,15 @@ class ViewCache:
 
     def put(self, rgb, depth, hw_ts=0.0):
         with self.cond:
-            self.rgb, self.depth, self.hw_ts = rgb, depth, hw_ts
+            # None means "the worker did not encode this stream because nobody is
+            # watching it" — keep the last one we had. Overwriting with None would
+            # blank the stream for the first frame after someone subscribes, and
+            # would strand serve_stream's initial wait.
+            if rgb is not None:
+                self.rgb = rgb
+            if depth is not None:
+                self.depth = depth
+            self.hw_ts = hw_ts
             self.view_id += 1
             self.cond.notify_all()
 
@@ -1058,6 +1094,9 @@ class Worker:
         self.view = ViewCache()
         self.viewer_lock = threading.Lock()
         self.viewer_count = 0
+        # Per-stream, so the worker can skip encoding what nobody reads. Counting
+        # only the total cannot express "3 watchers, none of them on depth".
+        self.viewer_kinds = {"rgb": 0, "depth": 0}
         self._spawn()
 
     def _spawn(self):
@@ -1081,9 +1120,11 @@ class Worker:
                 pass
             self._spawn()
         with self.viewer_lock:
-            n = self.viewer_count
+            n, kinds = self.viewer_count, dict(self.viewer_kinds)
         if n:
-            self.call("viewers", n=n)
+            # A respawned worker starts with both streams assumed wanted; resend
+            # the real per-kind counts or it would encode depth for nobody again.
+            self.call("viewers", n=n, **kinds)
 
     def _pump(self):
         queue = self.view_queue
@@ -1128,17 +1169,21 @@ class Worker:
             except (BrokenPipeError, EOFError, OSError) as exc:
                 return {"ok": False, "error": str(exc)}
 
-    def add_viewer(self):
+    def add_viewer(self, kind="rgb"):
         with self.viewer_lock:
             self.viewer_count += 1
-            n = self.viewer_count
-        self.call("viewers", n=n, timeout=3.0)
+            if kind in self.viewer_kinds:
+                self.viewer_kinds[kind] += 1
+            n, kinds = self.viewer_count, dict(self.viewer_kinds)
+        self.call("viewers", n=n, timeout=3.0, **kinds)
 
-    def remove_viewer(self):
+    def remove_viewer(self, kind="rgb"):
         with self.viewer_lock:
             self.viewer_count = max(0, self.viewer_count - 1)
-            n = self.viewer_count
-        self.call("viewers", n=n, timeout=3.0)
+            if kind in self.viewer_kinds:
+                self.viewer_kinds[kind] = max(0, self.viewer_kinds[kind] - 1)
+            n, kinds = self.viewer_count, dict(self.viewer_kinds)
+        self.call("viewers", n=n, timeout=3.0, **kinds)
 
 
 WORKERS = {}  # serial -> Worker, populated at startup
@@ -1498,13 +1543,14 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
         except OSError:
             pass
-        worker.add_viewer()
+        worker.add_viewer(which)
         try:
             view = worker.view
             first_seen = view.view_id
             end = time.monotonic() + FIRST_FRAME_TIMEOUT
             with view.cond:
-                while view.view_id == first_seen or view.rgb is None:
+                while view.view_id == first_seen or (
+                        view.rgb if which == "rgb" else view.depth) is None:
                     remaining = end - time.monotonic()
                     if remaining <= 0 or not worker.proc.is_alive():
                         status = worker.call("status", timeout=2.0)
@@ -1546,7 +1592,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 time.sleep(max(0.0, interval - (time.monotonic() - t_send)))
         finally:
-            worker.remove_viewer()
+            worker.remove_viewer(which)
 
 
 PAGE = """<!doctype html>
