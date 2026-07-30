@@ -49,7 +49,17 @@ Config (environment / node.env, loaded via calibration_config):
     SMARTROOM_REOLINK_CHANNELS  channels to record (default "1,2,3,4")
     SMARTROOM_REOLINK_STREAM    "main" (default) or "sub"
     SMARTROOM_REOLINK_PATH      URL path template (default Reolink's own)
+    SMARTROOM_REOLINK_AUDIO_CH  channel whose mic to keep (default 1; 0 = none)
     SMARTROOM_UPLOAD_DEST       user@host:/abs/recordings/root for --upload
+
+AUDIO. Every camera offers an aac 16kHz mono track, but only channel 1's mic
+actually carries signal -- measured over a real recording, ch1 is -40.9 dB mean
+with -14.9 dB peaks while 2, 3 and 4 sit at a flat -91.0 dB with mean equal to
+peak, which is digital silence rather than a quiet room. Only the configured
+channel keeps its track: copying the others would leave three clips that look
+like they have sound to anything checking for an audio stream rather than for
+signal. Point SMARTROOM_REOLINK_AUDIO_CH somewhere else if a different camera's
+mic is enabled later.
 
 The password is read from the environment and never printed; URLs are redacted
 in every log line. It does still reach ffmpeg's argv, which is visible in the
@@ -212,6 +222,23 @@ def make_recording_dir(now: dt.datetime) -> Path:
     return rec_dir
 
 
+def probe_audio_props(mp4_path: Path):
+    """(codec, sample_rate, channels) of the first audio track, or None."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_name,sample_rate,channels", "-of", "default=nw=1:nk=1",
+             str(mp4_path)], capture_output=True, text=True, timeout=60).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if len(out) < 3:
+        return None
+    try:
+        return {"codec": out[0], "sample_rate": int(out[1]), "channels": int(out[2])}
+    except ValueError:
+        return None
+
+
 def probe_video_props(mp4_path: Path):
     """(codec, width, height) of a finished file, or (None, None, None).
 
@@ -287,11 +314,19 @@ def probe_stream(channel: int, stream: str, timeout_s: int = 20):
     return True, " ".join((proc.stdout or "").split())
 
 
-def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp"):
+def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp",
+                    audio_ch=None):
     """Start one ffmpeg per channel, run them concurrently, wait for all.
 
     Stream-copy, not re-encode: the NVR already sends h264 and four 4K decodes
     would not keep up on a laptop.
+
+    Only `audio_ch` keeps its audio track. Every camera on this NVR offers one,
+    but measured over a real recording only channel 1 carries signal (-40.9 dB
+    mean, -14.9 dB peak); 2, 3 and 4 are flat digital silence at -91.0 dB, mean
+    equal to peak. Copying those is worse than dropping them: the clip then
+    looks like it has sound, and anything downstream that checks for an audio
+    stream rather than for signal will believe it.
     """
     procs = {}
     cam_dir = rec_dir / "streams" / NODE_DIR
@@ -300,8 +335,9 @@ def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp"):
         out = cam_dir / f"{stream_stem(ch)}.mp4"
         url = rtsp_url(ch, stream)
         cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
-               "-rtsp_transport", transport, "-i", url,
-               "-t", str(duration), "-c", "copy", "-movflags", "+faststart", str(out)]
+               "-rtsp_transport", transport, "-i", url, "-t", str(duration)]
+        cmd += ["-c", "copy"] if ch == audio_ch else ["-an", "-c:v", "copy"]
+        cmd += ["-movflags", "+faststart", str(out)]
         print(f"  ch{ch:02d} -> {out.relative_to(rec_dir)}  ({redact(url)})", file=sys.stderr)
         procs[ch] = (subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE), out)
 
@@ -375,6 +411,9 @@ def main(argv=None):
     ap.add_argument("--channels", default=None, help="NVR channels, e.g. '1,2,3,4'")
     ap.add_argument("--stream", default=None, choices=["main", "sub"], help="NVR stream")
     ap.add_argument("--transport", default="tcp", choices=["tcp", "udp"], help="RTSP transport")
+    ap.add_argument("--audio-from", type=int, default=None,
+                    help="channel whose mic to keep (0 = no audio at all; "
+                         "default: SMARTROOM_REOLINK_AUDIO_CH, else 1)")
     ap.add_argument("--probe", action="store_true", help="check auth/streams and exit")
     ap.add_argument("--upload", action="store_true", help="copy the recording to the analysis volume")
     ap.add_argument("--dest", default=None, help=f"upload target (default {DEFAULT_DEST})")
@@ -383,6 +422,13 @@ def main(argv=None):
     cfg.load_node_env()
     channels = channels_from_env(args.channels)
     stream = args.stream or os.environ.get("SMARTROOM_REOLINK_STREAM", "main")
+    audio_ch = (args.audio_from if args.audio_from is not None
+                else int(os.environ.get("SMARTROOM_REOLINK_AUDIO_CH", "1") or 0))
+    audio_ch = audio_ch or None
+    if audio_ch and audio_ch not in channels:
+        print(f"NOTE: audio channel {audio_ch} is not being recorded, so this clip has no sound",
+              file=sys.stderr)
+        audio_ch = None
     if not channels:
         print("ERROR: no channels selected", file=sys.stderr)
         return 1
@@ -404,7 +450,8 @@ def main(argv=None):
     start = dt.datetime.now().astimezone()
     rec_dir = make_recording_dir(start)
     print(f"Recording {args.duration}s from {len(channels)} camera(s) -> {rec_dir}", file=sys.stderr)
-    results = record_channels(channels, stream, args.duration, rec_dir, args.transport)
+    results = record_channels(channels, stream, args.duration, rec_dir, args.transport,
+                              audio_ch=audio_ch)
     end = dt.datetime.now().astimezone()
 
     cam_dir = rec_dir / "streams" / NODE_DIR
@@ -433,6 +480,11 @@ def main(argv=None):
         }
         if width and height:
             entry["resolution"] = [width, height]
+        audio = probe_audio_props(out) if ch == audio_ch else None
+        if audio:
+            # Recorded, not assumed: only this channel's mic carries signal, and
+            # metadata that claims audio on a silent track is worse than none.
+            entry["audio"] = audio
         cal = load_calibration(ch)
         if cal:
             entry["calibration"] = cal
@@ -446,7 +498,8 @@ def main(argv=None):
             entry["extrinsics"] = ext
         streams[stem] = entry
         flag = "" if cal and ext else "  (UNCALIBRATED — mirror cannot place it)"
-        print(f"  ch{ch:02d}: {frame_count} frames, {fps:.1f} fps{flag}", file=sys.stderr)
+        snd = f", audio {audio['codec']} {audio['sample_rate']}Hz" if audio else ""
+        print(f"  ch{ch:02d}: {frame_count} frames, {fps:.1f} fps{snd}{flag}", file=sys.stderr)
 
     if not streams:
         print("no camera recorded successfully", file=sys.stderr)
