@@ -79,7 +79,10 @@ PROJECT_ROOT = cfg.PROJECT_ROOT
 DATA_DIR = PROJECT_ROOT / "data"
 CALIBRATION_DIR = cfg.DEFAULT_OUT
 
-DEFAULT_PATH_TEMPLATE = "h264Preview_ch{ch:02d}_{stream}"
+# Reolink's own scheme, verified against this NVR: zero-padded channel, NO "ch"
+# prefix (h264Preview_ch01_main is a 404 here). The "h264" in the name is part of
+# the path, not a promise -- this NVR answers it with HEVC on the main stream.
+DEFAULT_PATH_TEMPLATE = "h264Preview_{ch:02d}_{stream}"
 DEFAULT_CHANNELS = "1,2,3,4"
 DEFAULT_DEST = "intern26@172.16.60.239:/mnt/data4/intern26/recordings"
 
@@ -209,6 +212,28 @@ def make_recording_dir(now: dt.datetime) -> Path:
     return rec_dir
 
 
+def probe_video_props(mp4_path: Path):
+    """(codec, width, height) of a finished file, or (None, None, None).
+
+    Read, never assumed: this NVR serves HEVC on a path called h264Preview_*,
+    so a hardcoded "h264" in metadata.json would be a lie that downstream has no
+    way to catch.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=codec_name,width,height", "-of", "default=nw=1:nk=1", str(mp4_path)],
+            capture_output=True, text=True, timeout=60).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None, None, None
+    if len(out) < 3:
+        return None, None, None
+    try:
+        return out[0], int(out[1]), int(out[2])
+    except ValueError:
+        return out[0], None, None
+
+
 def ffprobe_frame_times(mp4_path: Path):
     """Each encoded frame's real presentation time, from the finished file.
 
@@ -310,6 +335,22 @@ def upload(rec_dir: Path, dest: str):
         return False
     host, root = dest.split(":", 1)
     day = rec_dir.parent.name
+    # day_NN is a per-node counter, and this uploads into a tree other nodes also
+    # write to. Our NN reflects how many days THIS host has recorded, which for a
+    # new capture host is 01 while the shared tree is already on 20 -- and that
+    # created a second folder for the same date, splitting one day in two. The
+    # date is the real key, so adopt whatever the destination already calls it.
+    date = day.split("_", 2)[-1] if day.startswith("day_") else ""
+    if date:
+        probe = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host,
+             f"ls -d '{root}'/day_*_{date} 2>/dev/null | head -1"],
+            capture_output=True, text=True)
+        existing = probe.stdout.strip().rsplit("/", 1)[-1]
+        if existing and existing != day:
+            print(f"note: destination already calls {date} '{existing}' — using that",
+                  file=sys.stderr)
+            day = existing
     if not shutil.which("scp"):
         print("ERROR: scp not on PATH", file=sys.stderr)
         return False
@@ -378,10 +419,11 @@ def main(argv=None):
         frame_count = write_timestamps(cam_dir / f"{stem}_timestamps.csv", times)
         fps = (frame_count / args.duration) if args.duration else 0.0
 
+        codec, width, height = probe_video_props(out)
         entry = {
             "modality": "video",
             "path": f"{stem}.mp4",
-            "codec": "h264",
+            "codec": codec,
             "device": f"reolink-nvr:ch{ch:02d}:{stream}",
             "fps": round(fps, 2),
             "frame_count": frame_count,
@@ -389,11 +431,16 @@ def main(argv=None):
             # No hardware clock over RTSP — see the docstring.
             "hw_timestamp_domain": None,
         }
+        if width and height:
+            entry["resolution"] = [width, height]
         cal = load_calibration(ch)
         if cal:
             entry["calibration"] = cal
-            if cal.get("image_size"):
-                entry["resolution"] = cal["image_size"]
+            # Calibration is at the still's resolution; the recorded stream may
+            # differ (sub is 640x360 against a 3840x2160 calibration). Same 16:9,
+            # so a uniform scale applies — downstream scales by resolution, which
+            # is why the REAL one is recorded above rather than the calibration's.
+            entry.setdefault("resolution", cal.get("image_size"))
         ext = load_extrinsics(ch)
         if ext:
             entry["extrinsics"] = ext
