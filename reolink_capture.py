@@ -65,6 +65,7 @@ import csv
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -81,6 +82,16 @@ CALIBRATION_DIR = cfg.DEFAULT_OUT
 DEFAULT_PATH_TEMPLATE = "h264Preview_ch{ch:02d}_{stream}"
 DEFAULT_CHANNELS = "1,2,3,4"
 DEFAULT_DEST = "intern26@172.16.60.239:/mnt/data4/intern26/recordings"
+
+
+def redact_text(text: str) -> str:
+    """Strip credentials from any RTSP URL inside free text.
+
+    ffmpeg and ffprobe echo the URL they were given -- password included -- in
+    their own error messages, so anything relayed from their stderr has to go
+    through this or the first failed connection prints the NVR password.
+    """
+    return re.sub(r"(rtsp://[^:/@\s]+:)[^@\s]*@", r"\1***@", text or "")
 
 
 def redact(url: str) -> str:
@@ -247,7 +258,7 @@ def probe_stream(channel: int, stream: str, timeout_s: int = 20):
         return False, f"ffprobe not runnable: {exc}"
     if proc.returncode != 0:
         first = (proc.stderr or "").strip().splitlines()
-        return False, (first[-1] if first else f"exit {proc.returncode}")
+        return False, redact_text(first[-1] if first else f"exit {proc.returncode}")
     return True, " ".join((proc.stdout or "").split())
 
 
@@ -280,7 +291,8 @@ def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp"):
             results[ch] = (out, False, "ffmpeg overran its deadline")
             continue
         ok = proc.returncode == 0 and out.exists() and out.stat().st_size > 0
-        note = "" if ok else ((err or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
+        note = "" if ok else redact_text(
+            ((err or b"").decode(errors="replace").strip().splitlines() or [""])[-1])
         results[ch] = (out, ok, note)
     return results
 
