@@ -282,8 +282,14 @@ def calibrate_one(cam_dir: Path, room_photo: Path, cam_id: str, out_dir: Path, t
     # Every other tag in the same frame, mapped into the room frame — the same
     # chaining realsense_extrinsics.py does, so tags.json/room_tags can grow.
     also = {}
+    excluded = cfg.ignored_tags()
     for tid, pts in sorted(tags.items()):
         if tid == tag_id:
+            continue
+        # An excluded tag must not be republished here either. This path does not
+        # write tags.json, but it does publish tag positions that later consumers
+        # read, and "excluded" has to mean the same thing in both calibrators.
+        if int(tid) in excluded:
             continue
         s = solve_tag_pose(pts, tid, K, dist)
         if s is None:
