@@ -521,6 +521,18 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
     # metre-scale spread between tags. It is the tag CENTRES that must be right,
     # and centres come from PnP's translation, the well-conditioned half.
     anchors = _load_room_tags(out_dir)       # {id: (R tag->room, centre mm, size mm)}
+    # Tags the operator has excluded (SMARTROOM_TAG_IGNORE). Dropped here so a
+    # stale tags.json entry cannot anchor the solve, and again at detection time
+    # so it is not re-chained back into the file.
+    ignored_tags = cfg.ignored_tags()
+    if tag_id in ignored_tags:
+        return False, (f"SMARTROOM_TAG_IGNORE lists the reference tag {tag_id} — "
+                       f"the origin cannot be ignored; drop it from the list or "
+                       f"point SMARTROOM_TAG_ID at another tag")
+    for tid in sorted(ignored_tags & set(anchors)):
+        anchors.pop(tid)
+        level_notes.append(f"tag {tid} is in SMARTROOM_TAG_IGNORE — its tags.json "
+                           f"entry was not used as an anchor")
     # The reference tag sits at the origin BY DEFINITION, so a tags.json entry for
     # it must never win: that file records where each tag is relative to whatever
     # the reference WAS, so after re-pointing SMARTROOM_TAG_ID at a tag already in
@@ -608,6 +620,13 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
             continue
         flat = [int(i) for i in ids.flatten()]
         seen_ids.update(flat)
+        # Excluded tags leave the pipeline before anything can use them: not
+        # solved from, and — the reason this is here and not only at the anchor
+        # step — not chained into tags.json below.
+        if ignored_tags:
+            keep = [j for j, tid in enumerate(flat) if tid not in ignored_tags]
+            corners = [corners[j] for j in keep]
+            flat = [flat[j] for j in keep]
         # Drop detections too few pixels across to be worth solving from. A small
         # tag does not merely add little, it actively drags the pose: anchoring
         # the D455 on an 18px tag at 5m mapped its two good tags with 200-330mm
@@ -828,6 +847,9 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         "tag_sizes_mm_by_id": {str(k): size_of(k) for k in sorted(tag_px_by_id)},
         "tags_ignored_px": {str(k): v for k, v in sorted(skipped_px.items())},
         "min_tag_pixels": min_tag_px,
+        # deliberately excluded (SMARTROOM_TAG_IGNORE), as distinct from dropped
+        # for being too small — so a report can tell a policy from an accident
+        "tags_excluded": sorted(ignored_tags),
         "rvec": rvec.flatten().tolist(),          # room -> camera rotation (Rodrigues)
         "tvec_mm": tvec.flatten().tolist(),       # tag origin in camera frame
         "rotation_cam_to_room": R.T.tolist(),
@@ -883,6 +905,13 @@ def calibrate_from_samples(samples, intr, serial, camera_name="RealSense",
         yaw_note += ("; ignored " + ", ".join(
             f"tag {t} ({px:.0f} px)" for t, px in sorted(skipped_px.items()))
             + f" as under SMARTROOM_TAG_MIN_PIXELS={min_tag_px:g}")
+    if ignored_tags:
+        excluded_seen = sorted(ignored_tags & seen_ids)
+        yaw_note += ("; excluded tag" + ("s " if len(ignored_tags) > 1 else " ")
+                     + ", ".join(str(t) for t in sorted(ignored_tags))
+                     + " by SMARTROOM_TAG_IGNORE"
+                     + (f" ({', '.join(str(t) for t in excluded_seen)} was in view)"
+                        if excluded_seen else ""))
     edge = min(img_pts[:, 0].min(), img_pts[:, 1].min(),
                w - img_pts[:, 0].max(), h - img_pts[:, 1].max())
     if edge < 0.08 * min(w, h):

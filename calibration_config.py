@@ -172,6 +172,25 @@ def floor_tags():
     return _id_set("SMARTROOM_TAG_FLOOR")
 
 
+def ignored_tags():
+    """Tags to keep OUT of calibration entirely (SMARTROOM_TAG_IGNORE).
+
+    Stronger than tag_min_pixels, which only drops a tag in frames where it
+    happens to look small. A tag listed here is never solved from, never used as
+    an anchor even if tags.json already holds it, and — the part that matters —
+    never CHAINED into tags.json. Without that last piece, deleting a bad entry
+    by hand does not stick: the next calibration that sees the tag re-maps it
+    from the current pose and silently starts trusting it again.
+
+    Why a tag would be excluded rather than fixed: its recorded position is only
+    as good as the solve that mapped it. Tag 1 was mapped by the D435 from a
+    SINGLE tag (4 corners, 6 DOF — underdetermined), so it absorbed that pose's
+    error; once the D435 could see the reference tag directly, the two
+    disagreed and the joint solve split the difference at 52 px. An anchor
+    nobody has checked against a tape is a liability, not extra information."""
+    return _id_set("SMARTROOM_TAG_IGNORE")
+
+
 def tag_min_pixels():
     """Ignore tag detections smaller than this across (0 = off).
 
