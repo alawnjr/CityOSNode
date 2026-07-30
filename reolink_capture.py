@@ -13,22 +13,22 @@ the analysis volume. Measured on the lab laptop: RTSP/554 open, 1-4ms away.
 
 LAYOUT. capture.py writes one camera into rec/streams/ and lets
 upload_recording.sh fold it into rec/streams/<node>/ on the way up. Four cameras
-do not fit that shape, so this writes the FINAL layout directly -- one directory
-per camera, each with its own metadata.json:
+do not fit that shape, so this writes the FINAL layout directly, following the
+convention a RealSense node already uses -- ONE node directory holding several
+clips, one metadata.json describing them all:
 
-    data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_HHMMSS/streams/reolink1/
-        camera_main.mp4
-        camera_main_timestamps.csv
+    data/day_NN_YYYY-MM-DD/rec_YYYYMMDD_HHMMSS/streams/reolink/
+        camera_cam1_color.mp4  + camera_cam1_color_timestamps.csv
+        ...                      (one pair per channel)
         metadata.json
 
-The stem is `camera_main` and each camera gets its OWN directory, on purpose:
-the mirror only discovers a fixed set of clip stems (lib/manifest.ts CLIP_STEMS
-is camera_main / camera_d455_color / camera_d435_color, and its sensor suffix
-regex only matches /^camera_(d\\d+)_color$/). A stream called camera_reolink1
-would be silently invisible. One camera per directory falls through to the
-mirror's default mapping (<cam> dir -> camera_main) and needs no change there.
-It is also the honest shape: these four cameras have four different poses, so
-they are four clips, not one clip with four streams.
+The stems must be UNIQUE per camera, which is why none of them is camera_main:
+live_infer's find_calib_clips() locates a camera's calibration by globbing
+<cam_key>.mp4 across the whole archive, so four cameras sharing one stem would
+each adopt whichever was calibrated last. camera_main also means "this node's
+main camera", which four cameras with four different poses are not. Naming them
+camera_cam<N>_color puts them in the same shape as camera_d455_color /
+camera_d435_color, so they address as reolink-cam1 ... reolink-cam4.
 
 Recording ids are timestamps (rec_YYYYMMDD_HHMMSS) rather than capture.py's
 per-day counter. The counter is only unique among recordings made by the same
@@ -123,14 +123,24 @@ def channels_from_env(explicit=None):
     return out
 
 
+NODE_DIR = "reolink"
+
+
 def camera_id(channel: int) -> str:
     """Calibration key for a channel: reolink_calibrate.py's --id-prefix + folder."""
     return f"reolink-camera{channel}"
 
 
-def stream_dir_name(channel: int) -> str:
-    """The <cam> directory, which is how the archive and API address this clip."""
-    return f"reolink{channel}"
+def stream_stem(channel: int) -> str:
+    """Clip stem, following the RealSense convention: one node directory holding
+    several camera_<sensor>_color clips, addressed as <node>-<sensor>.
+
+    The stem must be UNIQUE per camera, which is why these are not all
+    camera_main: live_infer's find_calib_clips() locates a camera's calibration
+    by globbing <cam_key>.mp4 across the archive, so four cameras sharing one
+    stem would each adopt whichever of the four was calibrated last.
+    """
+    return f"camera_cam{channel}_color"
 
 
 def load_json(path: Path):
@@ -248,10 +258,10 @@ def record_channels(channels, stream, duration, rec_dir: Path, transport="tcp"):
     would not keep up on a laptop.
     """
     procs = {}
+    cam_dir = rec_dir / "streams" / NODE_DIR
+    cam_dir.mkdir(parents=True, exist_ok=True)
     for ch in channels:
-        cam_dir = rec_dir / "streams" / stream_dir_name(ch)
-        cam_dir.mkdir(parents=True, exist_ok=True)
-        out = cam_dir / "camera_main.mp4"
+        out = cam_dir / f"{stream_stem(ch)}.mp4"
         url = rtsp_url(ch, stream)
         cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
                "-rtsp_transport", transport, "-i", url,
@@ -344,25 +354,26 @@ def main(argv=None):
     results = record_channels(channels, stream, args.duration, rec_dir, args.transport)
     end = dt.datetime.now().astimezone()
 
-    written = 0
+    cam_dir = rec_dir / "streams" / NODE_DIR
+    streams = {}
     for ch in channels:
         out, ok, note = results[ch]
-        cam_dir = out.parent
+        stem = stream_stem(ch)
         if not ok:
             print(f"  ch{ch:02d}: FAILED — {note}", file=sys.stderr)
             continue
         times = ffprobe_frame_times(out)
-        frame_count = write_timestamps(cam_dir / "camera_main_timestamps.csv", times)
+        frame_count = write_timestamps(cam_dir / f"{stem}_timestamps.csv", times)
         fps = (frame_count / args.duration) if args.duration else 0.0
 
         entry = {
             "modality": "video",
-            "path": "camera_main.mp4",
+            "path": f"{stem}.mp4",
             "codec": "h264",
             "device": f"reolink-nvr:ch{ch:02d}:{stream}",
             "fps": round(fps, 2),
             "frame_count": frame_count,
-            "timestamps_path": "camera_main_timestamps.csv",
+            "timestamps_path": f"{stem}_timestamps.csv",
             # No hardware clock over RTSP — see the docstring.
             "hw_timestamp_domain": None,
         }
@@ -374,31 +385,33 @@ def main(argv=None):
         ext = load_extrinsics(ch)
         if ext:
             entry["extrinsics"] = ext
-
-        metadata = {
-            "recording_id": rec_dir.name,
-            "node": socket.gethostname(),
-            "space": "smart_room_1",
-            "start_time": start.isoformat(),
-            "end_time": end.isoformat(),
-            "duration_seconds": args.duration,
-            "schema_version": "0.1",
-            "streams": {"camera_main": entry},
-            "room_frame": room_frame_info(),
-        }
-        tags = load_json(CALIBRATION_DIR / cfg.TAGS_FILENAME)
-        if tags is not None:
-            metadata["room_tags"] = tags
-        # metadata.json LAST: upload_recording.sh treats its presence as "finished".
-        (cam_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-        written += 1
+        streams[stem] = entry
         flag = "" if cal and ext else "  (UNCALIBRATED — mirror cannot place it)"
         print(f"  ch{ch:02d}: {frame_count} frames, {fps:.1f} fps{flag}", file=sys.stderr)
 
-    if not written:
+    if not streams:
         print("no camera recorded successfully", file=sys.stderr)
         return 1
-    print(f"wrote {written}/{len(channels)} camera(s) -> {rec_dir}", file=sys.stderr)
+
+    # One metadata.json for the node directory carrying every camera, exactly as
+    # a RealSense node writes camera_d455_color + camera_d435_color side by side.
+    metadata = {
+        "recording_id": rec_dir.name,
+        "node": socket.gethostname(),
+        "space": "smart_room_1",
+        "start_time": start.isoformat(),
+        "end_time": end.isoformat(),
+        "duration_seconds": args.duration,
+        "schema_version": "0.1",
+        "streams": streams,
+        "room_frame": room_frame_info(),
+    }
+    tags = load_json(CALIBRATION_DIR / cfg.TAGS_FILENAME)
+    if tags is not None:
+        metadata["room_tags"] = tags
+    # metadata.json LAST: its presence is what marks a recording finished.
+    (cam_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    print(f"wrote {len(streams)}/{len(channels)} camera(s) -> {rec_dir}", file=sys.stderr)
 
     if args.upload:
         dest = args.dest or os.environ.get("SMARTROOM_UPLOAD_DEST", DEFAULT_DEST)
