@@ -34,6 +34,16 @@ person with a RealSense person by timestamp. Sending 0.0 instead would be more
 honest still, but it reads as "no clock at all" and loses the per-camera
 ordering that does work.
 
+CROSS-CAMERA FUSION DOES NOT USE THIS COLUMN. The server stamps its own arrival
+time for every camera -- one clock instead of this host's, the Pi's and
+librealsense's three -- and subtracts a per-camera delay measured by its lights
+on/off calibration (smartroom-control's detect/timing_sync.py). That is what
+puts a Reolink detection and a RealSense detection on a comparable timeline; the
+hw_ts sent here is carried through to recordings as a raw value and nothing
+compares it across cameras. Nothing on this side needs to change for it, but do
+re-run that calibration after anything that alters the path: a different NVR
+stream, a change of forwarding host, or a new --fps.
+
 A camera the server has no calibration for is SKIPPED by live_infer entirely
 (it needs an uploaded clip carrying calibration+extrinsics to build room
 geometry), so run reolink_capture.py --upload once before expecting a camera to
