@@ -148,6 +148,13 @@ Cross-node sync: there's no shared clock between the two Pis, so align recording
 using the **clap at t=0** marker in `test/scenarios.md` (keep the Pis' clocks close
 with NTP).
 
+**Live cross-camera timing** is a separate mechanism from the clap marker, covering
+the RealSense and the Reolink NVR cameras on the inference server: each camera's
+delivery delay is measured with a lights on/off calibration and subtracted, because
+a Reolink frame arrives ~3.5s after a RealSense one. `reolink_live_forward.py` and
+`reolink_audio_forward.py` are the push side of it and run on the host that can
+reach the NVR. Full write-up in **smartroom-control's `HANDOFF.md`**.
+
 ## Camera calibration (intrinsics)
 
 `calibrate_camera.py` computes checkerboard intrinsics (camera matrix, distortion)
