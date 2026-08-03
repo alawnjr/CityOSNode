@@ -71,6 +71,7 @@ process list on a shared machine -- run this somewhere you trust.
 """
 
 import argparse
+import collections
 import csv
 import datetime as dt
 import json
@@ -80,6 +81,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import urllib.parse
 from pathlib import Path
 
@@ -95,6 +97,32 @@ CALIBRATION_DIR = cfg.DEFAULT_OUT
 DEFAULT_PATH_TEMPLATE = "h264Preview_{ch:02d}_{stream}"
 DEFAULT_CHANNELS = "1,2,3,4"
 DEFAULT_DEST = "intern26@172.16.60.239:/mnt/data4/intern26/recordings"
+
+
+def drain_stderr(proc, keep=10):
+    """Continuously drain a subprocess's stderr, returning the last few lines.
+
+    A PIPE nobody reads is a small OS buffer, and ffmpeg writes warnings for the
+    whole life of the process. Once that buffer fills, ffmpeg BLOCKS trying to
+    write to it and stops producing output entirely -- so a long-running forwarder
+    dies in the worst possible way: no error, no exit, the stream just stops.
+
+    Measured on this NVR's audio: ~3KB of "non monotonically increasing dts" per
+    45s filled the pipe in about a minute, and the forwarder stalled after ~224KB
+    having logged nothing at all. Anything that keeps an ffmpeg alive rather than
+    waiting on it with communicate() has to drain this.
+    """
+    lines = collections.deque(maxlen=keep)
+
+    def pump():
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                lines.append(raw.decode(errors="replace").strip())
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=pump, daemon=True).start()
+    return lines
 
 
 def redact_text(text: str) -> str:

@@ -68,7 +68,8 @@ import threading
 import time
 
 import calibration_config as cfg
-from reolink_capture import redact, redact_text, rtsp_url, stream_stem, channels_from_env
+from reolink_capture import (channels_from_env, drain_stderr, redact, redact_text,
+                             rtsp_url, stream_stem)
 
 DEFAULT_SERVER = "172.16.60.239:8010"
 RECONNECT_S = 3.0
@@ -129,6 +130,9 @@ def forward_once(channel, cam_key, stream, srv_host, srv_port, fps, quality, sto
     print(f"[ch{channel:02d}] opening {redact(url)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             bufsize=0)
+    # Quiet on this source today, but the same undrained-pipe deadlock that
+    # stalled the audio forwarder applies here. See drain_stderr.
+    errlines = drain_stderr(proc)
     sock = None
     try:
         sock = socket.create_connection((srv_host, srv_port), timeout=15)
@@ -151,8 +155,7 @@ def forward_once(channel, cam_key, stream, srv_host, srv_port, fps, quality, sto
                 print(f"[ch{channel:02d}] forwarded {n} frames "
                       f"({n / max(time.time() - t0, 1e-6):.1f} fps)", flush=True)
         if not stop.is_set():
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-            last = (err.splitlines() or [""])[-1]
+            last = errlines[-1] if errlines else ""
             raise ConnectionError(redact_text(last) or "source stream ended")
     finally:
         if sock is not None:

@@ -60,7 +60,7 @@ import threading
 import time
 
 import calibration_config as cfg
-from reolink_capture import redact, redact_text, rtsp_url
+from reolink_capture import drain_stderr, redact, redact_text, rtsp_url
 
 DEFAULT_SERVER = "172.16.60.239:8010"
 RECONNECT_S = 3.0
@@ -92,6 +92,9 @@ def forward_once(channel, stream, srv_host, srv_port, bitrate, rate, stop):
     print(f"[audio ch{channel:02d}] opening {redact(url)}", flush=True)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             bufsize=0)
+    # ffmpeg warns continuously on this source ("non monotonically increasing
+    # dts", ~3KB/45s); an undrained pipe fills and blocks it. See drain_stderr.
+    errlines = drain_stderr(proc)
     sock = None
     try:
         sock = socket.create_connection((srv_host, srv_port), timeout=15)
@@ -115,8 +118,7 @@ def forward_once(channel, stream, srv_host, srv_port, bitrate, rate, stop):
                 print(f"[audio ch{channel:02d}] forwarded {sent / 1024:.0f} KB "
                       f"({kbps:.0f} kbps)", flush=True)
         if not stop.is_set():
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
-            last = (err.splitlines() or [""])[-1]
+            last = errlines[-1] if errlines else ""
             raise ConnectionError(redact_text(last) or "audio stream ended")
     finally:
         if sock is not None:
