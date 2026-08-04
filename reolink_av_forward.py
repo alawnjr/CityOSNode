@@ -65,6 +65,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -80,6 +81,11 @@ READ_CHUNK = 65536
 MAX_BUFFER = 24 * 1024 * 1024
 AUDIO_FD = 3                # ffmpeg writes the second output to pipe:3
 
+# preexec_fn (used to remap the pipe to fd 3) is POSIX-only — Popen raises
+# immediately on Windows. There, ffmpeg writes the second output to a plain
+# file instead and we tail it, since a Windows fd table has no equivalent.
+IS_WINDOWS = os.name == "nt"
+
 # MPEG-1 Layer III at 32kHz: 1152 samples per frame, so 36ms exactly. This is the
 # audio clock — see the module docstring on why bytes are not.
 MP3_SAMPLES_PER_FRAME = 1152
@@ -87,7 +93,7 @@ MP3_BITRATES = [None, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 
 MP3_RATES = {0: 44100, 1: 48000, 2: 32000}
 
 
-def ffmpeg_for(channel, stream, fps, quality, bitrate, rate, with_audio):
+def ffmpeg_for(channel, stream, fps, quality, bitrate, rate, with_audio, audio_path=None):
     """One input, one or two outputs. See the docstring on `fps` vs `-r`."""
     url = rtsp_url(channel, stream)
     cmd = [
@@ -104,11 +110,16 @@ def ffmpeg_for(channel, stream, fps, quality, bitrate, rate, with_audio):
         "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", str(quality), "pipe:1",
     ]
     if with_audio:
+        audio_out = audio_path if IS_WINDOWS else f"pipe:{AUDIO_FD}"
         cmd += [
             # --- audio output, same input, same clock ---
             "-map", "0:a", "-vn",
             "-c:a", "libmp3lame", "-b:a", bitrate, "-ar", str(rate), "-ac", "1",
-            "-f", "mp3", f"pipe:{AUDIO_FD}",
+            # Without this the mp3 muxer holds ~256KB before it becomes visible
+            # to another handle on the same file (Windows tail path only — a
+            # pipe has no such buffer), turning "live" audio into ~44s bursts.
+            "-flush_packets", "1",
+            "-f", "mp3", audio_out,
         ]
     return url, cmd
 
@@ -230,15 +241,75 @@ class Session:
                 except OSError:
                     pass
 
+    def _pump_audio_file(self, path, stop, errors):
+        """Windows fallback for `_pump_audio`: ffmpeg writes mp3 to a plain file
+        (no fd 3 to hand it) and we tail it like `tail -f`. A file read returns
+        b"" the instant it runs dry rather than blocking like a pipe does, so we
+        poll instead of blocking on read(). Same media-clock tagging throughout.
+        """
+        sock = None
+        fh = None
+        try:
+            sock = self._connect(f"/audio?cam={self.cam_key}&media=1")
+            print(f"[ch{self.channel:02d}] audio connected (media clock)", flush=True)
+            while fh is None and not stop.is_set():
+                try:
+                    fh = open(path, "rb")
+                except FileNotFoundError:
+                    time.sleep(0.05)
+            if fh is None:
+                return
+            pending = bytearray()
+            frames = 0
+            while not stop.is_set():
+                data = fh.read(READ_CHUNK)
+                if not data:
+                    time.sleep(0.02)
+                    continue
+                pending.extend(data)
+                n, used = mp3_frame_count(bytes(pending))
+                if not n:
+                    continue          # not a whole frame yet
+                media_ms = frames * self.mp3_frame_ms
+                payload = bytes(pending[:used])
+                del pending[:used]
+                frames += n
+                sock.sendall(struct.pack(">Idd", len(payload),
+                                         time.time() * 1000.0, media_ms) + payload)
+        except Exception as exc:  # noqa: BLE001 — surfaced by the supervisor
+            if not stop.is_set():
+                errors.append(f"audio: {redact_text(str(exc))}")
+        finally:
+            stop.set()
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
     def run_once(self, stop):
+        audio_path = None
+        if self.with_audio and IS_WINDOWS:
+            audio_path = os.path.join(
+                tempfile.gettempdir(),
+                f"smartroom_av_ch{self.channel:02d}_{os.getpid()}.mp3")
+            try:
+                os.remove(audio_path)
+            except FileNotFoundError:
+                pass
         url, cmd = ffmpeg_for(self.channel, self.stream, self.fps, self.quality,
-                              self.bitrate, self.rate, self.with_audio)
+                              self.bitrate, self.rate, self.with_audio, audio_path)
         print(f"[ch{self.channel:02d}] opening {redact(url)}"
               f"{' +audio' if self.with_audio else ''}", flush=True)
 
         arfd = awfd = None
         pass_fds = ()
-        if self.with_audio:
+        if self.with_audio and not IS_WINDOWS:
             arfd, awfd = os.pipe()
             # ffmpeg writes its second output to fd 3, so hand it that fd.
             os.set_inheritable(awfd, True)
@@ -255,7 +326,11 @@ class Session:
         errlines = drain_stderr(proc)
         errors: list[str] = []
         athread = None
-        if arfd is not None:
+        if self.with_audio and IS_WINDOWS:
+            athread = threading.Thread(target=self._pump_audio_file, args=(audio_path, stop, errors),
+                                       daemon=True, name=f"a{self.channel:02d}")
+            athread.start()
+        elif arfd is not None:
             athread = threading.Thread(target=self._pump_audio, args=(arfd, stop, errors),
                                        daemon=True, name=f"a{self.channel:02d}")
             athread.start()
@@ -297,6 +372,11 @@ class Session:
                 proc.kill()
             if athread is not None:
                 athread.join(timeout=5)
+            if audio_path is not None:
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
 
     def run_forever(self, stop_all):
         while not stop_all.is_set():
