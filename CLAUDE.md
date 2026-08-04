@@ -155,6 +155,15 @@ a Reolink frame arrives ~3.5s after a RealSense one. `reolink_live_forward.py` a
 `reolink_audio_forward.py` are the push side of it and run on the host that can
 reach the NVR. Full write-up in **smartroom-control's `HANDOFF.md`**.
 
+**`reolink_av_forward.py` replaces both of those** with ONE ffmpeg on ONE RTSP
+session, so a camera's audio and video keep the single input clock the camera
+already gave them (`?media=1` on the server's `/ingest` and `/audio`). This removes
+the by-ear `SMARTROOM_AUDIO_TRIM_MS`: measured against a synthetic flash+beep
+source it introduces 0.000s of A/V skew where the two-session split needed 2.79s of
+correction. **Written and tested but not yet switched on** — see open item 0 in
+HANDOFF.md, and `test/av_split_probe.py` / `test/mp3_clock_test.py` for the two
+measurements it rests on.
+
 ## Camera calibration (intrinsics)
 
 `calibrate_camera.py` computes checkerboard intrinsics (camera matrix, distortion)
